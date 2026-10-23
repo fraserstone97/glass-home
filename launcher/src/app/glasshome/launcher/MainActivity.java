@@ -1979,7 +1979,8 @@ public class MainActivity extends Activity {
         ilp.leftMargin = side - room;
         ilp.bottomMargin = dp(40) - room;
         root.addView(heroInfo, ilp);
-        heroInfo.setTranslationY(heroInfoRestY());
+        heroInfoY = heroInfoRestY();
+        heroInfo.setTranslationY(heroInfoY);
 
         heroDots = new LinearLayout(this);
         heroDots.setOrientation(LinearLayout.HORIZONTAL);
@@ -1988,7 +1989,8 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
         dlp.bottomMargin = dp(22);
         root.addView(heroDots, dlp);
-        heroDots.setTranslationY(heroDotsRestY());
+        heroDotsY = heroDotsRestY();
+        heroDots.setTranslationY(heroDotsY);
 
         // Up Next strip (Continue Watching): thumbnails with progress, shown while the shelf is focused.
         heroStrip = new LinearLayout(this);
@@ -2051,6 +2053,16 @@ public class MainActivity extends Activity {
     /** ...and the page dots sit centred between the info and the dock. */
     float heroDotsRestY() {
         return -(screenH - shelfH) + dp(22) - dp(12);
+    }
+
+    /** Where the info block and page dots are headed: a slide change cancels their animators, so it puts them back on course. */
+    float heroInfoY, heroDotsY;
+
+    void moveHeroInfo(float infoY, float dotsY, long ms) {
+        heroInfoY = infoY;
+        heroDotsY = dotsY;
+        heroInfo.animate().withLayer().translationY(infoY).setDuration(ms).setInterpolator(EASE).start();
+        heroDots.animate().withLayer().translationY(dotsY).setDuration(ms).setInterpolator(EASE).start();
     }
 
     /** tvOS-style top tab bar: a glass capsule, top centre, with two text tabs. */
@@ -2316,9 +2328,9 @@ public class MainActivity extends Activity {
         // coming back: they return after the artwork has settled.
         heroInfo.animate().cancel();
         heroDots.animate().cancel();
-        heroInfo.animate().withLayer().alpha(a).setStartDelay(show ? 160 : 0).setDuration(show ? 420 : 140)
+        heroInfo.animate().withLayer().alpha(a).translationY(heroInfoY).setStartDelay(show ? 160 : 0).setDuration(show ? 420 : 140)
                 .setInterpolator(EASE).start();
-        heroDots.animate().alpha(a).setStartDelay(show ? 160 : 0).setDuration(show ? 420 : 140).setInterpolator(EASE).start();
+        heroDots.animate().alpha(a).translationY(heroDotsY).setStartDelay(show ? 160 : 0).setDuration(show ? 420 : 140).setInterpolator(EASE).start();
         chevron.animate().alpha(1f - a).setDuration(show ? 140 : 420).setInterpolator(EASE).start();
         heroBack.animate().alpha(0f).setDuration(show ? 480 : 420).setInterpolator(HERO_EASE).start();
         handler.removeCallbacks(heroAdvance);
@@ -2409,6 +2421,7 @@ public class MainActivity extends Activity {
             heroBtnIcon.setVisibility(View.GONE);
             if (heroShown && dir != 0) {
                 heroInfo.animate().cancel();
+                heroInfo.setTranslationY(heroInfoY);
                 heroInfo.setAlpha(0f);
                 heroInfo.setTranslationX(dir == 2 ? 0 : dp(18) * dir);
                 heroInfo.animate().withLayer().alpha(1f).translationX(0).setDuration(680).setStartDelay(60).setInterpolator(HERO_EASE).start();
@@ -2443,6 +2456,7 @@ public class MainActivity extends Activity {
         if (heroShown && dir != 0) {
             // Text glides in from the side you pressed, like the artwork.
             heroInfo.animate().cancel();
+            heroInfo.setTranslationY(heroInfoY);
             heroInfo.setAlpha(0f);
             heroInfo.setTranslationX(dir == 2 ? 0 : dp(18) * dir);
             heroInfo.animate().withLayer().alpha(1f).translationX(0).setDuration(680).setStartDelay(60).setInterpolator(HERO_EASE).start();
@@ -2524,8 +2538,7 @@ public class MainActivity extends Activity {
             scroll.smoothScrollTo(0, 0);
             scroll.animate().withLayer().translationY(screenH - shelfH + dp(30)).setDuration(500).setInterpolator(EASE)
                     .setUpdateListener(null).withEndAction(this::invalidateGlass).start();
-            heroInfo.animate().withLayer().translationY(0).setDuration(500).setInterpolator(EASE).start();
-            heroDots.animate().withLayer().translationY(0).setDuration(500).setInterpolator(EASE).start();
+            moveHeroInfo(0, 0, 500);
             heroOverview.setVisibility(View.VISIBLE);
             heroButton.setVisibility(View.VISIBLE);
             heroRemove.setVisibility(heroIsContinue() ? View.VISIBLE : View.GONE);
@@ -2541,8 +2554,7 @@ public class MainActivity extends Activity {
             heroBtnText.setTextColor(Color.WHITE);
             scroll.animate().withLayer().translationY(0).setDuration(450).setInterpolator(EASE)
                     .setUpdateListener(null).withEndAction(this::invalidateGlass).start();
-            heroInfo.animate().withLayer().translationY(heroInfoRestY()).setDuration(450).setInterpolator(EASE).start();
-            heroDots.animate().withLayer().translationY(heroDotsRestY()).setDuration(450).setInterpolator(EASE).start();
+            moveHeroInfo(heroInfoRestY(), heroDotsRestY(), 450);
             heroOverview.animate().alpha(0f).setDuration(160).setStartDelay(0)
                     .withEndAction(() -> heroOverview.setVisibility(View.GONE)).start();
             heroButton.animate().alpha(0f).setDuration(160).setStartDelay(0)
@@ -3641,14 +3653,13 @@ public class MainActivity extends Activity {
         }
         idle = true;
         idleScrollY = scroll.getTranslationY();
-        idleInfoY = heroInfo.getTranslationY();
-        idleDotsY = heroDots.getTranslationY();
+        idleInfoY = heroInfoY;
+        idleDotsY = heroDotsY;
         idleOverviewShown = heroOverview.getVisibility() == View.VISIBLE;
         scroll.animate().cancel();
         scroll.animate().withLayer().translationY(screenH).alpha(0f).setDuration(900).setInterpolator(EASE)
                 .setUpdateListener(null).start();
-        heroInfo.animate().withLayer().translationY(0).setDuration(900).setInterpolator(EASE).start();
-        heroDots.animate().withLayer().translationY(dp(4)).setDuration(900).setInterpolator(EASE).start();
+        moveHeroInfo(0, dp(4), 900);
         weatherCard.animate().alpha(0f).setDuration(500).start();
         switcher.animate().alpha(0f).setDuration(500).start();
         heroButton.animate().alpha(0f).setDuration(300).start();
@@ -3681,8 +3692,7 @@ public class MainActivity extends Activity {
         scroll.animate().cancel();
         scroll.animate().withLayer().translationY(idleScrollY).alpha(1f).setDuration(450).setInterpolator(EASE)
                 .setUpdateListener(null).withEndAction(this::invalidateGlass).start();
-        heroInfo.animate().withLayer().translationY(idleInfoY).setDuration(450).setInterpolator(EASE).start();
-        heroDots.animate().withLayer().translationY(idleDotsY).setDuration(450).setInterpolator(EASE).start();
+        moveHeroInfo(idleInfoY, idleDotsY, 450);
         weatherCard.animate().alpha(toGrid ? 0f : weatherAlpha()).setDuration(350).start();
         switcher.animate().alpha(toGrid || folderMode ? 0f : clockAlpha()).setDuration(350).start();
         if (shelfView.isFocused()) {
