@@ -1,0 +1,26 @@
+# BenQ QS01 (Inspur, Amlogic S905Y2) Android TV dongle, Android TV 12, firmware QS01_00.03.00.06_ww.
+# Apply: TV_HOST=<tv ip> ./setup/debloat.sh setup/lists/benq-qs01-android-tv.txt
+# Undo:  TV_HOST=<tv ip> ./setup/restore.sh setup/lists/benq-qs01-android-tv.txt
+# Everything here is disabled with `pm disable-user --user 0`, never uninstalled.
+#
+# Kept on purpose: Google Cast (Chromecast), iMirror (com.ecloud.eairplay, the AirPlay receiver),
+# the Bluetooth remote apps (com.inspur.bluetoothdeviceconnector, com.inspur.BlueToothController,
+# com.inspur.benq.remoterc), BenQ System Updates (com.benq.qota) and droidlogic System.
+
+# Tracking
+com.inspur.firebase                    # DataCollect
+
+# BenQ / Inspur extras
+com.benq.familand                      # FamiLand
+com.droidlogic.tv.settings             # Droid Settings (Amlogic's extra settings app)
+
+# Screen mirroring through eShare (AirPlay itself is iMirror, kept above)
+com.eshare.tutorial                    # Wireless Projection
+com.ecloud.eshare.server               # EShareServer
+
+# Preloaded Google apps
+com.google.android.videos              # Google Play Movies
+com.google.android.play.games          # Google Play Games
+
+# Setup leftovers
+com.ericsson.tangenrine                # TV Setup Customization Sample
