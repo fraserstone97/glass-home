@@ -576,7 +576,7 @@ public class MainActivity extends Activity {
         ccButton = new ImageView(this);
         ccButton.setScaleType(ImageView.ScaleType.CENTER);
         ccButton.setImageBitmap(Glyphs.get("gear", dp(20), Color.WHITE));
-        LiquidGlass ccGlass = new LiquidGlass(btn / 2f, 0x1F000000, glassSource, screenW, screenH, unit).adaptive().clear();
+        LiquidGlass ccGlass = new LiquidGlass(btn / 2f, 0x1F000000, glassSource, screenW, screenH, unit).adaptive();
         ccGlass.lens = dp(4);
         ccGlass.owner = ccButton;
         GradientDrawable ccLit = new GradientDrawable();
