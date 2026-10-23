@@ -1,0 +1,55 @@
+# TCL C6K (tested on a 55C6K-UK), Google TV (device G08), Android 14, firmware UTT2.250416.001.
+# Apply: TV_HOST=<tv ip> ./setup/debloat.sh setup/lists/tcl-c6k-google-tv.txt
+# Undo:  TV_HOST=<tv ip> ./setup/restore.sh setup/lists/tcl-c6k-google-tv.txt
+# Everything here is disabled with `pm disable-user --user 0`, never uninstalled. Lived with for
+# weeks; after a reboot every package stayed disabled (this firmware doesn't switch them back on).
+#
+# Kept on purpose: Netflix, Prime Video, YouTube, YouTube Music, Chromecast (mediashell), AirPlay
+# (com.tcl.airplay2, com.mediatek.AirplayAPK, com.mediatek.airplaydaemon), game mode
+# (com.tcl.gamebar), the TV and input apps (com.tcl.tv, com.tcl.tvinput, needed for HDMI), TCL's
+# quick panel (com.tcl.dashboard), remote and Bluetooth services, Play Store and Play Services,
+# and the firmware updater. Comment out any line for something your household uses.
+
+# TCL tracking and analytics
+com.tcl.ttvs                           # Samba TV ACR viewing tracking, TCL BI analytics
+com.tcl.logkit                         # log capture and upload
+com.tcl.usercenter                     # TCL account sign-in nags
+
+# TCL content, ads, promos and retail demo
+com.tcl.channelplus                    # TCL Live FAST channels
+com.tcl.tv.tclhome_passive             # pushes TCL content to the home screen at boot
+com.tcl.partnercustomizer              # TCL tweaks to Google TV home rows
+com.tcl.interactive                    # TCL TIAS background service
+com.tcl.messagebox                     # TCL push messages and promos
+com.tcl.waterfall.overseas             # TCL movie/show recommendation browser
+com.tcl.exhibit                        # retail demo
+com.tcl.esticker                       # retail demo stickers
+
+# Preloaded apps and services
+com.tcl.ocean.instructions             # e-manual
+com.tcl.repairguide
+com.tcl.smartalexa                     # Amazon Alexa built-in
+com.tcl.guard                          # TCL "cleaner" / app manager
+android.autoinstalls.config.google.gtvpai   # silently installs partner apps
+com.google.android.partnersetup        # partner attribution
+com.google.android.feedback
+com.android.tv.feedbackconsent
+com.google.android.play.games
+
+# Screen mirroring you may not use: comment these out to keep Miracast or TCL's phone casting
+com.tcl.miracast                       # Miracast
+com.tcl.magiconnectfree                # TCL T-Cast / Magiconnect
+
+# Google TV's voice app (Gemini). Glass Home's mic button does its own voice search with Google's
+# speech service instead. Comment this out to keep Gemini.
+com.google.android.katniss
+
+# Google TV setup wizard: with the stock home off, it grabs the Home button. CAUTION: if it saved
+# your Wi-Fi network during setup, disabling it forgets that network and the TV drops off Wi-Fi
+# (and ADB). Check first: adb shell dumpsys wifi | grep -o 'cname=[^ ]*'  (if it says
+# setupwraith, connect the TV to Wi-Fi again yourself in Settings before running this list).
+com.google.android.tungsten.setupwraith
+
+# The stock Google TV home. install.sh switches it off itself once Glass Home is confirmed as Home;
+# it's here so restore.sh turns it back on.
+com.google.android.apps.tv.launcherx

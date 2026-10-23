@@ -1,0 +1,5 @@
+build/
+*.keystore
+*.jks
+keystore-password.txt
+.DS_Store

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- build.sh replaces "Glass Aerials" in this file with $AERIALS_NAME. -->
+    <string name="app_name">Glass Aerials</string>
+    <string name="dream_name">Aerials</string>
+</resources>

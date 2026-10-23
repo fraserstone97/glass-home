@@ -1,0 +1,28 @@
+Glass Home
+Copyright 2026 Fraser Stone
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Glass Home's launcher is a modified version of Hume Launcher
+(https://github.com/petrobot-admin/hume-launcher), Copyright 2026 Petrobot, Apache License 2.0.
+Changes: renamed and repackaged; the home screen, Control Centre, Search, title pages, Settings,
+motion and materials were redesigned; the UK recommendations, the remote-buttons helper and the
+screen saver were added.
+
+This product includes third-party components under their own licences:
+
+- Inter typeface — Copyright the Inter Project Authors — SIL Open Font License 1.1
+  (launcher/assets/fonts/Inter-LICENSE.txt)
+- QR Code generator library (Java) — Copyright (c) Project Nayuki — MIT License
+  (launcher/src/io/nayuki/qrcodegen)
+- Apple Root CA certificate (aerials/res/raw/apple_root_ca.cer), Apple's public root certificate,
+  used only to trust Apple's own video server.
+
+The setup scripts and debloat lists follow the method and safety rules of cleanyourtv
+(https://github.com/Gathin23/cleanyourtv, MIT License).
+
+Glass Home isn't affiliated with or endorsed by Apple, Google, TCL or any streaming service.
+Aerial videos stream from Apple's servers and aren't included in this repository. App logos on the
+home screen are drawn from each app installed on the TV. Recommendations come from JustWatch;
+artwork optionally from TMDB. This product uses the TMDB API but is not endorsed or certified by
+TMDB.
