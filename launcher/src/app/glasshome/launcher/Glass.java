@@ -125,18 +125,30 @@ final class Glass extends Drawable {
      * the direction the remote moved, then the spring settles it as it lifts. Eases back down.
      */
     static void lift(android.view.View v, boolean has, float scale, float z) {
+        lift(v, has, scale, z, 1f, true);
+    }
+
+    /**
+     * As lift, for a view shown at `rest` scale when not focused. Without `asImage`, it's drawn
+     * afresh at each size instead of as a stretched picture: for a little text (the weather pill)
+     * that keeps every frame sharp, where a picture softens for a moment and then snaps.
+     */
+    static void lift(android.view.View v, boolean has, float scale, float z, float rest, boolean asImage) {
         v.animate().cancel();
+        android.view.ViewPropertyAnimator a;
         if (has) {
             float push = 4f * v.getResources().getDisplayMetrics().density;
             v.setTranslationX(-dirX * push);
             v.setTranslationY(-dirY * push);
             // On a layer while it moves: drawn once and scaled as an image, instead of every
             // letter being re-drawn at a new size each frame (which made the lift stutter).
-            v.animate().scaleX(scale).scaleY(scale).translationX(0).translationY(0).translationZ(z)
-                    .setDuration(460).setInterpolator(SNAP).withLayer().start();
+            a = v.animate().scaleX(scale).scaleY(scale).translationX(0).translationY(0).translationZ(z)
+                    .setDuration(460).setInterpolator(SNAP);
         } else {
-            v.animate().scaleX(1f).scaleY(1f).translationX(0).translationY(0).translationZ(0)
-                    .setDuration(260).setInterpolator(MainActivity.EASE).withLayer().start();
+            a = v.animate().scaleX(rest).scaleY(rest).translationX(0).translationY(0).translationZ(0)
+                    .setDuration(260).setInterpolator(MainActivity.EASE);
         }
+        if (asImage) a.withLayer();
+        a.start();
     }
 }

@@ -596,9 +596,11 @@ public class MainActivity extends Activity {
         watchNetwork();
 
         // Weather overview in the top-left corner, over the top shelf; OK opens the forecast.
-        weatherCard = new WeatherView(this, false, unit);
+        // Drawn at its focused size and shown smaller at rest: lifting it on focus never stretches
+        // its picture, so the text doesn't soften and then snap sharp.
+        weatherCard = new WeatherView(this, false, unit * WEATHER_LIFT);
         // The same glass as the clock pill beside the gear: darker over bright pictures, never a glow.
-        weatherGlass = pillGlass(dp(WeatherView.COMPACT_H) / 2f);
+        weatherGlass = pillGlass(dp(WeatherView.COMPACT_H) * WEATHER_LIFT / 2f);
         weatherCard.setBackground(weatherGlass);
         weatherCard.setFocusable(true);
         weatherCard.setClickable(true);
@@ -609,14 +611,17 @@ public class MainActivity extends Activity {
             // pill behind the carousel for a moment (it vanished when focus moved to the gear).
             // Flat lift: its glass gives the TV no shape for a shadow, so one was drawn as a
             // rectangle every frame, which made the lift stutter.
-            Glass.lift(v, has, 1.05f, 0);
+            Glass.lift(v, has, 1f, 0, 1f / WEATHER_LIFT, false);
         });
         weatherCard.setPivotX(0);
         weatherCard.setPivotY(0);
+        weatherCard.setScaleX(1f / WEATHER_LIFT);
+        weatherCard.setScaleY(1f / WEATHER_LIFT);
         weatherCard.setOnClickListener(v -> showWeather());
         // Top left, level with the status row and inside the same 48 px edge margin.
         // As wide as what it says, so its margins are even whatever the weather and place.
-        FrameLayout.LayoutParams wlp = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(WeatherView.COMPACT_H),
+        FrameLayout.LayoutParams wlp = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+                Math.round(dp(WeatherView.COMPACT_H) * WEATHER_LIFT),
                 Gravity.TOP | Gravity.START);
         wlp.topMargin = dp(24);
         wlp.leftMargin = dockOuter;
@@ -831,6 +836,9 @@ public class MainActivity extends Activity {
      * picture behind, softly blurred, with a light tint that follows its brightness. The same
      * everywhere, so they always read as one material.
      */
+    /** How much the weather pill grows when focused. */
+    static final float WEATHER_LIFT = 1.05f;
+
     LiquidGlass controlGlass(float r) {
         LiquidGlass g = new LiquidGlass(r, 0x1F000000, glassSource, screenW, screenH, unit).adaptive();
         g.rimStrength = 0.45f;
@@ -1479,7 +1487,6 @@ public class MainActivity extends Activity {
     Drawable dockBackground() {
         // Apple's dock corner is ~2x the card corner (36 px vs ~18 px at 1080p).
         LiquidGlass g = new LiquidGlass(radius * 2f, 0x0AFFFFFF, glassSource, screenW, screenH, unit).clear();
-        g.lens = dp(12);
         g.rimStrength = 0.5f;
         return g;
     }
@@ -1551,8 +1558,9 @@ public class MainActivity extends Activity {
         LiquidGlass clear() {
             clear = true;
             body.setAlpha(105);
-            lens1.setAlpha(90);
-            lens2.setAlpha(90);
+            // No magnifying bands at the edge: through clear glass each one added its own step of
+            // tint, which showed as lines inside the rim. One smooth surface instead.
+            lens = 0;
             rimStrength = Math.max(rimStrength, 0.7f);
             return this;
         }
