@@ -125,6 +125,12 @@ public class ControlCentreActivity extends Activity {
     }
 
     @Override
+    public boolean dispatchKeyEvent(KeyEvent e) {
+        MainActivity.navSound(this, e);  // the same ticks as everywhere else
+        return super.dispatchKeyEvent(e);
+    }
+
+    @Override
     public boolean onKeyDown(int k, KeyEvent e) {
         if (k == KeyEvent.KEYCODE_BACK || k == KeyEvent.KEYCODE_ESCAPE) {
             if (onInputs && !inputsOnly) showMain(-1);
@@ -328,16 +334,14 @@ public class ControlCentreActivity extends Activity {
         float r = dp(28);
         MainActivity home = MainActivity.live.get();
         if (home != null && home.glassBg != null && home.getWindow().getDecorView().getVisibility() == View.VISIBLE) {
-            MainActivity.LiquidGlass g = new MainActivity.LiquidGlass(r, 0x0FFFFFFF, home.glassSource,
-                    home.screenW, home.screenH, home.unit);
+            // The same glass as Home's weather, clock and gear, a bigger piece of it.
+            MainActivity.LiquidGlass g = home.controlGlass(r);
             g.lens = home.dp(12);
-            g.rimStrength = 0.25f;
-            g.panel();
             liquid = true;
             return g;
         }
         GradientDrawable body = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
-                new int[]{0xC2303036, 0xD1202026});
+                new int[]{0xA6303036, 0xB8202026});
         body.setCornerRadius(r);
         body.setStroke(Math.max(1, dp(0.6f)), 0x3DFFFFFF);
         GradientDrawable sheen = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
@@ -379,11 +383,16 @@ public class ControlCentreActivity extends Activity {
             sub.setTextColor(0xA6FFFFFF);
             t.addView(sub);
         }
+        // Text and glyph change colour with the plate as it fades, frame by frame, so nothing flips
+        // ahead of it (white text on a still-white plate, a dark glyph on dark glass).
+        android.animation.ArgbEvaluator ev = new android.animation.ArgbEvaluator();
+        white.tint = f -> {
+            tt.setTextColor((int) ev.evaluate(f, Color.WHITE, 0xFF1C1C1E));
+            if (sub != null) sub.setTextColor((int) ev.evaluate(f, 0xA6FFFFFF, 0x991C1C1E));
+            if (tint == Color.WHITE) gi.setColorFilter((int) ev.evaluate(f, Color.WHITE, 0xFF1C1C1E));
+        };
         t.setOnFocusChangeListener((v, has) -> {
             Glass.focus(white, has);
-            gi.setImageBitmap(Glyphs.get(glyph, dp(16), has && tint == Color.WHITE ? 0xFF1C1C1E : tint));
-            tt.setTextColor(has ? 0xFF1C1C1E : Color.WHITE);
-            if (sub != null) sub.setTextColor(has ? 0x991C1C1E : 0xA6FFFFFF);
             lift(v, has);
         });
         t.setOnClickListener(v -> {
@@ -402,9 +411,10 @@ public class ControlCentreActivity extends Activity {
         t.setImageBitmap(Glyphs.get(glyph, dp(22), Color.WHITE));
         t.setFocusable(true);
         t.setClickable(true);
+        android.animation.ArgbEvaluator ev = new android.animation.ArgbEvaluator();
+        white.tint = f -> t.setColorFilter((int) ev.evaluate(f, Color.WHITE, 0xFF1C1C1E));
         t.setOnFocusChangeListener((v, has) -> {
             Glass.focus(white, has);
-            t.setImageBitmap(Glyphs.get(glyph, dp(22), has ? 0xFF1C1C1E : Color.WHITE));
             lift(v, has);
         });
         t.setOnClickListener(click);

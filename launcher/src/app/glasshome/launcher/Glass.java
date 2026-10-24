@@ -46,8 +46,16 @@ final class Glass extends Drawable {
     /** 0 = resting glass, 1 = focused (white); Glass.focus animates it. */
     public void setFocus(float f) {
         focus = f;
+        if (tint != null) tint.at(f);
         invalidateSelf();
     }
+
+    /** What sits on the glass and changes colour with its focus (text, glyphs): told every frame. */
+    interface Tint {
+        void at(float focus);
+    }
+
+    Tint tint;
 
     public float getFocus() {
         return focus;

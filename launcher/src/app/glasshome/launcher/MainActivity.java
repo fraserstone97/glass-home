@@ -147,6 +147,8 @@ public class MainActivity extends Activity {
     View heroScrim, shade;
     FrameLayout shelfView;
     LinearLayout heroInfo, heroDots;
+    /** The dots themselves, inside heroDots (which moves and fades the whole indicator). */
+    LinearLayout dotRow;
     ImageView heroLogo;
     TextView heroTitle, heroMeta, heroOverview, heroRemove;
     GradientDrawable heroRemoveBg;
@@ -576,8 +578,7 @@ public class MainActivity extends Activity {
         ccButton = new ImageView(this);
         ccButton.setScaleType(ImageView.ScaleType.CENTER);
         ccButton.setImageBitmap(Glyphs.get("gear", dp(20), Color.WHITE));
-        LiquidGlass ccGlass = new LiquidGlass(btn / 2f, 0x1F000000, glassSource, screenW, screenH, unit).adaptive();
-        ccGlass.lens = dp(4);
+        LiquidGlass ccGlass = controlGlass(btn / 2f);
         ccGlass.owner = ccButton;
         GradientDrawable ccLit = new GradientDrawable();
         ccLit.setShape(GradientDrawable.OVAL);
@@ -642,10 +643,7 @@ public class MainActivity extends Activity {
         // Weather overview in the top-left corner, over the top shelf; OK opens the forecast.
         weatherCard = new WeatherView(this, false, unit);
         // The same glass as the clock pill beside the gear: darker over bright pictures, never a glow.
-        weatherGlass = new LiquidGlass(dp(WeatherView.COMPACT_H) / 2f, 0x1F000000, glassSource, screenW, screenH, unit).adaptive();
-        weatherGlass.rimStrength = 0.35f;
-        weatherGlass.darker(0x33);
-        weatherGlass.lens = dp(6);
+        weatherGlass = controlGlass(dp(WeatherView.COMPACT_H) / 2f);
         weatherCard.setBackground(weatherGlass);
         weatherCard.setFocusable(true);
         weatherCard.setClickable(true);
@@ -873,11 +871,34 @@ public class MainActivity extends Activity {
         invalidateGlass();
     }
 
+    /**
+     * The one glass for Home's small controls (weather, clock, gear) and Control Centre: the
+     * picture behind, softly blurred, with a light tint that follows its brightness. The same
+     * everywhere, so they always read as one material.
+     */
+    LiquidGlass controlGlass(float r) {
+        LiquidGlass g = new LiquidGlass(r, 0x1F000000, glassSource, screenW, screenH, unit).adaptive();
+        g.rimStrength = 0.45f;
+        g.lens = Math.min(dp(6), Math.round(r * 0.3f));
+        return g;
+    }
+
     void invalidateGlass() {
         if (dockRow != null) dockRow.invalidate();
-        if (clockBox != null) clockBox.invalidate();
-        if (weatherCard != null) weatherCard.invalidate();
+        // Each glass view redraws itself: invalidating a parent doesn't redraw its children, which
+        // left the gear and clock showing an old picture (the wallpaper) behind them.
+        invalidateTree(clockBox);
+        invalidateTree(weatherCard);
         if (menuLayer != null && menuLayer.getChildCount() > 0) menuLayer.getChildAt(0).invalidate();
+    }
+
+    static void invalidateTree(View v) {
+        if (v == null) return;
+        v.invalidate();
+        if (v instanceof ViewGroup) {
+            ViewGroup g = (ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) invalidateTree(g.getChildAt(i));
+        }
     }
 
     static final String[] WALL_KEYS = {"night", "aurora", "midnight", "sunset", "ocean", "graphite"};
@@ -1637,23 +1658,7 @@ public class MainActivity extends Activity {
             return this;
         }
 
-        boolean clear, panel;
-
-        /**
-         * A large panel's glass (Control Centre), as Apple does it: the picture's colour shows
-         * through, but a black tint that grows with the picture's brightness keeps the panel the
-         * same dark glass over a bright sky or a night scene.
-         */
-        LiquidGlass panel() {
-            adaptive = true;
-            panel = true;
-            return this;
-        }
-
-        static int panelTint(float lum) {
-            float k = Math.max(0f, Math.min(1f, (lum - 0.2f) / 0.5f));
-            return Math.round(0x47 + k * (0x9C - 0x47)) << 24;  // 28% black over dark pictures, 61% over bright
-        }
+        boolean clear;
 
         /** The view this glass sits on, when it is drawn inside another drawable (for its position). */
         View owner;
@@ -1753,7 +1758,6 @@ public class MainActivity extends Activity {
                         t = (black ? Math.max(t >>> 24, minBlack) : minBlack) << 24;
                     }
                     if (clear) t = 0x14FFFFFF;  // the same soft white frost over any picture
-                    if (panel) t = panelTint(luminanceBehind(b));
                     if (t != adaptiveTint) {
                         adaptiveTint = t;
                         if (!lit) fill.setColor(t);
@@ -1984,6 +1988,10 @@ public class MainActivity extends Activity {
 
         heroDots = new LinearLayout(this);
         heroDots.setOrientation(LinearLayout.HORIZONTAL);
+        dotRow = new LinearLayout(this);
+        dotRow.setOrientation(LinearLayout.HORIZONTAL);
+        dotRow.setGravity(Gravity.CENTER_VERTICAL);
+        heroDots.addView(dotRow);
         heroDots.setAlpha(0f);
         FrameLayout.LayoutParams dlp = new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
@@ -2073,10 +2081,7 @@ public class MainActivity extends Activity {
         switcher.setGravity(Gravity.CENTER_VERTICAL);
         int h = dp(30);
         switcher.setPadding(dp(3), 0, dp(3), 0);
-        LiquidGlass g = new LiquidGlass(h / 2f, 0x1F000000, glassSource, screenW, screenH, unit).adaptive();
-        g.rimStrength = 0.6f;
-        g.lens = dp(5);
-        switcher.setBackground(g);
+        switcher.setBackground(controlGlass(h / 2f));
         switcher.setFocusable(true);
         tabSuggestBg = new GradientDrawable();
         tabContinueBg = new GradientDrawable();
@@ -2278,16 +2283,16 @@ public class MainActivity extends Activity {
         for (int i = 0; curTitle != null && i < items.size(); i++) if (items.get(i).title.equals(curTitle)) keep = i;
         heroIndex = keep;
         shelfView.setFocusable(!items.isEmpty());
-        heroDots.removeAllViews();
-        for (int i = 0; i < items.size() && items.size() > 1 && !continueMode(); i++) {
-            View d = new View(this);
-            GradientDrawable g = new GradientDrawable();
-            g.setShape(GradientDrawable.OVAL);
-            g.setColor(Color.WHITE);
-            d.setBackground(g);
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(dp(5), dp(5));
-            lp.rightMargin = dp(5);
-            heroDots.addView(d, lp);
+        int dots = items.size() > 1 && !continueMode() ? items.size() : 0;
+        if (dots != dotRow.getChildCount()) {
+            // A different number of pages (another app's shelf): the old row fades out and the new
+            // one fades in, instead of the dots jumping as the row re-centres.
+            dotRow.animate().cancel();
+            if (dotRow.getChildCount() == 0) buildDots(dots, keep);
+            else dotRow.animate().alpha(0f).setDuration(140).setInterpolator(EASE).withEndAction(() -> {
+                buildDots(dots, heroIndex);
+                dotRow.animate().alpha(1f).setDuration(260).setInterpolator(EASE).start();
+            }).start();
         }
         buildStrip(items);
         if (items.isEmpty()) {
@@ -2299,7 +2304,7 @@ public class MainActivity extends Activity {
         boolean dock = f == shelfView || (hasDock() && i >= 0 && i < COLS);
         setHeroShown(dock);
         if (!(same && items.get(keep).title.equals(curTitle))) showHero(keep, heroDissolve && heroShown ? 2 : 0);
-        else for (int j = 0; j < heroDots.getChildCount(); j++) heroDots.getChildAt(j).setAlpha(j == keep ? 1f : 0.35f);
+        else selectDot(keep, false);
         List<Suggestions.Item> pre = items;
         io.execute(() -> {
             for (Suggestions.Item it : pre) {
@@ -2350,13 +2355,42 @@ public class MainActivity extends Activity {
         if (!user || !shelfView.hasFocus()) scheduleAdvance();
     }
 
+    void buildDots(int n, int active) {
+        dotRow.removeAllViews();
+        for (int i = 0; i < n; i++) {
+            View d = new View(this);
+            GradientDrawable g = new GradientDrawable();
+            g.setShape(GradientDrawable.OVAL);
+            g.setColor(Color.WHITE);
+            d.setBackground(g);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(dp(5), dp(5));
+            lp.leftMargin = lp.rightMargin = dp(2.5f);
+            dotRow.addView(d, lp);
+        }
+        selectDot(active, false);
+    }
+
+    /** The current page's dot brightens and grows a touch; the others dim, all on one easing. */
+    void selectDot(int index, boolean animate) {
+        for (int i = 0; i < dotRow.getChildCount(); i++) {
+            View d = dotRow.getChildAt(i);
+            boolean on = i == index;
+            float a = on ? 1f : 0.35f, sc = on ? 1.3f : 1f;
+            d.animate().cancel();
+            if (animate) d.animate().alpha(a).scaleX(sc).scaleY(sc).setDuration(420).setInterpolator(HERO_EASE).start();
+            else {
+                d.setAlpha(a);
+                d.setScaleX(sc);
+                d.setScaleY(sc);
+            }
+        }
+    }
+
     /** dir: +1 next, -1 previous, 0 first show (no slide). */
     void showHero(int index, int dir) {
         heroIndex = index;
         Suggestions.Item it = heroItems.get(index);
-        for (int i = 0; i < heroDots.getChildCount(); i++) {
-            heroDots.getChildAt(i).animate().alpha(i == index ? 1f : 0.35f).setDuration(250).start();
-        }
+        selectDot(index, true);
         int want = index;
         io.execute(() -> {
             Bitmap raw = Suggestions.image(this, it.backdrop, "w1280", screenW);
