@@ -623,7 +623,7 @@ public class MainActivity extends Activity {
         clockBox.addView(avatar, alp);
         avatar.setOnFocusChangeListener((v, has) ->
                 v.animate().scaleX(has ? 1.18f : 1f).scaleY(has ? 1.18f : 1f).translationZ(has ? dp(8) : 0)
-                        .setDuration(380).setInterpolator(LIFT).start());
+                        .setDuration(has ? 380 : 260).setInterpolator(has ? LIFT : EASE).start());
         // Profiles are off on this TV: no avatar in the status row.
         avatar.setVisibility(View.GONE);
         avatar.setFocusable(false);
@@ -650,8 +650,10 @@ public class MainActivity extends Activity {
         weatherCard.setOnFocusChangeListener((v, has) -> {
             weatherGlass.setLit(has);
             if (has) v.setAlpha(1f);
+            // Spring up, ease down: a spring back down overshoots below zero height, which put the
+            // pill behind the carousel for a moment (it vanished when focus moved to the gear).
             v.animate().scaleX(has ? 1.05f : 1f).scaleY(has ? 1.05f : 1f).translationZ(has ? dp(10) : 0)
-                    .setDuration(380).setInterpolator(LIFT).start();
+                    .setDuration(has ? 380 : 260).setInterpolator(has ? LIFT : EASE).start();
         });
         weatherCard.setPivotX(0);
         weatherCard.setPivotY(0);
