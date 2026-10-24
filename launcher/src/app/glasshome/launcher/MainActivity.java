@@ -599,8 +599,7 @@ public class MainActivity extends Activity {
             fade.start();
             handler.postDelayed(() -> ccButton.setImageBitmap(Glyphs.get("gear", dp(20),
                     ccButton.isFocused() ? 0xFF111114 : Color.WHITE)), 100);
-            v.animate().scaleX(has ? 1.12f : 1f).scaleY(has ? 1.12f : 1f).setDuration(has ? 300 : 240)
-                    .setInterpolator(has ? LIFT : EASE).start();
+            Glass.lift(v, has, 1.12f, 0);
         });
         ccButton.setOnClickListener(v -> openControlCentre());
 
@@ -652,8 +651,7 @@ public class MainActivity extends Activity {
             if (has) v.setAlpha(1f);
             // Spring up, ease down: a spring back down overshoots below zero height, which put the
             // pill behind the carousel for a moment (it vanished when focus moved to the gear).
-            v.animate().scaleX(has ? 1.05f : 1f).scaleY(has ? 1.05f : 1f).translationZ(has ? dp(10) : 0)
-                    .setDuration(has ? 380 : 260).setInterpolator(has ? LIFT : EASE).start();
+            Glass.lift(v, has, 1.05f, dp(10));
         });
         weatherCard.setPivotX(0);
         weatherCard.setPivotY(0);
@@ -2360,13 +2358,9 @@ public class MainActivity extends Activity {
     void buildDots(int n, int active) {
         dotRow.removeAllViews();
         for (int i = 0; i < n; i++) {
-            View d = new View(this);
-            GradientDrawable g = new GradientDrawable();
-            g.setShape(GradientDrawable.OVAL);
-            g.setColor(Color.WHITE);
-            d.setBackground(g);
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(dp(5), dp(5));
-            lp.leftMargin = lp.rightMargin = dp(2.5f);
+            Dot d = new Dot(this);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(dp(6.5f), dp(6.5f));
+            lp.leftMargin = lp.rightMargin = dp(1.75f);
             dotRow.addView(d, lp);
         }
         selectDot(active, false);
@@ -2375,16 +2369,46 @@ public class MainActivity extends Activity {
     /** The current page's dot brightens and grows a touch; the others dim, all on one easing. */
     void selectDot(int index, boolean animate) {
         for (int i = 0; i < dotRow.getChildCount(); i++) {
-            View d = dotRow.getChildAt(i);
-            boolean on = i == index;
-            float a = on ? 1f : 0.35f, sc = on ? 1.3f : 1f;
-            d.animate().cancel();
-            if (animate) d.animate().alpha(a).scaleX(sc).scaleY(sc).setDuration(420).setInterpolator(HERO_EASE).start();
-            else {
-                d.setAlpha(a);
-                d.setScaleX(sc);
-                d.setScaleY(sc);
+            ((Dot) dotRow.getChildAt(i)).set(i == index, animate);
+        }
+    }
+
+    /**
+     * A page dot drawn as a true anti-aliased circle at its exact size every frame (scaling a
+     * tiny bitmap drew it as a rough diamond on this TV). The current one is bigger and brighter.
+     */
+    static final class Dot extends View {
+        final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+        float f;  // 0 = other page, 1 = current
+        ValueAnimator a;
+
+        Dot(Context c) {
+            super(c);
+            p.setColor(Color.WHITE);
+        }
+
+        void set(boolean on, boolean animate) {
+            float to = on ? 1f : 0f;
+            if (a != null) a.cancel();
+            if (!animate) {
+                f = to;
+                invalidate();
+                return;
             }
+            a = ValueAnimator.ofFloat(f, to);
+            a.setDuration(420);
+            a.setInterpolator(HERO_EASE);
+            a.addUpdateListener(v -> {
+                f = (float) v.getAnimatedValue();
+                invalidate();
+            });
+            a.start();
+        }
+
+        @Override protected void onDraw(Canvas c) {
+            float max = Math.min(getWidth(), getHeight()) / 2f;
+            p.setAlpha(Math.round((0.35f + 0.65f * f) * 255));
+            c.drawCircle(getWidth() / 2f, getHeight() / 2f, max * (0.77f + 0.23f * f), p);
         }
     }
 
@@ -3611,6 +3635,11 @@ public class MainActivity extends Activity {
     /** Android TV's system click on D-pad moves, select and Back (Settings -> Home -> Navigation sounds). */
     static void navSound(Context c, KeyEvent ev) {
         if (ev.getAction() != KeyEvent.ACTION_DOWN) return;
+        int k = ev.getKeyCode();
+        if (k >= KeyEvent.KEYCODE_DPAD_UP && k <= KeyEvent.KEYCODE_DPAD_RIGHT) {
+            Glass.dirX = k == KeyEvent.KEYCODE_DPAD_LEFT ? -1 : k == KeyEvent.KEYCODE_DPAD_RIGHT ? 1 : 0;
+            Glass.dirY = k == KeyEvent.KEYCODE_DPAD_UP ? -1 : k == KeyEvent.KEYCODE_DPAD_DOWN ? 1 : 0;
+        }
         switch (ev.getKeyCode()) {
             case KeyEvent.KEYCODE_DPAD_UP:
             case KeyEvent.KEYCODE_DPAD_DOWN:

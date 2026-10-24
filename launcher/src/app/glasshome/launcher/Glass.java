@@ -111,9 +111,24 @@ final class Glass extends Drawable {
         a.start();
     }
 
-    /** The shared lift: a spring up when focused, an ease back down. */
+    /** The last direction the remote moved focus: -1/0/+1 across and down (set by navSound). */
+    static int dirX, dirY;
+
+    /**
+     * The shared lift, with the app tiles' jiggle: the control arrives with a small push from
+     * the direction the remote moved, then the spring settles it as it lifts. Eases back down.
+     */
     static void lift(android.view.View v, boolean has, float scale, float z) {
-        v.animate().scaleX(has ? scale : 1f).scaleY(has ? scale : 1f).translationZ(has ? z : 0)
-                .setDuration(has ? 380 : 260).setInterpolator(has ? MainActivity.LIFT : MainActivity.EASE).start();
+        v.animate().cancel();
+        if (has) {
+            float push = 4f * v.getResources().getDisplayMetrics().density;
+            v.setTranslationX(-dirX * push);
+            v.setTranslationY(-dirY * push);
+            v.animate().scaleX(scale).scaleY(scale).translationX(0).translationY(0).translationZ(z)
+                    .setDuration(560).setInterpolator(MainActivity.LIFT).start();
+        } else {
+            v.animate().scaleX(1f).scaleY(1f).translationX(0).translationY(0).translationZ(0)
+                    .setDuration(260).setInterpolator(MainActivity.EASE).start();
+        }
     }
 }

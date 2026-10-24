@@ -435,8 +435,7 @@ public class ControlCentreActivity extends Activity {
     }
 
     void lift(View v, boolean has) {
-        v.animate().scaleX(has ? 1.05f : 1f).scaleY(has ? 1.05f : 1f)
-                .setDuration(has ? 320 : 260).setInterpolator(has ? MainActivity.LIFT : MainActivity.EASE).start();
+        Glass.lift(v, has, 1.05f, 0);
     }
 
     // ---------------------------------------------------------------- states

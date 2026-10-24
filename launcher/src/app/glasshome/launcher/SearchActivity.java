@@ -72,9 +72,19 @@ public class SearchActivity extends Activity {
     /** One search result: a title and the UK services (installed on this TV) that stream it. */
     static final class Result {
         String title, year, type, poster, id, backdrop;
+        double imdb;
+        int tomato = -1;
         final List<Suggestions.Item> offers = new ArrayList<>();
         Intent appLaunch;
         Drawable appBanner;
+    }
+
+    /** "IMDb 8.4 · 🍅 97%": whichever of the two scores the title has. */
+    static String ratings(double imdb, int tomato) {
+        StringBuilder b = new StringBuilder();
+        if (imdb > 0) b.append(String.format(java.util.Locale.UK, "IMDb %.1f", imdb));
+        if (tomato >= 0) b.append(b.length() > 0 ? " \u00b7 " : "").append("\uD83C\uDF45 ").append(tomato).append('%');
+        return b.toString();
     }
 
     int u(float units) {
@@ -460,7 +470,7 @@ public class SearchActivity extends Activity {
     static final String JW_SEARCH = "query S($country: Country!, $language: Language!, $first: Int!, $filter: TitleFilter, $sort: PopularTitlesSorting!) {"
             + " popularTitles(country: $country, filter: $filter, first: $first, sortBy: $sort) {"
             + " edges { node { id objectType content(country: $country, language: $language) {"
-            + " title originalReleaseYear posterUrl backdrops { backdropUrl } }"
+            + " title originalReleaseYear posterUrl backdrops { backdropUrl } scoring { imdbScore tomatoMeter } }"
             + " offers(country: $country, platform: WEB) { monetizationType standardWebURL package { technicalName } } } } } }";
 
     /** What is being searched for now ("" while the field is empty). */
@@ -558,6 +568,11 @@ public class SearchActivity extends Activity {
             }
             int y = ct.optInt("originalReleaseYear", 0);
             r.year = y > 0 ? String.valueOf(y) : "";
+            JSONObject sc = ct.optJSONObject("scoring");
+            if (sc != null) {
+                r.imdb = sc.optDouble("imdbScore", 0);
+                if (!sc.isNull("tomatoMeter")) r.tomato = sc.optInt("tomatoMeter", -1);
+            }
             r.type = "SHOW".equals(n.optString("objectType")) ? "tv" : "movie";
             String poster = ct.optString("posterUrl", "");
             r.poster = poster.isEmpty() ? null
@@ -691,6 +706,7 @@ public class SearchActivity extends Activity {
         StringBuilder sb = new StringBuilder();
         if (app) sb.append("App");
         else {
+            sb.append(ratings(r.imdb, r.tomato));
             for (Suggestions.Item it : r.offers) {
                 if (sb.length() > 0) sb.append(" · ");
                 sb.append(it.provider().name);

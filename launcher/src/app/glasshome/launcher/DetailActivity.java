@@ -41,7 +41,7 @@ public class DetailActivity extends Activity {
 
     static final String QUERY = "query D($id: ID!, $c: Country!, $l: Language!) { node(id: $id) { ... on MovieOrShow {"
             + " objectType content(country: $c, language: $l) { title shortDescription originalReleaseYear runtime"
-            + " ageCertification genres { shortName } backdrops { backdropUrl } credits { name role } scoring { imdbScore }"
+            + " ageCertification genres { shortName } backdrops { backdropUrl } credits { name role } scoring { imdbScore tomatoMeter }"
             + " externalIds { tmdbId } }"
             + " offers(country: $c, platform: WEB) { monetizationType retailPrice(language: $l) standardWebURL"
             + " package { clearName technicalName } } } ... on Show { totalSeasonCount } } }";
@@ -266,7 +266,9 @@ public class DetailActivity extends Activity {
         if (!genres.isEmpty()) m.add(genres);
         JSONObject sc = c.optJSONObject("scoring");
         double imdb = sc == null ? 0 : sc.optDouble("imdbScore", 0);
-        if (imdb > 0) m.add(String.format(Locale.UK, "IMDb %.1f", imdb));
+        int tomato = sc == null || sc.isNull("tomatoMeter") ? -1 : sc.optInt("tomatoMeter", -1);
+        String scores = SearchActivity.ratings(imdb, tomato);
+        if (!scores.isEmpty()) m.add(scores);
         meta.setText(TextUtils.join("  ·  ", m));
         synopsis.setText(c.optString("shortDescription", ""));
         JSONArray credits = c.optJSONArray("credits");
