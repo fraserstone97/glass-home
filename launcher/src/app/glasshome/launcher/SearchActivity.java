@@ -74,17 +74,99 @@ public class SearchActivity extends Activity {
         String title, year, type, poster, id, backdrop;
         double imdb;
         int tomato = -1;
+        boolean certified, rentBuy;
         final List<Suggestions.Item> offers = new ArrayList<>();
         Intent appLaunch;
         Drawable appBanner;
     }
 
-    /** "IMDb 8.4 · 🍅 97%": whichever of the two scores the title has. */
-    static String ratings(double imdb, int tomato) {
+    /** Stand-ins in the text for Rotten Tomatoes' icons; showIcons() draws them. */
+    static final char FRESH = '\uE000', ROTTEN = '\uE001', CERTIFIED = '\uE002';
+
+    /**
+     * "IMDb 8.4 · [tomato] 97%": whichever of the two scores the title has. As on Rotten Tomatoes,
+     * 60% and up is a red tomato (fresh), below that a green splat (rotten), and the badge for
+     * films and series Rotten Tomatoes has certified fresh.
+     */
+    static String ratings(double imdb, int tomato, boolean certified) {
         StringBuilder b = new StringBuilder();
         if (imdb > 0) b.append(String.format(java.util.Locale.UK, "IMDb %.1f", imdb));
-        if (tomato >= 0) b.append(b.length() > 0 ? " \u00b7 " : "").append("\uD83C\uDF45 ").append(tomato).append('%');
+        if (tomato >= 0) b.append(b.length() > 0 ? " \u00b7 " : "").append(certified && tomato >= 60 ? CERTIFIED : tomato >= 60 ? FRESH : ROTTEN)
+                .append(' ').append(tomato).append('%');
         return b.toString();
+    }
+
+    /** Swaps the stand-ins in a TextView's text for the drawn icons, sized to its text. */
+    static void showIcons(TextView t) {
+        CharSequence s = t.getText();
+        if (s == null) return;
+        String str = s.toString();
+        if (str.indexOf(FRESH) < 0 && str.indexOf(ROTTEN) < 0 && str.indexOf(CERTIFIED) < 0) return;
+        android.text.SpannableString sp = new android.text.SpannableString(s);
+        int size = Math.round(t.getTextSize() * 1.05f);
+        for (int i = 0; i < s.length(); i++) {
+            char ch = s.charAt(i);
+            if (ch != FRESH && ch != ROTTEN && ch != CERTIFIED) continue;
+            android.graphics.drawable.Drawable d = icon(t.getContext(), ch, size);
+            d.setBounds(0, 0, size, size);
+            sp.setSpan(new android.text.style.ImageSpan(d, android.text.style.DynamicDrawableSpan.ALIGN_BASELINE),
+                    i, i + 1, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        }
+        t.setText(sp);
+    }
+
+    /**
+     * The icon artwork in res/drawable-nodpi (rt_fresh, rt_certified, rt_rotten) when it's there;
+     * otherwise a drawn tomato or splat. Certified falls back to the fresh tomato.
+     */
+    static android.graphics.drawable.Drawable icon(android.content.Context c, char kind, int size) {
+        String[] names = kind == CERTIFIED ? new String[]{"rt_certified", "rt_fresh"}
+                : kind == FRESH ? new String[]{"rt_fresh"} : new String[]{"rt_rotten"};
+        for (String n : names) {
+            int id = c.getResources().getIdentifier(n, "drawable", c.getPackageName());
+            if (id != 0) return c.getDrawable(id);
+        }
+        return new android.graphics.drawable.BitmapDrawable(c.getResources(), tomatoIcon(kind != ROTTEN, size * 2));
+    }
+
+    /** A red tomato with a green crown (fresh), or a green splat (rotten), drawn at s px. */
+    static android.graphics.Bitmap tomatoIcon(boolean fresh, int s) {
+        android.graphics.Bitmap b = android.graphics.Bitmap.createBitmap(s, s, android.graphics.Bitmap.Config.ARGB_8888);
+        android.graphics.Canvas c = new android.graphics.Canvas(b);
+        android.graphics.Paint p = new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG);
+        float m = s / 2f;
+        if (fresh) {
+            p.setShader(new android.graphics.RadialGradient(s * 0.38f, s * 0.42f, s * 0.55f,
+                    0xFFFF5A3C, 0xFFD8200F, android.graphics.Shader.TileMode.CLAMP));
+            c.drawOval(s * 0.06f, s * 0.2f, s * 0.94f, s * 0.96f, p);
+            p.setShader(null);
+            p.setColor(0xFF2FA84F);
+            android.graphics.Path leaf = new android.graphics.Path();
+            for (int i = 0; i < 5; i++) {  // a five-pointed crown of leaves
+                double a = Math.toRadians(-90 + i * 72);
+                float x = m + (float) Math.cos(a) * s * 0.2f, y = s * 0.24f + (float) Math.sin(a) * s * 0.1f;
+                leaf.addOval(Math.min(m, x) - s * 0.04f, Math.min(s * 0.24f, y) - s * 0.035f,
+                        Math.max(m, x) + s * 0.04f, Math.max(s * 0.24f, y) + s * 0.035f, android.graphics.Path.Direction.CW);
+            }
+            c.drawPath(leaf, p);
+        } else {
+            p.setColor(0xFF4CB03A);
+            android.graphics.Path splat = new android.graphics.Path();
+            int n = 9;
+            for (int i = 0; i <= n * 2; i++) {  // a blob with uneven drips round its edge
+                double a = Math.toRadians(i * 180.0 / n);
+                float r = s * (i % 2 == 0 ? 0.47f - (i % 4 == 0 ? 0.04f : 0f) : 0.3f);
+                float x = m + (float) Math.cos(a) * r, y = m + (float) Math.sin(a) * r;
+                if (i == 0) splat.moveTo(x, y);
+                else splat.lineTo(x, y);
+            }
+            splat.close();
+            p.setPathEffect(new android.graphics.CornerPathEffect(s * 0.12f));
+            c.drawPath(splat, p);
+            p.setPathEffect(null);
+            c.drawCircle(m, m, s * 0.3f, p);
+        }
+        return b;
     }
 
     int u(float units) {
@@ -470,7 +552,7 @@ public class SearchActivity extends Activity {
     static final String JW_SEARCH = "query S($country: Country!, $language: Language!, $first: Int!, $filter: TitleFilter, $sort: PopularTitlesSorting!) {"
             + " popularTitles(country: $country, filter: $filter, first: $first, sortBy: $sort) {"
             + " edges { node { id objectType content(country: $country, language: $language) {"
-            + " title originalReleaseYear posterUrl backdrops { backdropUrl } scoring { imdbScore tomatoMeter } }"
+            + " title originalReleaseYear posterUrl backdrops { backdropUrl } scoring { imdbScore tomatoMeter certifiedFresh } }"
             + " offers(country: $country, platform: WEB) { monetizationType standardWebURL package { technicalName } } } } } }";
 
     /** What is being searched for now ("" while the field is empty). */
@@ -527,7 +609,7 @@ public class SearchActivity extends Activity {
         return out;
     }
 
-    /** Titles (popular, or matching the query) that stream on a UK service installed on this TV. */
+    /** Popular titles on your UK services, or every title matching the query. */
     List<Result> fetch(String q) throws Exception {
         List<Suggestions.Provider> mine = new ArrayList<>();
         JSONArray pkgs = new JSONArray();
@@ -572,6 +654,7 @@ public class SearchActivity extends Activity {
             if (sc != null) {
                 r.imdb = sc.optDouble("imdbScore", 0);
                 if (!sc.isNull("tomatoMeter")) r.tomato = sc.optInt("tomatoMeter", -1);
+                r.certified = sc.optBoolean("certifiedFresh", false);
             }
             r.type = "SHOW".equals(n.optString("objectType")) ? "tv" : "movie";
             String poster = ct.optString("posterUrl", "");
@@ -593,7 +676,13 @@ public class SearchActivity extends Activity {
                     break;
                 }
             }
-            if (r.offers.isEmpty()) continue;
+            for (int k = 0; offers != null && k < offers.length(); k++) {
+                String m = offers.getJSONObject(k).optString("monetizationType");
+                if (m.equals("RENT") || m.equals("BUY")) r.rentBuy = true;
+            }
+            // Popular Now is only what you can watch on your services; a search finds everything
+            // (Morbius, rent or buy only), and its title page lists where to rent or buy it.
+            if (r.offers.isEmpty() && q.isEmpty()) continue;
             // JustWatch lists each run of a programme separately (Doctor Who 1963, 2005, 2023):
             // show it once, with every service that has any of them.
             String key = norm(r.title);
@@ -706,13 +795,15 @@ public class SearchActivity extends Activity {
         StringBuilder sb = new StringBuilder();
         if (app) sb.append("App");
         else {
-            sb.append(ratings(r.imdb, r.tomato));
+            sb.append(ratings(r.imdb, r.tomato, r.certified));
             for (Suggestions.Item it : r.offers) {
                 if (sb.length() > 0) sb.append(" · ");
                 sb.append(it.provider().name);
             }
+            if (r.offers.isEmpty()) sb.append(sb.length() > 0 ? " · " : "").append(r.rentBuy ? "Rent or Buy" : "Not Streaming");
         }
         sub.setText(sb);
+        showIcons(sub);
         sub.setTextColor(0x8CFFFFFF);
         sub.setTypeface(Ui.font(this, "regular"));
         sub.setSingleLine(true);

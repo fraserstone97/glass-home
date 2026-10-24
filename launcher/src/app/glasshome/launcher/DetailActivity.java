@@ -41,7 +41,7 @@ public class DetailActivity extends Activity {
 
     static final String QUERY = "query D($id: ID!, $c: Country!, $l: Language!) { node(id: $id) { ... on MovieOrShow {"
             + " objectType content(country: $c, language: $l) { title shortDescription originalReleaseYear runtime"
-            + " ageCertification genres { shortName } backdrops { backdropUrl } credits { name role } scoring { imdbScore tomatoMeter }"
+            + " ageCertification genres { shortName } backdrops { backdropUrl } credits { name role } scoring { imdbScore tomatoMeter certifiedFresh }"
             + " externalIds { tmdbId } }"
             + " offers(country: $c, platform: WEB) { monetizationType retailPrice(language: $l) standardWebURL"
             + " package { clearName technicalName } } } ... on Show { totalSeasonCount } } }";
@@ -267,9 +267,10 @@ public class DetailActivity extends Activity {
         JSONObject sc = c.optJSONObject("scoring");
         double imdb = sc == null ? 0 : sc.optDouble("imdbScore", 0);
         int tomato = sc == null || sc.isNull("tomatoMeter") ? -1 : sc.optInt("tomatoMeter", -1);
-        String scores = SearchActivity.ratings(imdb, tomato);
+        String scores = SearchActivity.ratings(imdb, tomato, sc != null && sc.optBoolean("certifiedFresh", false));
         if (!scores.isEmpty()) m.add(scores);
         meta.setText(TextUtils.join("  ·  ", m));
+        SearchActivity.showIcons(meta);
         synopsis.setText(c.optString("shortDescription", ""));
         JSONArray credits = c.optJSONArray("credits");
         List<String> actors = new ArrayList<>();
