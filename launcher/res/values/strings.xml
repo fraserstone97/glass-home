@@ -5,6 +5,6 @@
     <string name="label_sleep">Glass Home sleep</string>
     <string name="label_power">Glass Home – Power Off</string>
     <string name="label_keys">Glass Home – Remote buttons</string>
-    <string name="power_service_desc">Lets Glass Home put the TV to sleep (Power Off, Sleep Timer) and close apps when you press Clean in Control Centre. It is only used when you ask Glass Home to do one of these.</string>
+    <string name="power_service_desc">Lets Glass Home put the TV to sleep (Power Off, Sleep Timer) on TVs that don\'t allow it any other way. It is only used when you ask, and reads nothing on screen.</string>
     <string name="keys_service_desc">Makes the remote\'s Netflix, Prime Video, YouTube and Quick Settings buttons work with Glass Home. It only looks at those buttons and reads nothing on screen.</string>
 </resources>

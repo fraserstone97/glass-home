@@ -38,7 +38,7 @@ final class Weather {
     static final String SRC_METOFFICE = "metoffice", SRC_OPEN_METEO = "openmeteo", SRC_MET = "met", SRC_WTTR = "wttr";
     static final String[] SOURCES = {SRC_METOFFICE, SRC_OPEN_METEO, SRC_MET, SRC_WTTR};
     static final int[] REFRESH_CHOICES = {10, 15, 30, 60};
-    static final String UA = "HumeLauncher/6.2 (Android TV launcher)";
+    static final String UA = "GlassHome/1.1 (github.com/fraserstone97/glass-home)";
 
     private Weather() {
     }

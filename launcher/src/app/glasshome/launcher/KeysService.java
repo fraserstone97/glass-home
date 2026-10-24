@@ -40,6 +40,25 @@ public class KeysService extends AccessibilityService {
         if (e.getAction() == KeyEvent.ACTION_DOWN && e.getRepeatCount() == 0 && !isCommon(k)) {
             Log.i(TAG, "key " + KeyEvent.keyCodeToString(k) + " (" + k + ") scan=" + e.getScanCode());
         }
+        if (k == KeyEvent.KEYCODE_SEARCH || k == KeyEvent.KEYCODE_VOICE_ASSIST || k == KeyEvent.KEYCODE_ASSIST) {
+            // Hold to talk: Search opens listening on the press and searches what you said on
+            // release, like the Siri button.
+            Log.i(TAG, "mic " + (e.getAction() == KeyEvent.ACTION_DOWN ? "down" : "up") + " repeat=" + e.getRepeatCount()
+                    + " held=" + (e.getEventTime() - e.getDownTime()) + "ms");
+            if (e.getAction() == KeyEvent.ACTION_DOWN && e.getRepeatCount() == 0 && SearchActivity.stopIfListening()) {
+                return true;  // a second press while listening stops it
+            }
+            if (e.getAction() == KeyEvent.ACTION_DOWN && e.getRepeatCount() == 0) {
+                SearchActivity.pressedAt = android.os.SystemClock.uptimeMillis();
+                startActivity(new Intent(this, SearchActivity.class).setAction(Intent.ACTION_VOICE_COMMAND)
+                        .putExtra("hold", true).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT));
+            } else if (e.getAction() == KeyEvent.ACTION_UP && e.getEventTime() - e.getDownTime() > 450) {
+                // A real hold being let go. Some remotes report "up" straight after "down" however
+                // long the button is held; that's treated as a tap, and listening ends when you stop talking.
+                SearchActivity.released();
+            }
+            return true;
+        }
         String target = KEYS.get(k);
         if (target == null) return false;
         if (e.getAction() == KeyEvent.ACTION_DOWN && e.getRepeatCount() == 0) open(target);

@@ -1,7 +1,5 @@
 package app.glasshome.launcher;
 
-import android.animation.Animator;
-import android.animation.AnimatorListenerAdapter;
 import android.animation.ObjectAnimator;
 import android.animation.ValueAnimator;
 import android.app.Activity;
@@ -18,26 +16,20 @@ import android.content.pm.ActivityInfo;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
-import android.content.res.Resources;
-import android.content.res.TypedArray;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.LinearGradient;
 import android.graphics.Outline;
 import android.graphics.Paint;
-import android.graphics.PorterDuff;
 import android.graphics.RadialGradient;
 import android.graphics.Rect;
 import android.graphics.RectF;
-import android.graphics.RenderEffect;
 import android.graphics.Shader;
 import android.graphics.Typeface;
 import android.graphics.drawable.BitmapDrawable;
-import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
-import android.graphics.drawable.LayerDrawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -46,7 +38,6 @@ import android.os.Looper;
 import android.provider.Settings;
 import android.text.TextUtils;
 import android.util.DisplayMetrics;
-import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.View;
@@ -60,7 +51,6 @@ import android.widget.ScrollView;
 import android.widget.TextClock;
 import android.widget.TextView;
 import android.widget.Toast;
-import android.service.notification.NotificationListenerService;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -150,9 +140,7 @@ public class MainActivity extends Activity {
     /** The dots themselves, inside heroDots (which moves and fades the whole indicator). */
     LinearLayout dotRow;
     ImageView heroLogo;
-    TextView heroTitle, heroMeta, heroOverview, heroRemove;
-    GradientDrawable heroRemoveBg;
-    boolean removeSelected;
+    TextView heroTitle, heroMeta, heroOverview;
     /** tvOS-style capsule button: glass when idle, solid white with dark text when focused. */
     LinearLayout heroButton;
     TextView heroBtnText;
@@ -160,7 +148,7 @@ public class MainActivity extends Activity {
     ImageView heroProvider;
     GradientDrawable heroBtnBg;
     List<Suggestions.Item> heroItems = new ArrayList<>();
-    /** The full carousel (Continue Watching + recommendations); heroItems may be one app's subset. */
+    /** The full carousel (every service's recommendations); heroItems may be one app's subset. */
     List<Suggestions.Item> heroAll = new ArrayList<>();
     /** The dock app whose own titles the carousel shows, or null for the full mix. */
     String shelfPkg;
@@ -174,6 +162,8 @@ public class MainActivity extends Activity {
     View dockRow;
     boolean returningFromSettings;
     final java.util.concurrent.ExecutorService io = java.util.concurrent.Executors.newSingleThreadExecutor();
+    final java.util.concurrent.ExecutorService preload = java.util.concurrent.Executors.newSingleThreadExecutor();
+    volatile int preloadGen;
     final Runnable heroAdvance = () -> heroStep(1, false);
     ShelfScrollView scroll;
     LinearLayout content;
@@ -200,15 +190,10 @@ public class MainActivity extends Activity {
     boolean folderMode;
     boolean resumed;
     ObjectAnimator wiggle;
-    AppEntry shelfEntry;
     BroadcastReceiver pkgReceiver;
-
-    /** Full-screen card that zooms out of a tile when an app is launched. */
-    /** The card that grew into the app, kept so it can shrink back into its tile on return. */
 
     final Runnable shelfUpdate = () -> {
         if (focusedIndex >= 0 && focusedIndex < shown.size()) {
-            updateShelf(shown.get(focusedIndex));
             shelfFor(shown.get(focusedIndex), hasDock() && focusedIndex < COLS);
         }
     };
@@ -252,7 +237,7 @@ public class MainActivity extends Activity {
         String wall = prefs.getString("wallpaper", "night");
         wallPrefetch = new java.util.concurrent.FutureTask<>(() -> makeWallpaper(wall));
         wallPrefetchStyle = wall;
-        new Thread((Runnable) wallPrefetch, "hume-wallpaper").start();
+        new Thread((Runnable) wallPrefetch, "wallpaper").start();
         // After an update that changes what the top shelf holds, start from a fresh carousel.
         if (Suggestions.prefs(this).getInt("cache_format", 0) != 3) {
             Suggestions.changed(this);
@@ -297,7 +282,7 @@ public class MainActivity extends Activity {
         if (idle) exitIdle();
         resetIdle();
         // Home always lands on the first app in the dock: close any overlay first
-        // (Control Center, profiles, Inputs, weather forecast, menus, move mode, folder).
+        // (Control Center, Inputs, weather forecast, menus, move mode, folder).
         if (pickerLayer != null) {
             popoverReturn = null;
             FrameLayout l = pickerLayer;
@@ -311,10 +296,8 @@ public class MainActivity extends Activity {
         if (moveIndex >= 0) endMove();
         if (folderMode) {
             folderMode = false;
-            switcher.setAlpha(1f);
             weatherCard.setAlpha(weatherAlpha());
             buildGrid();
-            shelfEntry = null;
             scroll.scrollTo(0, 0);
             focusIndex(0);
         } else {
@@ -329,6 +312,21 @@ public class MainActivity extends Activity {
         super.onConfigurationChanged(c);
         android.graphics.Point size = Ui.screen(this);
         if (size.x != screenW || size.y != screenH || Ui.unit(this) != unit) recreate();
+    }
+
+    /** Home is on screen (started), even under a see-through page such as Search. */
+    static volatile boolean onScreen;
+
+    @Override
+    protected void onStart() {
+        super.onStart();
+        onScreen = true;
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+        onScreen = false;
     }
 
     @Override
@@ -388,12 +386,11 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** What Home refreshes when it comes back: the carousel, weather and tabs, and the minute timer. */
+    /** What Home refreshes when it comes back: the carousel and weather, and the minute timer. */
     final Runnable resumeWork = () -> {
         if (!resumed) return;
         loadHero();
         updateWeather();
-        applyTabs();
         resetIdle();  // the return clears pending callbacks, the idle timer among them
         handler.removeCallbacks(this.weatherTick);
         handler.post(this.weatherTick);
@@ -421,7 +418,6 @@ public class MainActivity extends Activity {
                 // already unregistered
             }
         }
-        if (wakeReceiver != null) unregisterReceiver(wakeReceiver);
         handler.removeCallbacksAndMessages(null);
     }
 
@@ -464,7 +460,6 @@ public class MainActivity extends Activity {
         scroll.setFillViewport(true);
         scroll.setOnScrollChangeListener((v, x, y, ox, oy) -> {
             if (!statusFocused()) clockBox.setAlpha(clockAlpha());
-            if (!switcher.isFocused()) switcher.setAlpha(folderMode ? 0f : clockAlpha());
             if (weatherCard != null && !weatherCard.isFocused()) weatherCard.setAlpha(weatherAlpha());
             if (dockRow != null) dockRow.invalidate();
         });
@@ -518,7 +513,7 @@ public class MainActivity extends Activity {
         content.addView(shelf, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, shelfH));
 
         // tvOS 26 status row (per Apple's Control Center reference): plain time, then a glass
-        // Control Center button and the profile avatar; each turns white/lifts when focused.
+        // Control Center button that turns white and lifts when focused.
         int btn = dp(34);
         clockBox = new LinearLayout(this);
         clockBox.setOrientation(LinearLayout.HORIZONTAL);
@@ -531,49 +526,23 @@ public class MainActivity extends Activity {
         time.setFormat12Hour("h:mm a");
         time.setFormat24Hour("H:mm");
         time.setAllCaps(true);
-        // Internet status, left of the time: white when online, orange when there is no internet.
+        // Internet status, left of the time, drawn at its exact size (no scaling, so it stays crisp).
         netIcon = new ImageView(this);
-        LinearLayout.LayoutParams nlp = new LinearLayout.LayoutParams(dp(24), dp(20));
-        nlp.rightMargin = dp(8);
-        // A faint dark chip behind the network icon and time, for contrast over bright artwork.
+        netIcon.setScaleType(ImageView.ScaleType.CENTER);
+        LinearLayout.LayoutParams nlp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        nlp.rightMargin = dp(7);
+        // The network icon and time on the same glass as the gear beside it and the weather
+        // opposite: one material across the top of the screen. Just to read, never focused.
         LinearLayout timeChip = new LinearLayout(this);
         timeChip.setOrientation(LinearLayout.HORIZONTAL);
         timeChip.setGravity(Gravity.CENTER_VERTICAL);
-        timeChip.setPadding(dp(12), 0, dp(14), 0);
-        GradientDrawable chipBg = new GradientDrawable();
-        chipBg.setCornerRadius(btn / 2f);
-        chipBg.setColor(0x47000000);
-        timeChip.setBackground(chipBg);
+        timeChip.setPadding(dp(13), 0, dp(15), 0);
+        timeChip.setBackground(controlGlass(btn / 2f));
         // No text shadow: the pill gives the contrast, and a blurred shadow is cut off at the
         // text's own edges, which showed as a faint dark box around the numbers.
         timeChip.addView(netIcon, nlp);
         timeChip.addView(time);
         clockBox.addView(timeChip, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, btn));
-
-        // Refresh: reloads every part of the carousel (recommendations, news, Continue Watching) and weather.
-        refreshButton = new ImageView(this);
-        refreshButton.setScaleType(ImageView.ScaleType.CENTER);
-        refreshButton.setImageBitmap(Glyphs.get("refresh", dp(20), Color.WHITE));
-        LiquidGlass rfGlass = new LiquidGlass(btn / 2f, 0x1F000000, glassSource, screenW, screenH, unit).adaptive();
-        rfGlass.lens = dp(4);
-        refreshButton.setBackground(rfGlass);
-        refreshButton.setFocusable(true);
-        refreshButton.setClickable(true);
-        LinearLayout.LayoutParams rblp = new LinearLayout.LayoutParams(btn, btn);
-        rblp.leftMargin = dp(18);
-        clockBox.addView(refreshButton, rblp);
-        // Hidden on this TV: the carousel and weather refresh on their own.
-        refreshButton.setVisibility(View.GONE);
-        refreshButton.setFocusable(false);
-        GradientDrawable rfLit = new GradientDrawable();
-        rfLit.setShape(GradientDrawable.OVAL);
-        rfLit.setColor(Color.WHITE);
-        refreshButton.setOnFocusChangeListener((v, has) -> {
-            refreshButton.setBackground(has ? rfLit : rfGlass);
-            refreshButton.setImageBitmap(Glyphs.get("refresh", dp(20), has ? 0xFF111114 : Color.WHITE));
-            v.animate().scaleX(has ? 1.12f : 1f).scaleY(has ? 1.12f : 1f).setDuration(380).setInterpolator(LIFT).start();
-        });
-        refreshButton.setOnClickListener(v -> refreshAll());
 
         ccButton = new ImageView(this);
         ccButton.setScaleType(ImageView.ScaleType.CENTER);
@@ -604,38 +573,15 @@ public class MainActivity extends Activity {
         });
         ccButton.setOnClickListener(v -> openControlCentre());
 
-
-        int av = btn;
-        ImageView avatar = new ImageView(this);
-        avatar.setImageBitmap(Profiles.avatar(this, Profiles.current(this), av));
-        avatar.setFocusable(true);
-        avatar.setClickable(true);
-        avatar.setOutlineProvider(new ViewOutlineProvider() {
-            @Override public void getOutline(View v, Outline o) {
-                o.setOval(0, 0, v.getWidth(), v.getHeight());
-            }
-        });
-        avatar.setElevation(dp(2));
-        avatarView = avatar;
-        avatarSize = av;
-        LinearLayout.LayoutParams alp = new LinearLayout.LayoutParams(av, av);
-        alp.leftMargin = dp(12);
-        clockBox.addView(avatar, alp);
-        avatar.setOnFocusChangeListener((v, has) ->
-                v.animate().scaleX(has ? 1.18f : 1f).scaleY(has ? 1.18f : 1f).translationZ(has ? dp(8) : 0)
-                        .setDuration(has ? 380 : 260).setInterpolator(has ? LIFT : EASE).start());
-        // Profiles are off on this TV: no avatar in the status row.
-        avatar.setVisibility(View.GONE);
-        avatar.setFocusable(false);
-
-        // Room around the buttons for their focus growth (1.12x / 1.18x) so nothing is clipped;
+        // Room around the button for its focus growth (1.12x) so nothing is clipped;
         // the margins shrink by the same amount, so the row sits exactly where it did.
         int grow = dp(6);
         clockBox.setPadding(grow, grow, grow, grow);
         clockBox.setClipToPadding(false);
         FrameLayout.LayoutParams clp = new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, btn + 2 * grow, Gravity.TOP | Gravity.END);
-        clp.topMargin = dp(24) - grow;
+        // On the weather pill's centre line, so the two read as one row.
+        clp.topMargin = dp(24) + (dp(WeatherView.COMPACT_H) - btn) / 2 - grow;
         clp.rightMargin = dockOuter - grow;
         root.addView(clockBox, clp);
         watchNetwork();
@@ -660,7 +606,8 @@ public class MainActivity extends Activity {
         weatherCard.setPivotY(0);
         weatherCard.setOnClickListener(v -> showWeather());
         // Top left, level with the status row and inside the same 48 px edge margin.
-        FrameLayout.LayoutParams wlp = new FrameLayout.LayoutParams(dp(WeatherView.COMPACT_W), dp(WeatherView.COMPACT_H),
+        // As wide as what it says, so its margins are even whatever the weather and place.
+        FrameLayout.LayoutParams wlp = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(WeatherView.COMPACT_H),
                 Gravity.TOP | Gravity.START);
         wlp.topMargin = dp(24);
         wlp.leftMargin = dockOuter;
@@ -809,9 +756,7 @@ public class MainActivity extends Activity {
                             .translationZ(dp(18)).setDuration(560).setInterpolator(LIFT).start();
                     label.animate().alpha(1f).translationY(tileH * (FOCUS_SCALE - 1f) / 2f).setDuration(320)
                             .setInterpolator(EASE).start();
-                    // Liquid-glass illumination: a glare sweeps across once, then rests and
-                    // drifts with the card's gentle sway (HIG: "gently sways while the surface
-                    // illuminates").
+                    // Liquid-glass illumination: a glare sweeps across once, then rests on the card.
                     glare.animate().cancel();
                     glare.setTranslationX(-tileW * 0.7f);
                     glare.setAlpha(1f);
@@ -823,7 +768,6 @@ public class MainActivity extends Activity {
                 onTileFocused(index);
             } else {
                 cell.setTranslationZ(0);
-                stopSway(v);
                 v.animate().withLayer().scaleX(1f).scaleY(1f).translationX(0).translationY(0).translationZ(0)
                         .setDuration(300).setInterpolator(EASE).start();
                 label.animate().alpha(0f).translationY(0).setDuration(160).setInterpolator(EASE).start();
@@ -837,7 +781,6 @@ public class MainActivity extends Activity {
         tile.setOnClickListener(v -> {
             if (moveIndex >= 0) return;
             // Pressed state (HIG): the card dips instantly, then the action runs.
-            stopSway(v);
             v.animate().scaleX(FOCUS_SCALE * 0.92f).scaleY(FOCUS_SCALE * 0.92f).setDuration(90)
                     .setInterpolator(EASE).withEndAction(() -> {
                         v.animate().scaleX(FOCUS_SCALE).scaleY(FOCUS_SCALE).setDuration(420).setInterpolator(LIFT).start();
@@ -966,39 +909,6 @@ public class MainActivity extends Activity {
                     new float[]{0f, 0.55f, 1f}, Shader.TileMode.CLAMP));
             c.drawRect(0, 0, w, h, p);
         }
-        return b;
-    }
-
-    void startWallpaperDrift() {
-        ObjectAnimator dx = ObjectAnimator.ofFloat(wallView, View.TRANSLATION_X, -dp(60), dp(60));
-        dx.setDuration(38000);
-        ObjectAnimator dy = ObjectAnimator.ofFloat(wallView, View.TRANSLATION_Y, dp(30), -dp(30));
-        dy.setDuration(29000);
-        for (ObjectAnimator an : new ObjectAnimator[]{dx, dy}) {
-            an.setRepeatCount(ValueAnimator.INFINITE);
-            an.setRepeatMode(ValueAnimator.REVERSE);
-            an.setInterpolator(new PathInterpolator(0.45f, 0f, 0.55f, 1f));
-            an.start();
-        }
-    }
-
-    /** Round profile avatar: indigo-to-pink gradient with a person glyph. */
-    Bitmap avatarBitmap(int size) {
-        Bitmap b = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888);
-        Canvas c = new Canvas(b);
-        Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
-        p.setShader(new LinearGradient(0, 0, 0, size, 0xFFA8A8B0, 0xFF838389, Shader.TileMode.CLAMP));
-        float r = size / 2f;
-        c.drawCircle(r, r, r, p);
-        p.setShader(null);
-        p.setColor(0xF2FFFFFF);
-        c.drawCircle(r, size * 0.40f, size * 0.17f, p);
-        c.save();
-        android.graphics.Path clip = new android.graphics.Path();
-        clip.addCircle(r, r, r, android.graphics.Path.Direction.CW);
-        c.clipPath(clip);
-        c.drawOval(size * 0.20f, size * 0.64f, size * 0.80f, size * 1.10f, p);
-        c.restore();
         return b;
     }
 
@@ -1560,22 +1470,6 @@ public class MainActivity extends Activity {
         return g;
     }
 
-    Bitmap grainBitmap;
-
-    /** Fine monochrome noise, tiled over glass to give it a frosted texture. */
-    Bitmap grain() {
-        if (grainBitmap != null) return grainBitmap;
-        int n = 96;
-        int[] px = new int[n * n];
-        java.util.Random rnd = new java.util.Random(7);
-        for (int i = 0; i < px.length; i++) {
-            int a = rnd.nextInt(14);
-            px[i] = rnd.nextBoolean() ? Color.argb(a, 255, 255, 255) : Color.argb(a, 0, 0, 0);
-        }
-        grainBitmap = Bitmap.createBitmap(px, n, n, Bitmap.Config.ARGB_8888);
-        return grainBitmap;
-    }
-
     /**
      * Liquid Glass (iOS/tvOS 26), drawn from what is actually behind the surface: a blurred,
      * colour-boosted copy of the backdrop aligned to the surface's screen position; a band along
@@ -1587,7 +1481,7 @@ public class MainActivity extends Activity {
             Bitmap get();
         }
 
-        final float r, density;
+        final float r;
         final Backdrop backdrop;
         final int screenW, screenH;
         final int baseTint;
@@ -1613,7 +1507,6 @@ public class MainActivity extends Activity {
             this.backdrop = backdrop;
             this.screenW = screenW;
             this.screenH = screenH;
-            this.density = density;
             fill.setColor(tint);
             lens1.setStyle(Paint.Style.STROKE);
             lens2.setStyle(Paint.Style.STROKE);
@@ -1624,16 +1517,12 @@ public class MainActivity extends Activity {
         }
 
         boolean lit, adaptive;
-        int adaptiveTint, minBlack;
+        int adaptiveTint;
         Bitmap lumFor;
         int lumX = Integer.MIN_VALUE, lumY;
 
-        /** Never lighter than this much black: for text-heavy tiles (Control Center). */
-        LiquidGlass darker(int alpha) {
-            minBlack = alpha;
-            return this;
-        }
-        final int[] sample = new int[64];
+        /** The view this glass sits on, when it is drawn inside another drawable (for its position). */
+        View owner;
 
         /**
          * Glass for small controls (Liquid Glass "regular"): the backdrop is desaturated so the
@@ -1641,31 +1530,6 @@ public class MainActivity extends Activity {
          * brightness behind it \u2014 darker over bright artwork so white text stays legible, a light
          * frost over dark artwork so the control stays visible.
          */
-        /**
-         * Clearer glass: the frosted copy of the picture is drawn partly transparent, so the real
-         * picture shows through it, with a lighter tint (weather pill, status buttons).
-         */
-        LiquidGlass clear() {
-            // Colour-neutral: no tint picked up from the wallpaper, just a light frost, the rim and the lensing.
-            android.graphics.ColorMatrix cm = new android.graphics.ColorMatrix();
-            cm.setSaturation(0f);
-            android.graphics.ColorMatrixColorFilter grey = new android.graphics.ColorMatrixColorFilter(cm);
-            body.setColorFilter(grey);
-            lens1.setColorFilter(grey);
-            lens2.setColorFilter(grey);
-            body.setAlpha(70);
-            lens1.setAlpha(80);
-            lens2.setAlpha(80);
-            minBlack = 0;
-            clear = true;
-            return this;
-        }
-
-        boolean clear;
-
-        /** The view this glass sits on, when it is drawn inside another drawable (for its position). */
-        View owner;
-
         LiquidGlass adaptive() {
             adaptive = true;
             android.graphics.ColorMatrix cm = new android.graphics.ColorMatrix();
@@ -1756,11 +1620,6 @@ public class MainActivity extends Activity {
                     lumX = loc[0];
                     lumY = loc[1];
                     int t = tintFor(luminanceBehind(b));
-                    if (minBlack > 0) {
-                        boolean black = (t & 0xFFFFFF) == 0;
-                        t = (black ? Math.max(t >>> 24, minBlack) : minBlack) << 24;
-                    }
-                    if (clear) t = 0x14FFFFFF;  // the same soft white frost over any picture
                     if (t != adaptiveTint) {
                         adaptiveTint = t;
                         if (!lit) fill.setColor(t);
@@ -1788,95 +1647,6 @@ public class MainActivity extends Activity {
         @Override public void setAlpha(int a) { }
         @Override public void setColorFilter(android.graphics.ColorFilter cf) { }
         @Override public int getOpacity() { return android.graphics.PixelFormat.TRANSLUCENT; }
-    }
-
-    /**
-     * Frosted Liquid Glass surface: tinted luminosity lift, fine frost grain, a soft inner glow
-     * at the top, gentle shade at the bottom, and a rim that catches light on the top edge and
-     * fades down the sides (no uniform outline).
-     */
-    static class FrostedGlass extends Drawable {
-        final float r, density;
-        final int tint;
-        final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
-        final Paint grainPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        final Paint glow = new Paint(Paint.ANTI_ALIAS_FLAG);
-        final Paint shade = new Paint(Paint.ANTI_ALIAS_FLAG);
-        final Paint rim = new Paint(Paint.ANTI_ALIAS_FLAG);
-        final android.graphics.RectF box = new android.graphics.RectF();
-        final android.graphics.Path clip = new android.graphics.Path();
-        /** 1 = full light-catching rim (dock); lower for small controls like the capsule. */
-        float rimStrength = 1f;
-
-        FrostedGlass(float r, int tint, Bitmap grain, float density) {
-            this.r = r;
-            this.tint = tint;
-            this.density = density;
-            fill.setColor(tint);
-            grainPaint.setShader(new android.graphics.BitmapShader(grain, Shader.TileMode.REPEAT, Shader.TileMode.REPEAT));
-            rim.setStyle(Paint.Style.STROKE);
-            rim.setStrokeWidth(1.2f * density);
-        }
-
-        @Override protected void onBoundsChange(Rect b) {
-            box.set(b);
-            clip.reset();
-            clip.addRoundRect(box, r, r, android.graphics.Path.Direction.CW);
-            float h = box.height();
-            glow.setShader(new LinearGradient(0, box.top, 0, box.top + h * 0.45f,
-                    0x24FFFFFF, 0x00FFFFFF, Shader.TileMode.CLAMP));
-            shade.setShader(new LinearGradient(0, box.bottom - h * 0.4f, 0, box.bottom,
-                    0x00000000, 0x1F000000, Shader.TileMode.CLAMP));
-            rim.setShader(new LinearGradient(0, box.top, 0, box.bottom,
-                    new int[]{rimA(0x8C), rimA(0x26), rimA(0x0D), rimA(0x1F)},
-                    new float[]{0f, 0.25f, 0.75f, 1f}, Shader.TileMode.CLAMP));
-        }
-
-        int rimA(int a) {
-            return (Math.round(a * rimStrength) << 24) | 0xFFFFFF;
-        }
-
-        @Override public void draw(Canvas c) {
-            c.save();
-            c.clipPath(clip);
-            c.drawRect(box, fill);
-            c.drawRect(box, grainPaint);
-            c.drawRect(box, glow);
-            c.drawRect(box, shade);
-            c.restore();
-            float inset = rim.getStrokeWidth() / 2f;
-            c.drawRoundRect(box.left + inset, box.top + inset, box.right - inset, box.bottom - inset,
-                    r - inset, r - inset, rim);
-        }
-
-        /** Focused: brighter glass (tvOS lifts and lightens focused glass controls). */
-        void setLit(boolean lit) {
-            fill.setColor(lit ? 0x59FFFFFF : tint);
-            invalidateSelf();
-        }
-
-        @Override public void setAlpha(int a) { }
-        @Override public void setColorFilter(android.graphics.ColorFilter cf) { }
-        @Override public int getOpacity() { return android.graphics.PixelFormat.TRANSLUCENT; }
-
-        @Override public boolean getPadding(Rect padding) {
-            padding.set(0, 0, 0, 0);
-            return false;
-        }
-    }
-
-    /** Liquid-glass surface: translucent fill, top sheen and a bright hairline rim. */
-    LayerDrawable glassBackground(GradientDrawable fill) {
-        fill.setCornerRadius(radius);
-        fill.setColor(0x26FFFFFF);
-        GradientDrawable sheen = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
-                new int[]{0x38FFFFFF, 0x08FFFFFF, 0x00FFFFFF});
-        sheen.setCornerRadius(radius);
-        GradientDrawable rim = new GradientDrawable();
-        rim.setCornerRadius(radius);
-        rim.setColor(Color.TRANSPARENT);
-        rim.setStroke(Math.max(1, dp(1)), 0x66FFFFFF);
-        return new LayerDrawable(new Drawable[]{fill, sheen, rim});
     }
 
     /** Outline whose corner radius can be changed while animating (radius[0]). */
@@ -1953,24 +1723,11 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams iclp = new LinearLayout.LayoutParams(dp(22), dp(22));
         iclp.leftMargin = dp(9);
         heroButton.addView(heroBtnIcon, iclp);
-        // Resume / Open capsule, plus a Remove capsule on Continue Watching items (Right reaches it).
+        // The Open capsule's row: it keeps its height while the capsule itself is hidden.
         LinearLayout btnRow = new LinearLayout(this);
         btnRow.setOrientation(LinearLayout.HORIZONTAL);
         btnRow.setClipChildren(false);
         btnRow.addView(heroButton, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(32)));
-        heroRemove = text(13, Ui.font(this, "semibold"), 1f);
-        heroRemove.setShadowLayer(0, 0, 0, 0);
-        heroRemove.setText("\u2715  Remove");
-        heroRemove.setGravity(Gravity.CENTER);
-        heroRemove.setPadding(dp(16), 0, dp(18), 0);
-        heroRemoveBg = new GradientDrawable();
-        heroRemoveBg.setCornerRadius(dp(16));
-        heroRemoveBg.setColor(0x47FFFFFF);
-        heroRemove.setBackground(heroRemoveBg);
-        heroRemove.setVisibility(View.GONE);
-        LinearLayout.LayoutParams rlp2 = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(32));
-        rlp2.leftMargin = dp(10);
-        btnRow.addView(heroRemove, rlp2);
         LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(32));
         blp.topMargin = dp(14);
         heroInfo.addView(btnRow, blp);
@@ -2002,25 +1759,6 @@ public class MainActivity extends Activity {
         root.addView(heroDots, dlp);
         heroDotsY = heroDotsRestY();
         heroDots.setTranslationY(heroDotsY);
-
-        // Up Next strip (Continue Watching): thumbnails with progress, shown while the shelf is focused.
-        heroStrip = new LinearLayout(this);
-        heroStrip.setOrientation(LinearLayout.HORIZONTAL);
-        heroStrip.setClipChildren(false);
-        heroStrip.setClipToPadding(false);
-        heroStrip.setVisibility(View.GONE);
-        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(64));
-        slp.topMargin = dp(16);
-        heroInfo.addView(heroStrip, slp);
-
-        // Empty state for Continue Watching.
-        shelfEmpty = text(15, Ui.font(this, "medium"), 0f);
-        shelfEmpty.setGravity(Gravity.CENTER);
-        FrameLayout.LayoutParams elp = new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER);
-        shelf.addView(shelfEmpty, elp);
-
-        buildSwitcher();
 
         // The shelf itself is the carousel's focus target (UP from the dock).
         shelf.setFocusable(false);
@@ -2076,95 +1814,9 @@ public class MainActivity extends Activity {
         heroDots.animate().withLayer().translationY(dotsY).setDuration(ms).setInterpolator(EASE).start();
     }
 
-    /** tvOS-style top tab bar: a glass capsule, top centre, with two text tabs. */
-    void buildSwitcher() {
-        shelfMode = Profiles.homePrefs(this).getString("shelf_mode", "suggest");
-        switcher = new LinearLayout(this);
-        switcher.setOrientation(LinearLayout.HORIZONTAL);
-        switcher.setGravity(Gravity.CENTER_VERTICAL);
-        int h = dp(30);
-        switcher.setPadding(dp(3), 0, dp(3), 0);
-        switcher.setBackground(controlGlass(h / 2f));
-        switcher.setFocusable(true);
-        tabSuggestBg = new GradientDrawable();
-        tabContinueBg = new GradientDrawable();
-        tabSuggest = tab("Suggestions", tabSuggestBg);
-        tabContinue = tab("Continue Watching", tabContinueBg);
-        switcher.addView(tabSuggest, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, h - dp(6)));
-        switcher.addView(tabContinue, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, h - dp(6)));
-        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, h,
-                Gravity.TOP | Gravity.CENTER_HORIZONTAL);
-        lp.topMargin = dp(26);
-        root.addView(switcher, lp);
-        switcher.setOnFocusChangeListener((v, has) -> {
-            styleTabs();
-            v.animate().scaleX(has ? 1.08f : 1f).scaleY(has ? 1.08f : 1f).setDuration(380).setInterpolator(LIFT).start();
-            if (has) setHeroShown(!heroItems.isEmpty());
-        });
-        styleTabs();
-    }
-
-    TextView tab(String label, GradientDrawable bg) {
-        TextView t = text(12.5f, Ui.font(this, "medium"), 1f);
-        t.setText(label);
-        t.setShadowLayer(0, 0, 0, 0);
-        t.setGravity(Gravity.CENTER);
-        t.setPadding(dp(14), 0, dp(14), 0);
-        bg.setCornerRadius(dp(12));
-        t.setBackground(bg);
-        return t;
-    }
-
-    /** Selected tab: soft glass pill; white with dark text while the tab bar has focus (tvOS). */
-    void styleTabs() {
-        boolean focused = switcher.isFocused();
-        boolean sug = !"continue".equals(shelfMode);
-        TextView on = sug ? tabSuggest : tabContinue, off = sug ? tabContinue : tabSuggest;
-        GradientDrawable onBg = sug ? tabSuggestBg : tabContinueBg, offBg = sug ? tabContinueBg : tabSuggestBg;
-        onBg.setColor(focused ? 0xFFFFFFFF : 0x33FFFFFF);
-        on.setTextColor(focused ? 0xFF111114 : Color.WHITE);
-        offBg.setColor(Color.TRANSPARENT);
-        off.setTextColor(0xB3FFFFFF);
-    }
-
-    void setShelfMode(String mode) {
-        if (mode.equals(shelfMode)) return;
-        shelfMode = mode;
-        Profiles.homePrefs(this).edit().putString("shelf_mode", mode).apply();
-        styleTabs();
-        heroItems = new ArrayList<>();
-        heroIndex = 0;
-        heroVersion = -1;
-        heroFront.setImageDrawable(null);
-        heroBack.setImageDrawable(null);
-        setHeroShown(false);
-        loadHero();
-    }
-
-    /** Continue Watching was removed: the apps on this TV don't say what's playing. */
-    boolean cwEnabled() {
-        return false;
-    }
-
-    /** The tab bar only appears when there are two things to switch between. */
-    boolean tabsShown() {
-        return false;  // one carousel mixes everything; no Suggestions / Continue Watching tabs
-    }
-
-    /** Applies the profile's choices: hides the tab bar and picks the one remaining mode. */
-    void applyTabs() {
-        if (switcher == null) return;
-        if (!"suggest".equals(shelfMode)) setShelfMode("suggest");
-        boolean show = tabsShown();
-        if (!show && switcher.isFocused()) ccButton.requestFocus();
-        switcher.setVisibility(show ? View.VISIBLE : View.GONE);
-    }
-
-    /** Down from the status row: the tab bar, or (when it's hidden) the carousel or the dock. */
+    /** Down from the status row: the carousel, or the dock when there is no carousel. */
     void focusBelowStatus() {
-        if (switcher != null && switcher.getVisibility() == View.VISIBLE) {
-            switcher.requestFocus();
-        } else if (shelfView.isFocusable() && !folderMode) {
+        if (shelfView.isFocusable() && !folderMode) {
             heroRequested = true;
             shelfView.requestFocus();
         } else {
@@ -2172,77 +1824,39 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** Up from the shelf/dock: the tab bar, or the status row when the tab bar is hidden. */
+    /** Up from the shelf/dock: the status row. */
     void focusTop() {
-        (switcher != null && switcher.getVisibility() == View.VISIBLE ? switcher : ccButton).requestFocus();
-    }
-
-    boolean continueMode() {
-        return "continue".equals(shelfMode);
+        ccButton.requestFocus();
     }
 
     /** Loads cached suggestions at once and refreshes them in the background when stale or reconfigured. */
-    String lastCwSig = "";
-
-    /**
-     * One carousel: news / recommendations (if this profile shows them) with Continue Watching
-     * titles mixed in (if it's on) — one after every two items; or Continue Watching alone.
-     */
     void loadHero() {
-        updateEmpty();
         boolean shelf = Suggestions.enabled(this) && Suggestions.ready(this);
-        boolean cw = cwEnabled();
-        if (!shelf && !cw) {
+        if (!shelf) {
             heroItems = new ArrayList<>();
             shelfView.setFocusable(false);
             setHeroShown(false);
             return;
         }
-        int v = Suggestions.version(this) * 2 + (cw ? 1 : 0);
+        int v = Suggestions.version(this);
         boolean reconfigured = v != heroVersion;
         heroVersion = v;
         io.execute(() -> {
-            List<Suggestions.Item> cwItems = new ArrayList<Suggestions.Item>();
-            StringBuilder sig = new StringBuilder();
-            for (Suggestions.Item it : cwItems) sig.append(it.key).append(it.progress).append(';');
-            boolean cwChanged = !sig.toString().equals(lastCwSig);
-            lastCwSig = sig.toString();
-            List<Suggestions.Item> base = shelf ? Suggestions.cached(this, true) : null;
-            List<Suggestions.Item> mixed = mixContinue(base, cwItems);
-            if (!mixed.isEmpty() && (reconfigured || cwChanged || heroItems.isEmpty())) {
-                handler.post(() -> setHeroBase(mixed));
-            } else if (mixed.isEmpty()) {
-                handler.post(() -> {
-                    heroItems = new ArrayList<>();
-                    shelfView.setFocusable(false);
-                    setHeroShown(false);
-                });
+            List<Suggestions.Item> base = Suggestions.cached(this, true);
+            if (base != null && (reconfigured || heroItems.isEmpty())) {
+                handler.post(() -> setHeroBase(base));
             }
-            if (shelf && Suggestions.cached(this, false) == null) {
+            // Nothing saved yet: fetched below. What's showing is never cleared for a list that
+            // couldn't be read this time, so the carousel can't go blank.
+            if (Suggestions.cached(this, false) == null) {
                 try {
                     List<Suggestions.Item> fresh = Suggestions.fetch(this);
-                    List<Suggestions.Item> m2 = mixContinue(fresh, cwItems);
-                    handler.post(() -> setHeroBase(m2));
+                    handler.post(() -> setHeroBase(fresh));
                 } catch (Exception e) {
                     android.util.Log.w("TvHome", "suggestions: " + e);
                 }
             }
         });
-    }
-
-    /** Resume first: up to six recent Continue Watching titles, then news and recommendations. */
-    static List<Suggestions.Item> mixContinue(List<Suggestions.Item> base, List<Suggestions.Item> cw) {
-        List<Suggestions.Item> out = new ArrayList<>(cw.subList(0, Math.min(6, cw.size())));
-        if (base != null) out.addAll(base);
-        return out;
-    }
-
-    void updateEmpty() {
-        boolean show = continueMode() && heroItems.isEmpty() && !folderMode;
-        if (show) {
-            shelfEmpty.setText("Nothing here yet.");
-        }
-        shelfEmpty.animate().alpha(show ? 0.75f : 0f).setDuration(250).start();
     }
 
     /** A new full carousel: kept as the mix, shown unless an app's own shelf is up. */
@@ -2256,7 +1870,6 @@ public class MainActivity extends Activity {
      * titles; anything else (or an app with no titles, like YouTube) shows the full mix.
      */
     void shelfFor(AppEntry a, boolean dock) {
-        if (continueMode()) return;
         String pkg = dock && a != null ? a.pkg : null;
         List<Suggestions.Item> own = pkg == null ? null : Suggestions.forService(this, pkg);
         if (own == null || own.size() < 2) pkg = null;
@@ -2282,7 +1895,7 @@ public class MainActivity extends Activity {
         for (int i = 0; curTitle != null && i < items.size(); i++) if (items.get(i).title.equals(curTitle)) keep = i;
         heroIndex = keep;
         shelfView.setFocusable(!items.isEmpty());
-        int dots = items.size() > 1 && !continueMode() ? items.size() : 0;
+        int dots = items.size() > 1 ? items.size() : 0;
         if (dots != dotRow.getChildCount()) {
             // A different number of pages (another app's shelf): the old row fades out and the new
             // one fades in, instead of the dots jumping as the row re-centres.
@@ -2293,7 +1906,6 @@ public class MainActivity extends Activity {
                 dotRow.animate().alpha(1f).setDuration(260).setInterpolator(EASE).start();
             }).start();
         }
-        buildStrip(items);
         if (items.isEmpty()) {
             setHeroShown(false);
             return;
@@ -2304,9 +1916,13 @@ public class MainActivity extends Activity {
         setHeroShown(dock);
         if (!(same && items.get(keep).title.equals(curTitle))) showHero(keep, heroDissolve && heroShown ? 2 : 0);
         else selectDot(keep, false);
+        // Fetching the rest of the shelf's artwork ahead happens in its own lane, so the picture
+        // you're about to see never waits behind it; a newer shelf stops an older one's fetching.
         List<Suggestions.Item> pre = items;
-        io.execute(() -> {
+        int gen = ++preloadGen;
+        preload.execute(() -> {
             for (Suggestions.Item it : pre) {
+                if (gen != preloadGen) return;
                 Suggestions.image(this, it.backdrop, "w1280", 64);  // downloads to disk; tiny decode
                 Suggestions.logoFor(this, it);
             }
@@ -2343,7 +1959,6 @@ public class MainActivity extends Activity {
 
     void scheduleAdvance() {
         handler.removeCallbacks(heroAdvance);
-        if (continueMode()) return;  // Up Next stays put
         int sec = Suggestions.advanceSeconds(this);
         if (sec > 0 && heroShown && resumed) handler.postDelayed(heroAdvance, sec * 1000L);
     }
@@ -2443,8 +2058,6 @@ public class MainActivity extends Activity {
 
     /** Title/meta/overview for an item, applied in the same frame as its artwork. */
     void applyHeroInfo(Suggestions.Item it, Bitmap logo, int dir) {
-        if (removeSelected) selectRemove(false);
-        heroRemove.setVisibility(!it.pkg.isEmpty() && shelfView.isFocused() ? View.VISIBLE : View.GONE);
         if (shelfView.isFocused()) {
             heroButton.setVisibility(View.VISIBLE);
             heroButton.setAlpha(1f);
@@ -2462,31 +2075,6 @@ public class MainActivity extends Activity {
         heroTitle.setVisibility(View.VISIBLE);
         heroLogo.setImageDrawable(null);
         heroLogo.setVisibility(View.GONE);
-        selectStrip(heroIndex);
-        if (!it.pkg.isEmpty()) {  // Continue Watching entry
-            List<String> meta = new ArrayList<>();
-            meta.add(appLabel(it.pkg));
-            if (it.remainingMin > 0) meta.add(it.remainingMin >= 60
-                    ? (it.remainingMin / 60) + " h " + (it.remainingMin % 60) + " min left" : it.remainingMin + " min left");
-            heroMeta.setText(String.join("  \u00B7  ", meta));
-            heroOverview.setText(it.overview);
-            heroBtnText.setText("\u25B6  Resume");
-            try {
-                heroProvider.setImageDrawable(getPackageManager().getApplicationIcon(it.pkg));
-                heroProvider.setVisibility(View.VISIBLE);
-            } catch (PackageManager.NameNotFoundException e) {
-                heroProvider.setVisibility(View.GONE);
-            }
-            heroBtnIcon.setVisibility(View.GONE);
-            if (heroShown && dir != 0) {
-                heroInfo.animate().cancel();
-                heroInfo.setTranslationY(heroInfoY);
-                heroInfo.setAlpha(0f);
-                heroInfo.setTranslationX(dir == 2 ? 0 : dp(18) * dir);
-                heroInfo.animate().withLayer().alpha(1f).translationX(0).setDuration(680).setStartDelay(60).setInterpolator(HERO_EASE).start();
-            }
-            return;
-        }
         List<String> meta = new ArrayList<>();
         if (!it.year.isEmpty()) meta.add(it.year);
         meta.add(it.type.equals("tv") ? "Series" : "Movie");
@@ -2498,9 +2086,10 @@ public class MainActivity extends Activity {
         heroBtnText.setText(p != null && !Suggestions.installed(this, p.pkg) ? "Get" : "\u25B6  Open");
         // The service's own app icon as its badge.
         Drawable appIcon = null;
-        if (p != null && Suggestions.installed(this, p.pkg)) {
+        String badge = p != null ? p.pkg : null;
+        if (badge != null && Suggestions.installed(this, badge)) {
             try {
-                appIcon = getPackageManager().getApplicationIcon(p.pkg);
+                appIcon = getPackageManager().getApplicationIcon(badge);
             } catch (PackageManager.NameNotFoundException ignored) {
             }
         }
@@ -2565,21 +2154,11 @@ public class MainActivity extends Activity {
     /** Carousel focused: the dock slides away and the artwork takes the whole screen (tvOS Top Shelf). */
     boolean heroRequested;
 
-    ImageView avatarView, ccButton, refreshButton, netIcon;
+    ImageView ccButton, netIcon;
     android.net.ConnectivityManager.NetworkCallback netCallback;
     WeatherView weatherCard;
     LiquidGlass weatherGlass;
-    int avatarSize;
     FrameLayout pickerLayer;
-    BroadcastReceiver wakeReceiver;
-
-    /** Top shelf content: "suggest" (carousel) or "continue" (Continue Watching). */
-    String shelfMode;
-    LinearLayout switcher;
-    TextView tabSuggest, tabContinue;
-    GradientDrawable tabSuggestBg, tabContinueBg;
-    LinearLayout heroStrip;
-    TextView shelfEmpty;
 
     void heroFocused(boolean has) {
         if (has && !heroRequested) {
@@ -2600,9 +2179,6 @@ public class MainActivity extends Activity {
             moveHeroInfo(0, 0, 500);
             heroOverview.setVisibility(View.VISIBLE);
             heroButton.setVisibility(View.VISIBLE);
-            heroRemove.setVisibility(heroIsContinue() ? View.VISIBLE : View.GONE);
-            heroRemove.setAlpha(1f);
-            if (continueMode() && heroStrip.getChildCount() > 0) heroStrip.setVisibility(View.VISIBLE);
             heroOverview.animate().alpha(0.85f).setDuration(400).setStartDelay(120).start();
             heroButton.animate().alpha(1f).setDuration(400).setStartDelay(120).start();
             handler.removeCallbacks(heroAdvance);
@@ -2618,38 +2194,9 @@ public class MainActivity extends Activity {
                     .withEndAction(() -> heroOverview.setVisibility(View.GONE)).start();
             heroButton.animate().alpha(0f).setDuration(160).setStartDelay(0)
                     .withEndAction(() -> heroButton.setVisibility(View.GONE)).start();
-            if (removeSelected) selectRemove(false);
-            heroRemove.setVisibility(View.GONE);
-            heroStrip.setVisibility(View.GONE);
             scheduleAdvance();
         }
     }
-
-    boolean heroIsContinue() {
-        return heroIndex >= 0 && heroIndex < heroItems.size() && !heroItems.get(heroIndex).pkg.isEmpty();
-    }
-
-    /** Moves the highlight between Resume and Remove (the carousel keeps focus). */
-    void selectRemove(boolean on) {
-        removeSelected = on;
-        heroBtnBg.setColor(on ? 0x47FFFFFF : 0xFFFFFFFF);
-        heroBtnText.setTextColor(on ? Color.WHITE : 0xFF111114);
-        heroRemoveBg.setColor(on ? 0xFFFFFFFF : 0x47FFFFFF);
-        heroRemove.setTextColor(on ? 0xFF111114 : Color.WHITE);
-        heroButton.animate().scaleX(on ? 1f : 1.08f).scaleY(on ? 1f : 1.08f).setDuration(on ? 240 : 380)
-                .setInterpolator(on ? EASE : LIFT).start();
-        heroRemove.animate().scaleX(on ? 1.08f : 1f).scaleY(on ? 1.08f : 1f).setDuration(on ? 380 : 240)
-                .setInterpolator(on ? LIFT : EASE).start();
-    }
-
-    void removeHeroItem(Suggestions.Item it) {
-        selectRemove(false);
-        lastCwSig = "";
-        heroVersion = -1;
-        toast("Removed " + it.title);
-        loadHero();
-    }
-
 
     /** Carousel and capsule navigation: LEFT/RIGHT browse, OK opens, UP/DOWN move between capsule, carousel and dock. */
     boolean heroKeys(KeyEvent ev) {
@@ -2660,40 +2207,13 @@ public class MainActivity extends Activity {
         boolean heroActive = shelfView.isFocusable() && !folderMode;
         if (f == shelfView) {
             switch (k) {
-                case KeyEvent.KEYCODE_DPAD_LEFT:
-                    if (down) {
-                        if (removeSelected) selectRemove(false);
-                        else heroStep(-1, true);
-                    }
-                    return true;
-                case KeyEvent.KEYCODE_DPAD_RIGHT:
-                    if (down) {
-                        if (!removeSelected && heroIsContinue()) selectRemove(true);
-                        else heroStep(1, true);
-                    }
-                    return true;
+                case KeyEvent.KEYCODE_DPAD_LEFT: if (down) heroStep(-1, true); return true;
+                case KeyEvent.KEYCODE_DPAD_RIGHT: if (down) heroStep(1, true); return true;
                 case KeyEvent.KEYCODE_DPAD_CENTER:
                 case KeyEvent.KEYCODE_ENTER:
-                    if (!down && !heroItems.isEmpty()) {
-                        if (removeSelected) removeHeroItem(heroItems.get(heroIndex));
-                        else openHeroItem(heroItems.get(heroIndex));
-                    }
+                    if (!down && !heroItems.isEmpty()) openHeroItem(heroItems.get(heroIndex));
                     return true;
-                case KeyEvent.KEYCODE_MENU:
-                    if (!down && !heroItems.isEmpty() && !heroItems.get(heroIndex).pkg.isEmpty()) {
-                        Suggestions.Item it = heroItems.get(heroIndex);
-                        List<String> l = new ArrayList<>();
-                        List<Runnable> act = new ArrayList<>();
-                        l.add("Resume");
-                        act.add(() -> openHeroItem(it));
-                        l.add("Remove");
-                        act.add(() -> {
-                            heroItems = new ArrayList<>();
-                            loadHero();
-                        });
-                        showMenu(heroButton, it.title, l, act, 1);
-                    }
-                    return true;
+                case KeyEvent.KEYCODE_MENU: return true;  // no options for the carousel
                 case KeyEvent.KEYCODE_DPAD_UP: if (down) focusTop(); return true;
                 case KeyEvent.KEYCODE_DPAD_DOWN:
                 case KeyEvent.KEYCODE_BACK:
@@ -2702,63 +2222,17 @@ public class MainActivity extends Activity {
                 default: return false;
             }
         }
-        if (f == switcher) {
-            switch (k) {
-                case KeyEvent.KEYCODE_DPAD_LEFT:
-                    if (down) {
-                        if (continueMode()) setShelfMode("suggest");
-                        else if (weatherShown()) weatherCard.requestFocus();
-                    }
-                    return true;
-                case KeyEvent.KEYCODE_DPAD_RIGHT:
-                    // Past the last tab, Right continues to the status row (Control Center).
-                    if (down) {
-                        if (continueMode()) ccButton.requestFocus();
-                        else setShelfMode("continue");
-                    }
-                    return true;
-                case KeyEvent.KEYCODE_DPAD_CENTER:
-                case KeyEvent.KEYCODE_ENTER:
-                    if (!down) setShelfMode(continueMode() ? "suggest" : "continue");
-                    return true;
-                case KeyEvent.KEYCODE_DPAD_UP: if (down) ccButton.requestFocus(); return true;
-                case KeyEvent.KEYCODE_DPAD_DOWN:
-                case KeyEvent.KEYCODE_BACK:
-                    if (down) {
-                        if (heroActive) {
-                            heroRequested = true;
-                            shelfView.requestFocus();
-                        } else {
-                            focusIndex(Math.min(focusedIndex, COLS - 1));
-                        }
-                    }
-                    return true;
-                default: return false;
-            }
-        }
-        if (f == refreshButton || f == ccButton || f == avatarView) {
-            // Status row, left to right: Control Centre, profile (Refresh is hidden).
+        if (f == ccButton) {
+            // Status row: the Control Centre button alone; Left goes to the weather.
             if (k == KeyEvent.KEYCODE_DPAD_LEFT) {
-                if (down) {
-                    if (f == avatarView) ccButton.requestFocus();
-                    else if (f == ccButton && refreshButton.getVisibility() == View.VISIBLE) refreshButton.requestFocus();
-                    else if (switcher.getVisibility() == View.VISIBLE) switcher.requestFocus();
-                    else if (weatherShown()) weatherCard.requestFocus();
-                }
-                return true;
-            }
-            if (k == KeyEvent.KEYCODE_DPAD_RIGHT) {
-                if (down) {
-                    if (f == refreshButton) ccButton.requestFocus();
-                    else if (f == ccButton && avatarView.getVisibility() == View.VISIBLE) avatarView.requestFocus();
-                }
+                if (down && weatherShown()) weatherCard.requestFocus();
                 return true;
             }
             if (k == KeyEvent.KEYCODE_DPAD_DOWN || k == KeyEvent.KEYCODE_BACK) {
                 if (down) focusBelowStatus();
                 return true;
             }
-            return k == KeyEvent.KEYCODE_DPAD_UP;
+            return k == KeyEvent.KEYCODE_DPAD_UP || k == KeyEvent.KEYCODE_DPAD_RIGHT;
         }
         if (f == weatherCard) {
             switch (k) {
@@ -2800,47 +2274,7 @@ public class MainActivity extends Activity {
     }
 
     void openHeroItem(Suggestions.Item it) {
-        if (it.pkg.isEmpty()) {
-            Suggestions.open(this, it);
-            return;
-        }
-        Intent i = getPackageManager().getLeanbackLaunchIntentForPackage(it.pkg);
-        if (i == null) i = getPackageManager().getLaunchIntentForPackage(it.pkg);
-        if (i != null) Suggestions.start(this, i);
-    }
-
-    // ---------------------------------------------------------------- focus sway
-
-    ValueAnimator sway;
-    View swayView;
-
-    /** Slow elliptical tilt of the focused card with the highlight drifting against it. */
-    void startSway(View v, View glare) {
-        if (moveIndex >= 0 || !v.hasFocus() && !v.isFocused()) return;
-        stopSway(swayView);
-        swayView = v;
-        sway = ValueAnimator.ofFloat(0f, (float) (2 * Math.PI));
-        sway.setDuration(5200);
-        sway.setRepeatCount(ValueAnimator.INFINITE);
-        sway.setInterpolator(new android.view.animation.LinearInterpolator());
-        sway.addUpdateListener(an -> {
-            float t = (float) an.getAnimatedValue();
-            float sin = (float) Math.sin(t), cos = (float) Math.cos(t);
-            v.setRotationY(2.2f * sin);
-            v.setRotationX(-1.4f * cos);
-        });
-        sway.start();
-    }
-
-    void stopSway(View v) {
-        if (sway != null && (v == null || v == swayView)) {
-            sway.cancel();
-            sway = null;
-            if (swayView != null) {
-                swayView.animate().rotationX(0).rotationY(0).setDuration(240).setInterpolator(EASE).start();
-            }
-            swayView = null;
-        }
+        Suggestions.open(this, it);
     }
 
     // ---------------------------------------------------------------- launch animation
@@ -2861,7 +2295,6 @@ public class MainActivity extends Activity {
             Bundle opts = ActivityOptions.makeScaleUpAnimation(tile, 0, 0, w, h).toBundle();
             startActivity(a.launch, opts);
             appOpened = true;
-            noteLaunched(a.pkg);
         } catch (ActivityNotFoundException | SecurityException e) {
             toast("Can't open " + a.label);
         }
@@ -2870,86 +2303,6 @@ public class MainActivity extends Activity {
     static int colorDistance(int x, int y) {
         return Math.abs(Color.red(x) - Color.red(y)) + Math.abs(Color.green(x) - Color.green(y))
                 + Math.abs(Color.blue(x) - Color.blue(y));
-    }
-
-    static int blendArgb(int x, int y, float t) {
-        return Color.argb(
-                (int) (Color.alpha(x) + (Color.alpha(y) - Color.alpha(x)) * t),
-                (int) (Color.red(x) + (Color.red(y) - Color.red(x)) * t),
-                (int) (Color.green(x) + (Color.green(y) - Color.green(x)) * t),
-                (int) (Color.blue(x) + (Color.blue(y) - Color.blue(x)) * t));
-    }
-
-    static int blend(int x, int y, float t) {
-        return Color.rgb(
-                (int) (Color.red(x) + (Color.red(y) - Color.red(x)) * t),
-                (int) (Color.green(x) + (Color.green(y) - Color.green(x)) * t),
-                (int) (Color.blue(x) + (Color.blue(y) - Color.blue(x)) * t));
-    }
-
-    String appLabel(String pkg) {
-        AppEntry e = null;
-        for (AppEntry a : all.values()) if (pkg.equals(a.pkg)) e = a;
-        if (e != null) return e.label;
-        try {
-            return getPackageManager().getApplicationLabel(getPackageManager().getApplicationInfo(pkg, 0)).toString();
-        } catch (PackageManager.NameNotFoundException ex) {
-            return pkg;
-        }
-    }
-
-    /** Up Next strip: one thumbnail per entry with a progress bar; the current one is lifted. */
-    void buildStrip(List<Suggestions.Item> items) {
-        heroStrip.removeAllViews();
-        if (!continueMode()) return;
-        for (int i = 0; i < items.size() && i < 8; i++) {
-            Suggestions.Item it = items.get(i);
-            FrameLayout th = new FrameLayout(this);
-            GradientDrawable tbg = new GradientDrawable();
-            tbg.setCornerRadius(dp(6));
-            tbg.setColor(0x33FFFFFF);
-            th.setBackground(tbg);
-            th.setOutlineProvider(roundedOutline(new float[]{dp(6)}));
-            th.setClipToOutline(true);
-            ImageView iv = new ImageView(this);
-            iv.setScaleType(ImageView.ScaleType.CENTER_CROP);
-            th.addView(iv, match());
-            if (it.progress >= 0) {
-                View track = new View(this);
-                track.setBackgroundColor(0x4DFFFFFF);
-                FrameLayout.LayoutParams tlp = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(3),
-                        Gravity.BOTTOM);
-                tlp.setMargins(dp(6), 0, dp(6), dp(5));
-                th.addView(track, tlp);
-                View bar = new View(this);
-                bar.setBackgroundColor(Color.WHITE);
-                FrameLayout.LayoutParams blp = new FrameLayout.LayoutParams(
-                        Math.max(dp(3), Math.round((dp(100) - dp(12)) * it.progress)), dp(3), Gravity.BOTTOM | Gravity.START);
-                blp.setMargins(dp(6), 0, 0, dp(5));
-                th.addView(bar, blp);
-            }
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(dp(100), dp(56));
-            lp.rightMargin = dp(10);
-            heroStrip.addView(th, lp);
-            io.execute(() -> {
-                Bitmap b = Suggestions.image(this, it.backdrop, "w300", 240);
-                if (b != null) handler.post(() -> iv.setImageBitmap(b));
-            });
-        }
-    }
-
-    void selectStrip(int index) {
-        for (int i = 0; i < heroStrip.getChildCount(); i++) {
-            View v = heroStrip.getChildAt(i);
-            boolean on = i == index;
-            v.animate().scaleX(on ? 1.12f : 1f).scaleY(on ? 1.12f : 1f).alpha(on ? 1f : 0.6f).setDuration(400)
-                    .setInterpolator(LIFT).start();
-        }
-    }
-
-    Drawable copyOf(Drawable d) {
-        Drawable.ConstantState cs = d.getConstantState();
-        return cs != null ? cs.newDrawable(getResources()).mutate() : d;
     }
 
     float clockAlpha() {
@@ -2980,16 +2333,11 @@ public class MainActivity extends Activity {
         scroll.smoothScrollTo(0, Math.max(0, target));
     }
 
-    void updateShelf(AppEntry a) {
-        shelfEntry = a;
-    }
-
     void focusIndex(int i) {
         if (tiles.isEmpty()) return;
         i = Math.max(0, Math.min(i, tiles.size() - 1));
         tiles.get(i).requestFocus();
         focusedIndex = i;
-        updateShelf(shown.get(i));
         int row = i / COLS;
         scroll.post(() -> scrollToRow(row));
     }
@@ -3045,35 +2393,13 @@ public class MainActivity extends Activity {
         return b;
     }
 
-    Bitmap backdropSharp(AppEntry e, int w, int h) {
-        Bitmap b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
-        Canvas c = new Canvas(b);
-        c.drawColor(e.banner != null ? 0xFF1C1C1E : e.color);
-        Drawable d = e.banner != null ? e.banner : e.icon;
-        if (d != null) {
-            Rect old = d.copyBounds();
-            if (e.banner != null) {
-                d.setBounds(0, 0, w, h);
-            } else {
-                int s = h * 6 / 10;
-                d.setBounds((w - s) / 2, (h - s) / 2, (w + s) / 2, (h + s) / 2);
-            }
-            d.draw(c);
-            d.setBounds(old);
-        }
-        return b;
-    }
-
     void enterFolder() {
         if (hiddenApps.isEmpty()) return;
         animateGridSwap(() -> {
             folderMode = true;
             setHeroShown(false);
-            switcher.setAlpha(0f);
             weatherCard.setAlpha(0f);
-            shelfEmpty.setAlpha(0f);
             buildGrid();
-            shelfEntry = null;
             scroll.scrollTo(0, 0);
             focusIndex(0);
         });
@@ -3082,10 +2408,8 @@ public class MainActivity extends Activity {
     void exitFolder() {
         animateGridSwap(() -> {
             folderMode = false;
-            switcher.animate().alpha(1f).setDuration(250).start();
             weatherCard.animate().alpha(weatherAlpha()).setDuration(250).start();
             buildGrid();
-            shelfEntry = null;
             int i = indexOfKey(FOLDER_KEY);
             focusIndex(i >= 0 ? i : 0);
         });
@@ -3125,7 +2449,7 @@ public class MainActivity extends Activity {
             int pk = ev.getKeyCode();
             boolean pd = ev.getAction() == KeyEvent.ACTION_DOWN;
             if (pk == KeyEvent.KEYCODE_BACK) {
-                if (!pd) closeProfilePicker();
+                if (!pd) closePopover();
                 return true;
             }
             if (pk == KeyEvent.KEYCODE_DPAD_UP || pk == KeyEvent.KEYCODE_DPAD_DOWN
@@ -3338,7 +2662,6 @@ public class MainActivity extends Activity {
         loadApps();
         if (folderMode && hiddenApps.isEmpty()) folderMode = false;
         buildGrid();
-        shelfEntry = null;
         int i = focusKey == null ? -1 : indexOfKey(focusKey);
         focusIndex(i >= 0 ? i : Math.min(focusedIndex, shown.size() - 1));
     }
@@ -3361,7 +2684,6 @@ public class MainActivity extends Activity {
         loadApps();
         if (folderMode && hiddenApps.isEmpty()) folderMode = false;
         buildGrid();
-        shelfEntry = null;
         focusIndex(Math.min(i, shown.size() - 1));
         toast(hide ? a.label + " moved to More Apps" : a.label + " is back on Home");
     }
@@ -3437,55 +2759,6 @@ public class MainActivity extends Activity {
         startActivity(new Intent(this, ControlCentreActivity.class).putExtra("inputs", true));
     }
 
-
-    interface Status {
-        String get();
-    }
-
-
-    // ---------------------------------------------------------------- memory
-
-
-
-
-
-
-    /** Apps opened from Home recently, newest first (Android hides other apps' processes). */
-    void noteLaunched(String pkg) {
-        if (pkg == null || pkg.equals(getPackageName())) return;
-        List<String> l = new ArrayList<>(Arrays.asList(getSharedPreferences("clean", MODE_PRIVATE).getString("recent", "").split(",")));
-        l.remove(pkg);
-        l.remove("");
-        l.add(0, pkg);
-        while (l.size() > 12) l.remove(l.size() - 1);
-        getSharedPreferences("clean", MODE_PRIVATE).edit().putString("recent", String.join(",", l)).apply();
-    }
-
-    List<String> recentApps() {
-        List<String> l = new ArrayList<>();
-        for (String p : getSharedPreferences("clean", MODE_PRIVATE).getString("recent", "").split(",")) {
-            if (!p.isEmpty() && Suggestions.installed(this, p)) l.add(p);
-        }
-        return l;
-    }
-
-
-    long availMem(android.app.ActivityManager am) {
-        android.app.ActivityManager.MemoryInfo mi = new android.app.ActivityManager.MemoryInfo();
-        am.getMemoryInfo(mi);
-        return mi.availMem;
-    }
-
-
-
-
-
-
-
-
-    // ---------------------------------------------------------------- inputs
-
-
     // ---------------------------------------------------------------- internet status
 
     /** Follows the default network; Android marks it "validated" once the internet is reachable. */
@@ -3531,7 +2804,7 @@ public class MainActivity extends Activity {
         netState = state;
         netEthernet = eth;
         netBars = bars;
-        netIcon.setImageBitmap(netGlyph(state, eth, bars, dp(20)));
+        netIcon.setImageBitmap(netGlyph(state, eth, bars, dp(15)));
         netIcon.setContentDescription(state == 2 ? "Online" : state == 1 ? "No internet" : "Offline");
         // Back online: refresh what needs the internet.
         if (state == 2 && back) {
@@ -3546,68 +2819,82 @@ public class MainActivity extends Activity {
      * and a slash through dimmed bands with no network (wifi.slash).
      */
     Bitmap netGlyph(int state, boolean eth, int bars, int s) {
-        int w = Math.round(s * 1.2f);
+        // Wi-Fi alone is a fan 1.2x as wide as it's tall; "no internet" adds a "!" to its right.
+        int w = Math.round(s * (state == 1 ? 1.55f : 1.2f));
         Bitmap b = Bitmap.createBitmap(w, s, Bitmap.Config.ARGB_8888);
         Canvas c = new Canvas(b);
         int on = Color.WHITE, off = 0x4DFFFFFF;
-        if (eth && state != 0) drawEthernet(c, s, state == 2 ? on : off);
-        else drawWifi(c, s, state == 2 ? bars : 0, on, off);
+        if (eth && state != 0) {
+            c.save();
+            c.translate(s * 0.1f, 0);  // centred where the Wi-Fi fan would be
+            drawEthernet(c, s, state == 2 ? on : off);
+            c.restore();
+        } else {
+            drawWifi(c, s, state == 2 ? bars : 0, on, off);
+        }
         Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
         p.setColor(on);
         p.setStrokeCap(Paint.Cap.ROUND);
-        if (state == 1) {  // exclamation mark to the right
-            p.setStrokeWidth(s * 0.13f);
-            float x = s * 1.08f;
-            c.drawLine(x, s * 0.2f, x, s * 0.6f, p);
-            c.drawCircle(x, s * 0.82f, s * 0.075f, p);
-        } else if (state == 0) {  // slash with a clear gap around it
+        if (state == 1) {  // exclamation mark to the right (wifi.exclamationmark)
+            p.setStrokeWidth(s * 0.14f);
+            float x = s * 1.4f;
+            c.drawLine(x, s * 0.16f, x, s * 0.6f, p);
+            c.drawCircle(x, s * 0.84f, s * 0.08f, p);
+        } else if (state == 0) {  // slash with a clear gap around it (wifi.slash)
             Paint cut = new Paint(Paint.ANTI_ALIAS_FLAG);
             cut.setXfermode(new android.graphics.PorterDuffXfermode(android.graphics.PorterDuff.Mode.CLEAR));
             cut.setStrokeCap(Paint.Cap.ROUND);
             cut.setStrokeWidth(s * 0.24f);
-            c.drawLine(s * 0.12f, s * 0.1f, s * 0.9f, s * 0.92f, cut);
+            c.drawLine(s * 0.18f, s * 0.08f, s * 1.0f, s * 0.95f, cut);
             p.setStrokeWidth(s * 0.1f);
-            c.drawLine(s * 0.12f, s * 0.1f, s * 0.9f, s * 0.92f, p);
+            c.drawLine(s * 0.18f, s * 0.08f, s * 1.0f, s * 0.95f, p);
         }
-        // Soft shadow behind everything, like the time's.
-        Bitmap out = Bitmap.createBitmap(w, s, Bitmap.Config.ARGB_8888);
-        Canvas oc = new Canvas(out);
-        Paint sh = new Paint(Paint.ANTI_ALIAS_FLAG);
-        sh.setColorFilter(new android.graphics.PorterDuffColorFilter(0x40000000, android.graphics.PorterDuff.Mode.SRC_IN));
-        oc.drawBitmap(b, 0, s * 0.05f, sh);
-        oc.drawBitmap(b, 0, 0, null);
-        return out;
+        return b;
     }
 
     /** SF-style Wi-Fi: a wedge and two equal bands fanning 90 degrees from a point near the bottom. */
+    /**
+     * Apple's Wi-Fi fan: a quarter circle split into a wedge and two bands with even gaps, the band
+     * ends cut straight along the fan's edges and every corner slightly rounded. Drawn four times
+     * over size and scaled down smoothly, as type is, so the small curves come out even; bands
+     * beyond the signal strength are dimmed.
+     */
     void drawWifi(Canvas c, float s, int lit, int on, int off) {
-        float cx = s * 0.5f, cy = s * 0.88f, rw = s * 0.24f, t = s * 0.15f, gap = s * 0.075f;
+        int k = 4, bw = Math.round(c.getWidth() * k), bh = Math.round(s * k);
+        Bitmap big = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888);
+        Canvas g = new Canvas(big);
+        float S = s * k, cx = (c.getWidth() > s * 1.3f ? s * 0.6f : c.getWidth() / 2f) * k, cy = S * 0.93f;
+        float rw = S * 0.32f, gap = S * 0.09f, t = S * 0.17f, d = S * 0.035f;
+        // The fan's sides moved in by d: the same quarter, its point a little higher.
+        float lift = (float) (d / Math.sin(Math.toRadians(45)));
+        android.graphics.Path fan = new android.graphics.Path();
+        fan.moveTo(cx, cy - lift);
+        fan.lineTo(cx - S * 2, cy - lift - S * 2);
+        fan.lineTo(cx + S * 2, cy - lift - S * 2);
+        fan.close();
         Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
-        p.setStrokeJoin(Paint.Join.ROUND);
-        p.setStrokeWidth(s * 0.05f);
         p.setStyle(Paint.Style.FILL_AND_STROKE);
-        RectF r = new RectF();
+        p.setStrokeWidth(2 * d);   // the stroke puts back the d taken off every edge, rounding the corners
+        p.setStrokeJoin(Paint.Join.ROUND);
         for (int i = 0; i < 3; i++) {
-            android.graphics.Path path = new android.graphics.Path();
-            if (i == 0) {
-                path.moveTo(cx, cy);
-                r.set(cx - rw, cy - rw, cx + rw, cy + rw);
-                path.arcTo(r, -135, 90);
-            } else {
-                float inner = rw + gap + (i - 1) * (t + gap), outer = inner + t;
-                r.set(cx - outer, cy - outer, cx + outer, cy + outer);
-                path.arcTo(r, -135, 90, true);
-                r.set(cx - inner, cy - inner, cx + inner, cy + inner);
-                path.arcTo(r, -45, -90);
+            float inner = i == 0 ? 0 : rw + gap + (i - 1) * (t + gap), outer = i == 0 ? rw : inner + t;
+            android.graphics.Path ring = new android.graphics.Path();
+            ring.addCircle(cx, cy, outer - d, android.graphics.Path.Direction.CW);
+            if (inner > 0) {
+                android.graphics.Path hole = new android.graphics.Path();
+                hole.addCircle(cx, cy, inner + d, android.graphics.Path.Direction.CW);
+                ring.op(hole, android.graphics.Path.Op.DIFFERENCE);
             }
-            path.close();
-            // Unlit bands: drawn opaque on a faded layer so fill and rounded edge don't overlap.
-            boolean dim = i >= lit;
-            if (dim) c.saveLayerAlpha(0, 0, c.getWidth(), c.getHeight(), Color.alpha(off));
-            p.setColor(dim ? (off | 0xFF000000) : on);
-            c.drawPath(path, p);
-            if (dim) c.restore();
+            ring.op(fan, android.graphics.Path.Op.INTERSECT);
+            p.setColor(i < lit ? on : off);
+            g.drawPath(ring, p);
         }
+        // Down in halves with filtering: each pixel the average of the ones it covers.
+        Bitmap half = Bitmap.createScaledBitmap(big, bw / 2, bh / 2, true);
+        big.recycle();
+        Paint f = new Paint(Paint.FILTER_BITMAP_FLAG | Paint.ANTI_ALIAS_FLAG);
+        c.drawBitmap(half, null, new RectF(0, 0, c.getWidth(), s), f);
+        half.recycle();
     }
 
     /** Ethernet: three solid nodes joined by lines, drawn bolder to match the Wi-Fi weight. */
@@ -3656,20 +2943,6 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** Refresh button: fetch fresh recommendations and news, reload Continue Watching and weather. */
-    void refreshAll() {
-        refreshButton.animate().cancel();
-        refreshButton.setRotation(0);
-        refreshButton.animate().rotation(360).setDuration(700).setInterpolator(EASE).start();
-        Suggestions.changed(this);
-        lastCwSig = "";
-        heroVersion = -1;
-        heroItems = new ArrayList<>();
-        loadHero();
-        Weather.refresh(this, true, this::updateWeather);
-        toast("Refreshing");
-    }
-
     // ---------------------------------------------------------------- idle full-screen carousel
 
     boolean idle, swallowUp;
@@ -3695,11 +2968,11 @@ public class MainActivity extends Activity {
     }
 
     /**
-     * No input for a while: the dock and grid slide down off screen, the weather card and tab bar
-     * fade, and the carousel keeps playing full screen with its title and summary at the bottom.
+     * No input for a while: the dock and grid slide down off screen, the weather card fades, and
+     * the carousel keeps playing full screen with its title and summary at the bottom.
      */
     void enterIdle() {
-        if (idle || !resumed || heroItems.isEmpty() || continueMode() || folderMode
+        if (idle || !resumed || heroItems.isEmpty() || folderMode
                 || pickerLayer != null || menuLayer != null || moveIndex >= 0) {
             resetIdle();
             return;
@@ -3725,7 +2998,6 @@ public class MainActivity extends Activity {
                 .setUpdateListener(null).start();
         moveHeroInfo(0, dp(4), 900);
         weatherCard.animate().alpha(0f).setDuration(500).start();
-        switcher.animate().alpha(0f).setDuration(500).start();
         heroButton.animate().alpha(0f).setDuration(300).start();
         heroOverview.animate().cancel();
         heroOverview.setVisibility(heroOverview.getText().length() > 0 ? View.VISIBLE : View.GONE);
@@ -3748,8 +3020,8 @@ public class MainActivity extends Activity {
         // Back to the shelf of the app in focus (a dock app shows its own titles again).
         handler.removeCallbacks(shelfUpdate);
         handler.postDelayed(shelfUpdate, 260);
-        // Back to the app grid, if that's where it went full screen from: the weather and the tab
-        // bar stay hidden there, as they are whenever the grid is scrolled up.
+        // Back to the app grid, if that's where it went full screen from: the weather stays hidden
+        // there, as it is whenever the grid is scrolled up.
         boolean toGrid = idleReturnIndex >= 0;
         if (toGrid) {
             int back = idleReturnIndex;
@@ -3761,7 +3033,6 @@ public class MainActivity extends Activity {
                 .setUpdateListener(null).withEndAction(this::invalidateGlass).start();
         moveHeroInfo(idleInfoY, idleDotsY, 450);
         weatherCard.animate().alpha(toGrid ? 0f : weatherAlpha()).setDuration(350).start();
-        switcher.animate().alpha(toGrid || folderMode ? 0f : clockAlpha()).setDuration(350).start();
         if (shelfView.isFocused()) {
             heroButton.animate().alpha(1f).setDuration(300).start();
             handler.removeCallbacks(heroAdvance);  // browsing by hand: no auto-advance
@@ -3798,7 +3069,7 @@ public class MainActivity extends Activity {
     boolean weatherOpen;
 
     float weatherAlpha() {
-        return folderMode || weatherOpen ? 0f : clockAlpha();
+        return folderMode || weatherOpen || idle ? 0f : clockAlpha();
     }
 
     /** Shows the cached forecast (hidden when weather is off or nothing has loaded yet). */
@@ -3817,7 +3088,6 @@ public class MainActivity extends Activity {
         Weather.Data d = Weather.cached(this);
         if (d == null) return;
         if (pickerLayer != null) root.removeView(pickerLayer);
-        stopSway(null);
         popoverReturn = weatherCard;
         FrameLayout layer = new FrameLayout(this);
         layer.setClickable(true);
@@ -3857,47 +3127,13 @@ public class MainActivity extends Activity {
         });
     }
 
-    // ---------------------------------------------------------------- profiles
+    // ---------------------------------------------------------------- popover
 
     List<View> pickerCells = new ArrayList<>();
 
-    /**
-     * tvOS 26 profile switcher (per Apple's UI): a popover under the top-right status area with a
-     * two-column grid of round avatars, names in soft grey, a green check on the current profile,
-     * and a glass "+" Add User. Content stays visible behind it.
-     */
-    int profileAvatarSize;
-
-    /**
-     * The whole Home Screen (artwork, dock, cards, status row) blurred and dimmed behind an overlay:
-     * a quarter-size snapshot taken once when the overlay opens, then blurred off the GPU path.
-     */
-    void addBlurredBackdrop(FrameLayout layer, int dim) {
-        ImageView iv = new ImageView(this);
-        iv.setScaleType(ImageView.ScaleType.FIT_XY);
-        try {
-            int w = Math.max(1, screenW / 4), h = Math.max(1, screenH / 4);
-            Bitmap snap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
-            Canvas c = new Canvas(snap);
-            c.scale(w / (float) screenW, h / (float) screenH);
-            root.draw(c);
-            Bitmap blurred = Ui.blur(snap, w / 2, h / 2, 4, 3);
-            snap.recycle();
-            if (blurred != null) iv.setImageBitmap(blurred);
-        } catch (Throwable e) {
-            Bitmap bg = glassSource.get();
-            if (bg != null) iv.setImageBitmap(bg);
-        }
-        layer.addView(iv, match());
-        View v = new View(this);
-        v.setBackgroundColor(dim);
-        layer.addView(v, match());
-    }
-
-
     boolean statusFocused() {
         View f = getCurrentFocus();
-        return f != null && (f == ccButton || f == avatarView || f == refreshButton);
+        return f != null && f == ccButton;
     }
 
     /** Directional focus inside a popover: nearest cell whose centre lies in that direction. */
@@ -3935,11 +3171,9 @@ public class MainActivity extends Activity {
         return true;
     }
 
-
-
     View popoverReturn;
 
-    void closeProfilePicker() {
+    void closePopover() {
         if (pickerLayer == null) return;
         FrameLayout l = pickerLayer;
         pickerLayer = null;
@@ -3950,14 +3184,6 @@ public class MainActivity extends Activity {
         else goTop();
         popoverReturn = null;
     }
-
-
-
-
-    void refreshAvatar() {
-        if (avatarView != null) avatarView.setImageBitmap(Profiles.avatar(this, Profiles.current(this), avatarSize));
-    }
-
 
     // ---------------------------------------------------------------- tvOS context menu
 
@@ -3971,7 +3197,6 @@ public class MainActivity extends Activity {
     void showMenu(View anchor, String title, List<String> labels, List<Runnable> actions, int destructive) {
         closeMenu();
         menuReturnFocus = anchor;
-        stopSway(null);
         menuLayer = new FrameLayout(this);
         menuLayer.setBackgroundColor(0x00000000);
         menuLayer.setClickable(true);
@@ -4098,7 +3323,6 @@ public class MainActivity extends Activity {
     // ---------------------------------------------------------------- move mode
 
     void startMove(int index) {
-        stopSway(null);
         moveIndex = index;
         focusIndex(index);
         startWiggle(tiles.get(index));

@@ -26,7 +26,6 @@ import org.json.JSONObject;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -73,7 +72,7 @@ public class DetailActivity extends Activity {
 
     /** One service's offer for this title, merged across quality (SD/HD/4K). */
     static final class Offer {
-        String name, tech, url, pkg;
+        String name, url, pkg;
         boolean subscription, free, ads;
         String rent, buy;
         int rank;
@@ -100,16 +99,17 @@ public class DetailActivity extends Activity {
         backdrop = new ImageView(this);
         backdrop.setScaleType(ImageView.ScaleType.CENTER_CROP);
         backdrop.setAlpha(0f);
+        // Legibility: dark from the left and from the bottom, as on Apple TV product pages. The
+        // shades ride on the picture and the three are kept as one ready image, so as it fades and
+        // settles the TV draws a single picture each frame rather than three full-screen layers.
+        android.graphics.drawable.LayerDrawable shade = new android.graphics.drawable.LayerDrawable(new android.graphics.drawable.Drawable[]{
+                new GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT, new int[]{0xF2000000, 0xB3000000, 0x33000000, 0x00000000}),
+                new GradientDrawable(GradientDrawable.Orientation.BOTTOM_TOP, new int[]{0xE6000000, 0x66000000, 0x00000000})});
+        shade.setLayerGravity(1, Gravity.BOTTOM | Gravity.FILL_HORIZONTAL);
+        shade.setLayerHeight(1, u(260));
+        backdrop.setForeground(shade);
+        backdrop.setLayerType(View.LAYER_TYPE_HARDWARE, null);
         root.addView(backdrop, new FrameLayout.LayoutParams(-1, -1));
-        // Legibility: dark from the left and from the bottom, as on Apple TV product pages.
-        View left = new View(this);
-        left.setBackground(new GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT,
-                new int[]{0xF2000000, 0xB3000000, 0x33000000, 0x00000000}));
-        root.addView(left, new FrameLayout.LayoutParams(-1, -1));
-        View bottom = new View(this);
-        bottom.setBackground(new GradientDrawable(GradientDrawable.Orientation.BOTTOM_TOP,
-                new int[]{0xE6000000, 0x66000000, 0x00000000}));
-        root.addView(bottom, new FrameLayout.LayoutParams(-1, u(260), Gravity.BOTTOM));
 
         column = new LinearLayout(this);
         column.setOrientation(LinearLayout.VERTICAL);
@@ -162,7 +162,8 @@ public class DetailActivity extends Activity {
         setContentView(root);
         column.setAlpha(0f);
         column.setTranslationY(u(10));
-        column.animate().alpha(1f).translationY(0).setDuration(480).setInterpolator(MainActivity.EASE).start();
+        // As one picture while it fades up: the text isn't redrawn off screen on every frame.
+        column.animate().alpha(1f).translationY(0).setDuration(480).setInterpolator(MainActivity.EASE).withLayer().start();
         load(getIntent().getStringExtra("id"), getIntent().getStringExtra("backdrop"));
     }
 
@@ -220,7 +221,7 @@ public class DetailActivity extends Activity {
 
     void loadBackdrop(String url) {
         io.execute(() -> {
-            Bitmap bm = Suggestions.image(this, url, "", Math.min(1920, Ui.screen(this).x));
+            Bitmap bm = Suggestions.screenImage(this, url, Math.min(1920, Ui.screen(this).x));
             if (bm != null) ui.post(() -> {
                 backdrop.setImageBitmap(bm);
                 backdrop.setScaleX(1.04f);
@@ -336,7 +337,6 @@ public class DetailActivity extends Activity {
             Offer of = by.get(key);
             if (of == null) {
                 of = new Offer();
-                of.tech = tech;
                 of.name = name;
                 of.url = o.optString("standardWebURL");
                 by.put(key, of);

@@ -37,20 +37,6 @@ final class Glyphs {
                 p.setStyle(Paint.Style.FILL);
                 c.drawCircle(m, s * 0.78f, s * 0.06f, p);
                 break;
-            case "ethernet":  // three linked network nodes
-                p.setStrokeWidth(s * 0.075f);
-                c.drawLine(m, s * 0.36f, m, s * 0.5f, p);
-                c.drawLine(s * 0.27f, s * 0.5f, s * 0.73f, s * 0.5f, p);
-                c.drawLine(s * 0.27f, s * 0.5f, s * 0.27f, s * 0.62f, p);
-                c.drawLine(s * 0.73f, s * 0.5f, s * 0.73f, s * 0.62f, p);
-                p.setStyle(Paint.Style.FILL);
-                r.set(m - s * 0.12f, s * 0.14f, m + s * 0.12f, s * 0.36f);
-                c.drawRoundRect(r, s * 0.04f, s * 0.04f, p);
-                r.set(s * 0.15f, s * 0.62f, s * 0.39f, s * 0.84f);
-                c.drawRoundRect(r, s * 0.04f, s * 0.04f, p);
-                r.set(s * 0.61f, s * 0.62f, s * 0.85f, s * 0.84f);
-                c.drawRoundRect(r, s * 0.04f, s * 0.04f, p);
-                break;
             case "bluetooth":  // the rune
                 p.setStrokeWidth(s * 0.075f);
                 path.moveTo(s * 0.3f, s * 0.32f);
@@ -85,14 +71,6 @@ final class Glyphs {
                     path.quadTo(cx - w, cy - w, cx, cy - k);
                     c.drawPath(path, p);
                 }
-                break;
-            case "leaf":  // energy saving
-                p.setStrokeWidth(s * 0.075f);
-                path.moveTo(s * 0.2f, s * 0.8f);
-                path.cubicTo(s * 0.2f, s * 0.36f, s * 0.46f, s * 0.18f, s * 0.82f, s * 0.18f);
-                path.cubicTo(s * 0.82f, s * 0.56f, s * 0.6f, s * 0.8f, s * 0.2f, s * 0.8f);
-                c.drawPath(path, p);
-                c.drawLine(s * 0.2f, s * 0.8f, s * 0.58f, s * 0.42f, p);
                 break;
             case "mediaplayer": {  // a screen with a play button, like SF Symbols' play.rectangle
                 p.setStrokeWidth(s * 0.07f);
@@ -177,14 +155,6 @@ final class Glyphs {
                 c.drawPath(view, p);
                 break;
             }
-            case "moon":
-                p.setStyle(Paint.Style.FILL);
-                path.addCircle(m, m, s * 0.34f, Path.Direction.CW);
-                Path cut = new Path();
-                cut.addCircle(m + s * 0.2f, m - s * 0.14f, s * 0.3f, Path.Direction.CW);
-                path.op(cut, Path.Op.DIFFERENCE);
-                c.drawPath(path, p);
-                break;
             case "audio":
                 for (int i = 0; i < 2; i++) {
                     float rad = s * (0.2f + 0.16f * i);
@@ -217,17 +187,6 @@ final class Glyphs {
                 c.drawCircle(s * 0.66f, m - s * 0.03f, s * 0.035f, p);
                 c.drawCircle(s * 0.74f, m + s * 0.06f, s * 0.035f, p);
                 p.setXfermode(null);
-                break;
-            case "accessibility":
-                c.drawCircle(m, m, s * 0.38f, p);
-                p.setStyle(Paint.Style.FILL);
-                c.drawCircle(m, s * 0.3f, s * 0.05f, p);
-                p.setStyle(Paint.Style.STROKE);
-                p.setStrokeWidth(s * 0.06f);
-                c.drawLine(s * 0.32f, s * 0.42f, s * 0.68f, s * 0.42f, p);
-                c.drawLine(m, s * 0.42f, m, s * 0.58f, p);
-                c.drawLine(m, s * 0.58f, s * 0.4f, s * 0.74f, p);
-                c.drawLine(m, s * 0.58f, s * 0.6f, s * 0.74f, p);
                 break;
             case "gear":
                 p.setStyle(Paint.Style.FILL);
@@ -405,57 +364,6 @@ final class Glyphs {
                 c.drawRect(r, fill);
                 break;
             }
-            case "memory": {  // a memory chip with pins
-                r.set(s * 0.22f, s * 0.28f, s * 0.78f, s * 0.72f);
-                c.drawRoundRect(r, s * 0.06f, s * 0.06f, p);
-                for (int i = 0; i < 4; i++) {
-                    float x = s * (0.3f + i * 0.13f);
-                    c.drawLine(x, s * 0.16f, x, s * 0.28f, p);
-                    c.drawLine(x, s * 0.72f, x, s * 0.84f, p);
-                }
-                Paint dot = new Paint(p);
-                dot.setStyle(Paint.Style.FILL);
-                r.set(s * 0.36f, s * 0.42f, s * 0.5f, s * 0.58f);
-                c.drawRect(r, dot);
-                break;
-            }
-            case "refresh": {  // circular arrow
-                r.set(s * 0.2f, s * 0.2f, s * 0.8f, s * 0.8f);
-                c.drawArc(r, -60, 300, false, p);
-                float ax = m + s * 0.3f * (float) Math.cos(Math.toRadians(-60)), ay = m + s * 0.3f * (float) Math.sin(Math.toRadians(-60));
-                path.moveTo(ax - s * 0.16f, ay - s * 0.04f);
-                path.lineTo(ax, ay);
-                path.lineTo(ax - s * 0.02f, ay + s * 0.16f);
-                c.drawPath(path, p);
-                break;
-            }
-            case "search":
-                c.drawCircle(s * 0.44f, s * 0.44f, s * 0.24f, p);
-                c.drawLine(s * 0.62f, s * 0.62f, s * 0.82f, s * 0.82f, p);
-                break;
-            case "present":  // Presentation: screen with a play triangle
-                r.set(s * 0.1f, s * 0.2f, s * 0.9f, s * 0.74f);
-                c.drawRoundRect(r, s * 0.08f, s * 0.08f, p);
-                c.drawLine(s * 0.36f, s * 0.86f, s * 0.64f, s * 0.86f, p);
-                p.setStyle(Paint.Style.FILL);
-                path.moveTo(s * 0.43f, s * 0.35f);
-                path.lineTo(s * 0.62f, s * 0.47f);
-                path.lineTo(s * 0.43f, s * 0.59f);
-                path.close();
-                c.drawPath(path, p);
-                break;
-            case "controls":  // Control Center glyph: two toggles
-                p.setStrokeWidth(s * 0.07f);
-                r.set(s * 0.14f, s * 0.2f, s * 0.86f, s * 0.44f);
-                c.drawRoundRect(r, s * 0.12f, s * 0.12f, p);
-                c.drawCircle(s * 0.66f, s * 0.32f, s * 0.05f, p);
-                p.setStyle(Paint.Style.FILL);
-                r.set(s * 0.14f, s * 0.56f, s * 0.86f, s * 0.8f);
-                c.drawRoundRect(r, s * 0.12f, s * 0.12f, p);
-                Paint knob = new Paint(Paint.ANTI_ALIAS_FLAG);
-                knob.setXfermode(new android.graphics.PorterDuffXfermode(android.graphics.PorterDuff.Mode.CLEAR));
-                c.drawCircle(s * 0.34f, s * 0.68f, s * 0.07f, knob);
-                break;
             default:
                 break;
         }

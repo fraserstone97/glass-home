@@ -89,10 +89,6 @@ final class Suggestions {
         String type, title, overview, backdrop, logo, year, genres;
         /** Exact title page on the service (JustWatch), opened directly in the app when it supports it. */
         String link = "";
-        /** Continue Watching entries: the app that played it, its store key, and progress. */
-        String pkg = "", key = "";
-        float progress = -1f;
-        int remainingMin = -1;
         double rating;
         /** News: when the story was published (ms), for "2 h ago". */
         long published;
@@ -232,6 +228,18 @@ final class Suggestions {
         }
     }
 
+    /**
+     * Writes a saved list whole, then swaps it in: a reader at the same moment (Home reloading the
+     * carousel) gets the old list or the new one, never a half-written file read as "nothing".
+     */
+    static void save(File f, String json) throws java.io.IOException {
+        File tmp = new File(f.getPath() + ".part");
+        try (OutputStream os = new FileOutputStream(tmp)) {
+            os.write(json.getBytes(StandardCharsets.UTF_8));
+        }
+        if (!tmp.renameTo(f)) throw new java.io.IOException("couldn't save " + f.getName());
+    }
+
     /** Fetches fresh suggestions from the chosen source (blocking; call off the UI thread). */
     static List<Item> fetch(Context c) throws Exception {
         List<Item> out = new ArrayList<>();
@@ -247,9 +255,7 @@ final class Suggestions {
         if (out.isEmpty() && err != null) throw err;
         JSONArray a = new JSONArray();
         for (Item it : out) a.put(it.toJson());
-        try (OutputStream os = new FileOutputStream(cacheFile(c))) {
-            os.write(a.toString().getBytes(StandardCharsets.UTF_8));
-        }
+        save(cacheFile(c), a.toString());
         return out;
     }
 
@@ -309,9 +315,7 @@ final class Suggestions {
                 }
                 o.put(String.valueOf(e.getKey()), a);
             }
-            try (OutputStream os = new FileOutputStream(serviceFile(c))) {
-                os.write(o.toString().getBytes(StandardCharsets.UTF_8));
-            }
+            save(serviceFile(c), o.toString());
         } catch (Exception ignored) {
             // the mixed carousel still works without it
         }
@@ -531,9 +535,7 @@ final class Suggestions {
                 o = new JSONObject(new String(readAll(new FileInputStream(f)), StandardCharsets.UTF_8));
             } else {
                 o = get(c, "/genre/" + kind + "/list?language=en");
-                try (OutputStream os = new FileOutputStream(f)) {
-                    os.write(o.toString().getBytes(StandardCharsets.UTF_8));
-                }
+                save(f, o.toString());
             }
             Map<Integer, String> m = new LinkedHashMap<>();
             JSONArray g = o.optJSONArray("genres");
@@ -580,7 +582,10 @@ final class Suggestions {
                 JSONObject o = b.getJSONObject(i);
                 if (o.optInt("width") < 1920) continue;
                 boolean textless = o.isNull("iso_639_1");
-                double score = (textless ? 10 : 0) + o.optDouble("vote_average", 0) + Math.min(o.optInt("vote_count"), 10) * 0.05;
+                // Textless first, then best liked; a 4K original only if nothing near the screen's
+                // own width will do (it looks no sharper here, and takes far longer to fetch and open).
+                double score = (textless ? 10 : 0) + (o.optInt("width") <= 2560 ? 1.5 : 0)
+                        + o.optDouble("vote_average", 0) + Math.min(o.optInt("vote_count"), 10) * 0.05;
                 if (score > bestScore) {
                     bestScore = score;
                     best = o.optString("file_path");
@@ -618,15 +623,6 @@ final class Suggestions {
     /** TMDB image, cached on disk, decoded no larger than maxWidth (the box has little RAM). */
     static Bitmap image(Context c, String path, String size, int maxWidth) {
         if (path == null || path.isEmpty()) return null;
-        if (path.startsWith("/")) {  // local artwork (Continue Watching)
-            BitmapFactory.Options o = new BitmapFactory.Options();
-            o.inJustDecodeBounds = true;
-            BitmapFactory.decodeFile(path, o);
-            o.inSampleSize = 1;
-            while (o.outWidth / (o.inSampleSize * 2) >= maxWidth) o.inSampleSize *= 2;
-            o.inJustDecodeBounds = false;
-            return BitmapFactory.decodeFile(path, o);
-        }
         try {
             File f = download(c, path, size);
             if (f == null) return null;
@@ -637,6 +633,36 @@ final class Suggestions {
             while (o.outWidth / (o.inSampleSize * 2) >= maxWidth) o.inSampleSize *= 2;
             o.inJustDecodeBounds = false;
             return BitmapFactory.decodeFile(f.getPath(), o);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * A full-screen picture (backdrop): opened at about the width given in 16-bit colour (half the
+     * memory, and no difference under the dark shades it sits beneath), and sent to the graphics
+     * chip straight away, so showing it doesn't stall a frame.
+     */
+    static Bitmap screenImage(Context c, String url, int width) {
+        try {
+            File f = download(c, url, "");
+            if (f == null) return null;
+            BitmapFactory.Options o = new BitmapFactory.Options();
+            o.inJustDecodeBounds = true;
+            BitmapFactory.decodeFile(f.getPath(), o);
+            o.inSampleSize = 1;
+            while (o.outWidth / (o.inSampleSize * 2) >= width) o.inSampleSize *= 2;
+            o.inJustDecodeBounds = false;
+            o.inPreferredConfig = Bitmap.Config.RGB_565;
+            int w = o.outWidth / o.inSampleSize;
+            if (w > width * 11 / 10) {
+                o.inScaled = true;
+                o.inDensity = w;
+                o.inTargetDensity = width;
+            }
+            Bitmap b = BitmapFactory.decodeFile(f.getPath(), o);
+            if (b != null) b.prepareToDraw();
+            return b;
         } catch (Exception e) {
             return null;
         }

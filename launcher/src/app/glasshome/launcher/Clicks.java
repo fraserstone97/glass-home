@@ -3,7 +3,6 @@ package app.glasshome.launcher;
 import android.content.Context;
 import android.media.AudioAttributes;
 import android.media.SoundPool;
-import android.view.KeyEvent;
 
 import java.io.File;
 import java.io.FileOutputStream;

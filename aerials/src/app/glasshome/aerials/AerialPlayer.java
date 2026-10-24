@@ -48,6 +48,12 @@ final class AerialPlayer {
     static final PathInterpolator EASE = new PathInterpolator(0.25f, 0.1f, 0.25f, 1f);
     /** Load the next clip this long before the current one ends; dissolve over the last XFADE. */
     static final int PRELOAD = 20000, XFADE = 2200, FADE = 1400, PREPARE_TIMEOUT = 30000;
+    /**
+     * How early the next clip starts before its dissolve is due. A 4K clip takes most of a second
+     * to show its first frame; started any later, the outgoing clip reached its end and froze
+     * part-way through the dissolve.
+     */
+    static final int LEAD = 1200;
 
     /** How long the place name stays up after Up, and its fades. */
     static final int INFO_HOLD = 4000, INFO_IN = 450, INFO_OUT = 700;
@@ -327,6 +333,9 @@ final class AerialPlayer {
                 return false;
             });
             mp.setOnCompletionListener(m -> {
+                if (m == d.mp && d == live && dissolving) {
+                    log("outgoing clip ended " + (XFADE - (System.currentTimeMillis() - dissolveAt)) + " ms before the dissolve finished");
+                }
                 if (m == d.mp && d == live) ended();
             });
             mp.setOnErrorListener((m, what, extra) -> {
@@ -367,6 +376,9 @@ final class AerialPlayer {
         }, wait);
     }
 
+    /** When the current dissolve began (for the log). */
+    long dissolveAt;
+
     void begin(Deck d) {
         log("play deck " + deck(d));
         d.started = System.currentTimeMillis();
@@ -386,7 +398,15 @@ final class AerialPlayer {
             return;
         }
         Deck out = live;
-        log("dissolve to deck " + deck(d));
+        int left = -1;
+        try {
+            left = out.mp.getDuration() - out.mp.getCurrentPosition();
+        } catch (IllegalStateException ignored) {
+            // timing for the log only
+        }
+        dissolveAt = System.currentTimeMillis();
+        log("dissolve to deck " + deck(d) + ": first frame after " + (dissolveAt - d.started) + " ms, "
+                + left + " ms of the outgoing clip left for a " + XFADE + " ms dissolve");
         // The place name belonged to the clip that is leaving.
         handler.removeCallbacks(hideInfo);
         hideInfo.run();
@@ -409,7 +429,7 @@ final class AerialPlayer {
         MediaPlayer m = live == null ? null : live.mp;
         if (m == null) return false;
         try {
-            return m.getDuration() > 0 && m.getCurrentPosition() >= m.getDuration() - XFADE - 200;
+            return m.getDuration() > 0 && m.getCurrentPosition() >= m.getDuration() - XFADE - LEAD;
         } catch (IllegalStateException e) {
             return false;
         }
@@ -429,7 +449,7 @@ final class AerialPlayer {
             }
             Deck next = other(d);
             if (len > 0 && at >= len - PRELOAD && next.mp == null && next.surface) load(next, false);
-            if (len > 0 && at >= len - XFADE - 200 && next.prepared && !next.mp.isPlaying()) {
+            if (len > 0 && at >= len - XFADE - LEAD && next.prepared && !next.mp.isPlaying()) {
                 begin(next);
                 return;  // shown() takes over when its first frame arrives
             }

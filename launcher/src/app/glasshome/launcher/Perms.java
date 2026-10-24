@@ -15,10 +15,8 @@ import android.provider.Settings;
  * Permissions, asked for on screen wherever the TV allows it; adb is only the last resort.
  * - Location (Wi-Fi name): the normal runtime prompt.
  * - Device admin (Power Off, Sleep Timer): Android's "Activate device admin app?" screen.
- * - Notification access (Continue Watching, Do Not Disturb): the system's notification-access
- *   screen (Android 11+ opens Hume's own switch directly).
- * Some TVs (e.g. Android 9 builds) have no screen for the last two; only then is the
- * one-time computer command shown.
+ * Some TVs (e.g. Android 9 builds) have no screen for device admin; then Glass Home's
+ * accessibility switch does the same job.
  */
 final class Perms {
     static final int REQ_LOCATION = 41;
@@ -34,8 +32,7 @@ final class Perms {
         return a.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED;
     }
 
-    /** Some TVs (e.g. this office TV's Android 9 build) lack device admin entirely; nothing can enable it. */
-    /** Power Off is possible via device admin, or via Hume's accessibility service (any TV with that screen). */
+    /** Power Off is possible via device admin, or via Glass Home's accessibility service (any TV with that screen). */
     static boolean adminSupported(Activity a) {
         return adminWorks(a) || accessibilityScreen(a) != null;
     }
@@ -69,7 +66,7 @@ final class Perms {
             return;
         }
         if (!adminWorks(a)) {
-            // Device admin is switched off on this TV: use Hume's accessibility switch instead.
+            // Device admin is switched off on this TV: use Glass Home's accessibility switch instead.
             Intent acc = accessibilityScreen(a);
             new AlertDialog.Builder(a, android.R.style.Theme_DeviceDefault_Dialog_Alert)
                     .setTitle("Turn On Sleep Timer")

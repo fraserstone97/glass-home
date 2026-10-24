@@ -18,8 +18,6 @@ import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import java.util.List;
-
 /**
  * Control Centre: a translucent glass panel docked to the right of the screen, over Home or any
  * app. Opened by the gear on Home and by the remote's Quick Settings button (KeysService); a

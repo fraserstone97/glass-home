@@ -37,7 +37,35 @@ final class WeatherView extends View {
 
     void setData(Weather.Data d) {
         data = d;
+        if (!full) requestLayout();
         invalidate();
+    }
+
+    /** The compact pill is as wide as its contents, with even margins. */
+    @Override
+    protected void onMeasure(int ws, int hs) {
+        if (full) {
+            super.onMeasure(ws, hs);
+            return;
+        }
+        float w = COMPACT_W * u;
+        if (data != null) {
+            float pad = 12 * u, is = 30 * u;
+            w = pad + is + 6 * u + measure(data.temp + "\u00b0", 22, regular) + 9 * u
+                    + Math.max(measure(Weather.describe(data.code, data.day), 11.5f, semibold), measure(detail(data), 11.5f, medium))
+                    + 16 * u;
+        }
+        setMeasuredDimension(Math.round(w), View.MeasureSpec.getSize(hs));
+    }
+
+    private float measure(String s, float size, android.graphics.Typeface tf) {
+        p.setTypeface(tf);
+        p.setTextSize(size * u);
+        return p.measureText(s);
+    }
+
+    static String detail(Weather.Data d) {
+        return (d.place.isEmpty() ? "" : d.place + "  ") + "H:" + d.max + "\u00b0 L:" + d.min + "\u00b0";
     }
 
     @Override
@@ -59,8 +87,7 @@ final class WeatherView extends View {
         float tw = text(c, d.temp + "\u00b0", tx, h / 2f + 8 * u, 22, regular, 1f, Paint.Align.LEFT);
         float cx = tx + tw + 9 * u;
         text(c, Weather.describe(d.code, d.day), cx, h / 2f - 2 * u, 11.5f, semibold, 1f, Paint.Align.LEFT);
-        text(c, (d.place.isEmpty() ? "" : d.place + "  ") + "H:" + d.max + "\u00b0 L:" + d.min + "\u00b0",
-                cx, h / 2f + 12 * u, 11.5f, medium, 0.7f, Paint.Align.LEFT);
+        text(c, detail(d), cx, h / 2f + 12 * u, 11.5f, medium, 0.7f, Paint.Align.LEFT);
     }
 
     private void drawFull(Canvas c) {
@@ -108,8 +135,9 @@ final class WeatherView extends View {
             text(c, day.label, x0, base, 15, semibold, 1f, Paint.Align.LEFT);
             float ix = x0 + 64 * u;
             if (day.rain >= 20) {
-                icon(c, day.code, true, ix, ry + 3 * u, 22 * u);
-                text(c, day.rain + "%", ix + 11 * u, ry + row - 1 * u, 11.5f, semibold, 1f, Paint.Align.CENTER, 0xFF64C8FF);
+                // The chance of rain under the icon, as Apple Weather shows it, with room between.
+                icon(c, day.code, true, ix + 2 * u, ry + 2 * u, 18 * u);
+                text(c, day.rain + "%", ix + 11 * u, ry + row - 2.5f * u, 10.5f, semibold, 1f, Paint.Align.CENTER, 0xFF64C8FF);
             } else {
                 icon(c, day.code, true, ix - 1 * u, ry + 5 * u, 24 * u);
             }

@@ -3,11 +3,8 @@ Copyright 2026 Fraser Stone
 
 Licensed under the Apache License, Version 2.0 (see LICENSE).
 
-Glass Home's launcher is a modified version of Hume Launcher
-(https://github.com/petrobot-admin/hume-launcher), Copyright 2026 Petrobot, Apache License 2.0.
-Changes: renamed and repackaged; the home screen, Control Centre, Search, title pages, Settings,
-motion and materials were redesigned; the UK recommendations, the remote-buttons helper and the
-screen saver were added.
+Portions of the launcher derive from Hume Launcher, Copyright 2026 Petrobot (Apache License 2.0),
+as modified by Fraser Stone.
 
 This product includes third-party components under their own licences:
 

@@ -28,7 +28,7 @@ public class SleepReceiver extends BroadcastReceiver {
         return (dpm != null && dpm.isAdminActive(admin(c))) || PowerService.instance != null;
     }
 
-    /** Device admin where available; otherwise Hume's accessibility service (screen off / sleep). */
+    /** Device admin where available; otherwise Glass Home's accessibility service (screen off / sleep). */
     static boolean sleepNow(Context c) {
         DevicePolicyManager dpm = c.getSystemService(DevicePolicyManager.class);
         if (dpm != null && dpm.isAdminActive(admin(c))) {

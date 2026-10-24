@@ -17,7 +17,7 @@ import java.util.List;
  * shows it. Boxes without inputs (e.g. a Mi Box) report none, and the Inputs card and button hide.
  */
 final class Inputs {
-    static final String K_CARD = "inputs_card", K_BUTTON = "inputs_button";
+    static final String K_CARD = "inputs_card";
 
     private Inputs() {
     }
@@ -40,10 +40,6 @@ final class Inputs {
 
     static boolean showCard(Context c) {
         return prefs(c).getBoolean(K_CARD, true);
-    }
-
-    static boolean showButton(Context c) {
-        return prefs(c).getBoolean(K_BUTTON, true);
     }
 
     /** Hardware inputs in a natural order: HDMI first, then AV and the rest, tuner last. */

@@ -48,7 +48,7 @@ public class SettingsActivity extends Activity {
     }
 
     // tvOS-style pages: the main list opens a page per section; Back returns to the main list.
-    static final String ROOT = "root", PROFILES = "Profiles", SHELF = "Top Shelf",
+    static final String ROOT = "root", SHELF = "Top Shelf",
             INPUTS = "Inputs", WEATHER = "Weather", HOME = "Home Screen",
             PERMS = "Permissions", ABOUT = "About", SAVER = "Screen Saver";
 
@@ -273,7 +273,6 @@ public class SettingsActivity extends Activity {
         int[] grad;
         String glyph;
         switch (p) {
-            case PROFILES: grad = new int[]{0xFFBF5AF2, 0xFF7D3CCB}; glyph = null; break;
             case SHELF: grad = new int[]{0xFF64D2FF, 0xFF0A84FF}; glyph = "shelf"; break;
             case INPUTS: grad = new int[]{0xFF5A6478, 0xFF1C212C}; glyph = "hdmi"; break;
             case WEATHER: grad = new int[]{0xFF5AC8FA, 0xFF2D6BD8}; glyph = null; break;
@@ -288,8 +287,7 @@ public class SettingsActivity extends Activity {
         paint.setShader(new android.graphics.LinearGradient(0, 0, 0, h, grad[0], grad[1], android.graphics.Shader.TileMode.CLAMP));
         c.drawRect(0, 0, w, h, paint);
         android.graphics.Bitmap g;
-        if (p.equals(PROFILES)) g = Profiles.avatar(this, Profiles.current(this), (int) (h * 0.62f));
-        else if (p.equals(WEATHER)) g = WeatherIcons.get(0, true, (int) (h * 0.7f));
+        if (p.equals(WEATHER)) g = WeatherIcons.get(0, true, (int) (h * 0.7f));
         else g = Glyphs.get(glyph, (int) (h * 0.56f), Color.WHITE);
         c.drawBitmap(g, (w - g.getWidth()) / 2f, (h - g.getHeight()) / 2f, null);
         return b;
@@ -478,7 +476,6 @@ public class SettingsActivity extends Activity {
 
     void pageAbout() {
         row(getString(R.string.app_name), () -> "Version " + version(), () -> { });
-        row("Based on", () -> "Hume Launcher by Petrobot (Apache 2.0)", () -> { });
         row("Weather", () -> Weather.sourceName(Weather.source(this)), () -> { });
         row("Artwork", () -> Suggestions.hasToken(this) ? "TMDB" : "JustWatch", () -> { });
         if (Suggestions.hasToken(this)) {
@@ -495,8 +492,7 @@ public class SettingsActivity extends Activity {
     // ---------------------------------------------------------------- screen saver
 
     /** The TV's own screen saver settings, read and written directly (tvOS holds the permission). */
-    static final String DREAM_ON = "screensaver_enabled", DREAM = "screensaver_components",
-            DREAM_DEFAULT = "screensaver_default_component";
+    static final String DREAM_ON = "screensaver_enabled", DREAM = "screensaver_components";
     static final String AERIALS = "app.glasshome.aerials/app.glasshome.aerials.AerialDream";
 
     void pageSaver() {

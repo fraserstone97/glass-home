@@ -27,9 +27,15 @@ Android 7 or newer.
 - **Control Centre** (the gear, or your remote's Quick Settings button, from any app): inputs,
   picture, sound, Wi-Fi, Bluetooth, sleep timer, screen saver and Glass Home's settings, as a glass
   panel over whatever you're watching.
-- **Search and voice search.** Press the mic button and say what you want; Google's speech
-  service, not Gemini. Every result opens a title page with the synopsis, cast, ratings, a Watch
-  button and *How to Watch*: every UK service that streams, rents or sells it, with prices.
+- **Search that understands you.** Type, or hold the mic button and ask the way you'd ask a
+  person: *slow horses*, *films like Inception*, *comedies with Will Ferrell*, *films directed by
+  Greta Gerwig*, *documentaries about space*, *80s films*, *kids films*, *what's new on Netflix*,
+  *Christmas films*. Answers come as tvOS shelves (Top Results, More Like This, an actor's or
+  director's work, what's trending in a genre), kept to what UK viewers watch and can watch, with
+  IMDb and Rotten Tomatoes scores. Voice uses Google's speech service, not Gemini, and a glow runs
+  round the search field while it listens. Every result opens a title page with the synopsis,
+  cast, ratings, a Watch button and *How to Watch*: every UK service that streams, rents or sells
+  it, with prices. (Actors, directors and subjects need the free TMDB key below.)
 - **Remote buttons that work.** Netflix, Prime Video, YouTube and Quick Settings, from any screen.
 - **Apple's aerials as the screen saver.** 92 of Apple TV's aerial films in 4K, shuffled with no
   repeats, dissolving from one to the next. Press Up to see where you are.
@@ -179,8 +185,6 @@ Home" ./build.sh` changes the name the TV shows. Code is plain Java with no depe
 
 ## Credits
 
-- [Hume Launcher](https://github.com/petrobot-admin/hume-launcher) by Petrobot (Apache 2.0), which
-  Glass Home's launcher grew from.
 - [cleanyourtv](https://github.com/Gathin23/cleanyourtv) (MIT), whose method and safety rules the
   setup scripts follow.
 - Recommendations from [JustWatch](https://www.justwatch.com); artwork from
