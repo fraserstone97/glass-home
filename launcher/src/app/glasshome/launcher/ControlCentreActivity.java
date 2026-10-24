@@ -90,8 +90,15 @@ public class ControlCentreActivity extends Activity {
         body = new LinearLayout(this);
         body.setOrientation(LinearLayout.VERTICAL);
         body.setClipChildren(false);
+        // A fading page is drawn as one image cut to its edges. The selected button grows and
+        // nudges past them as it lifts, which sliced its corner flat while the page faded in; this
+        // invisible border gives that image room, and the negative margins keep the layout put.
+        int room = dp(12);
+        body.setPadding(room, room, room, room);
+        body.setClipToPadding(false);
         LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(-1, 0, 1f);
-        blp.topMargin = dp(16);
+        blp.topMargin = dp(16) - room;
+        blp.leftMargin = blp.rightMargin = blp.bottomMargin = -room;
         sheet.addView(body, blp);
 
         setContentView(root);
@@ -180,7 +187,8 @@ public class ControlCentreActivity extends Activity {
                 body.setTranslationX(dp(36) * dir);
                 body.setAlpha(0f);
                 heading.setAlpha(0f);
-                body.animate().translationX(0).alpha(1f).setDuration(380).setInterpolator(MainActivity.EASE).withLayer().start();
+                // No off-screen layer: it's cut to the page's edges, which sliced the lifting button square.
+                body.animate().translationX(0).alpha(1f).setDuration(380).setInterpolator(MainActivity.EASE).start();
                 heading.animate().alpha(1f).setDuration(380).setInterpolator(MainActivity.EASE).start();
             }
         };
@@ -190,7 +198,7 @@ public class ControlCentreActivity extends Activity {
         }
         heading.animate().alpha(0f).setDuration(160).setInterpolator(MainActivity.EASE).start();
         body.animate().translationX(-dp(36) * dir).alpha(0f).setDuration(170).setInterpolator(MainActivity.EASE)
-                .withLayer().withEndAction(in).start();
+                .withEndAction(in).start();
     }
 
     void showMain(int dir) {
