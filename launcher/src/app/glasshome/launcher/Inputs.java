@@ -26,6 +26,8 @@ final class Inputs {
         String id, label;
         int type;
         boolean passthrough, disconnected, usb;
+        /** Given a name in the TV's input settings ("PS5"), so something is plugged in there. */
+        boolean named;
     }
 
     /** File/media apps that can browse a USB drive, in order of preference. */
@@ -76,14 +78,17 @@ final class Inputs {
                 in.type = info.getType();
                 in.passthrough = info.isPassthroughInput();
                 CharSequence custom = info.loadCustomLabel(c), label = info.loadLabel(c);
-                in.label = custom != null && custom.length() > 0 ? custom.toString() : label != null ? tidy(label.toString(), in.type) : "Input";
+                in.named = custom != null && custom.length() > 0;
+                in.label = in.named ? custom.toString() : label != null ? tidy(label.toString(), in.type) : "Input";
                 in.disconnected = tm.getInputState(in.id) == TvInputManager.INPUT_STATE_DISCONNECTED;
                 out.add(in);
             } catch (Exception ignored) {
                 // skip inputs that can't be read
             }
         }
-        out.sort((a, b) -> Integer.compare(rank(a), rank(b)) != 0 ? Integer.compare(rank(a), rank(b))
+        // Named inputs (the PS5, the Sky box) first, then the plain ports in order (HDMI 1, 2...).
+        out.sort((a, b) -> a.named != b.named ? (a.named ? -1 : 1)
+                : Integer.compare(rank(a), rank(b)) != 0 ? Integer.compare(rank(a), rank(b))
                 : a.label.compareToIgnoreCase(b.label));
         // A plugged-in USB drive shows as its own source (opens the TV's file or media app).
         if (!out.isEmpty()) {
