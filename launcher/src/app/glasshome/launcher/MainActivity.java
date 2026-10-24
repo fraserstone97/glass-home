@@ -3720,6 +3720,8 @@ public class MainActivity extends Activity {
             return;
         }
         idle = true;
+        // Full screen shows what's on across all your services, not just the app you were on.
+        shelfFor(null, false);
         idleScrollY = scroll.getTranslationY();
         idleInfoY = heroInfoY;
         idleDotsY = heroDotsY;
@@ -3749,6 +3751,9 @@ public class MainActivity extends Activity {
     void exitIdle() {
         if (!idle) return;
         idle = false;
+        // Back to the shelf of the app in focus (a dock app shows its own titles again).
+        handler.removeCallbacks(shelfUpdate);
+        handler.postDelayed(shelfUpdate, 260);
         // Back to the app grid, if that's where it went full screen from: the weather and the tab
         // bar stay hidden there, as they are whenever the grid is scrolled up.
         boolean toGrid = idleReturnIndex >= 0;
