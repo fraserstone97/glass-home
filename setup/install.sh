@@ -62,7 +62,6 @@ echo "Permissions"
 tv pm grant "$HOME_PKG" android.permission.RECORD_AUDIO 2>/dev/null || true          # voice search
 tv pm grant "$HOME_PKG" android.permission.ACCESS_FINE_LOCATION 2>/dev/null || true  # Wi-Fi name in Control Centre
 tv pm grant "$HOME_PKG" android.permission.WRITE_SECURE_SETTINGS 2>/dev/null || true # screen saver settings, helper self-repair
-tv cmd notification allow_listener "$HOME_PKG/$HOME_PKG.MediaWatchService" 2>/dev/null || true  # Continue Watching
 tv dpm set-active-admin --user 0 "$HOME_PKG/.SleepReceiver\\\$Admin" >/dev/null 2>&1 || true   # Sleep Timer
 # TCL (and some other brands) block apps from starting their own services unless allowed.
 tv appops set "$HOME_PKG" AUTO_START allow 2>/dev/null || true

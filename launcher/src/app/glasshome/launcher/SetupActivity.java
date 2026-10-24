@@ -301,13 +301,7 @@ public class SetupActivity extends Activity {
             show(index, 0);
             focusRow(0);
         });
-        boolean cw = Profiles.homePrefs(this).getBoolean("cw_enabled", true);
-        option(l, "Continue Watching", "Pick up where you left off.", cw, () -> {
-            Profiles.homePrefs(this).edit().putBoolean("cw_enabled", !cw).apply();
-            show(index, 0);
-            focusRow(1);
-        });
-        option(l, "Continue", recs || cw ? null : null, false, this::next);
+        option(l, "Continue", null, false, this::next);
         dots();
     }
 
@@ -362,9 +356,6 @@ public class SetupActivity extends Activity {
         if (!Perms.hasLocation(this)) {
             option(l, "Show Wi-Fi Name", "Needs location access.", false,
                     () -> Perms.requestLocation(this));
-        }
-        if (Perms.listenerSupported(this) && !Perms.hasListener(this)) {
-            option(l, "Continue Watching", "See what\u2019s playing in each app.", false, () -> Perms.requestListener(this));
         }
         if (Perms.adminSupported(this) && !Perms.hasAdmin(this)) {
             option(l, "Sleep Timer", "Lets " + getString(R.string.app_name) + " turn off the TV.", false, () -> Perms.requestAdmin(this));

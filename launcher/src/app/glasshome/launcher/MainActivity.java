@@ -2141,9 +2141,9 @@ public class MainActivity extends Activity {
         loadHero();
     }
 
-    /** Continue Watching can be switched off per profile (Settings -> Continue Watching). */
+    /** Continue Watching was removed: the apps on this TV don't say what's playing. */
     boolean cwEnabled() {
-        return Profiles.homePrefs(this).getBoolean("cw_enabled", true);
+        return false;
     }
 
     /** The tab bar only appears when there are two things to switch between. */
@@ -2202,7 +2202,7 @@ public class MainActivity extends Activity {
         boolean reconfigured = v != heroVersion;
         heroVersion = v;
         io.execute(() -> {
-            List<Suggestions.Item> cwItems = cw ? MediaWatchService.Store.list(this) : new ArrayList<>();
+            List<Suggestions.Item> cwItems = new ArrayList<Suggestions.Item>();
             StringBuilder sig = new StringBuilder();
             for (Suggestions.Item it : cwItems) sig.append(it.key).append(it.progress).append(';');
             boolean cwChanged = !sig.toString().equals(lastCwSig);
@@ -2240,11 +2240,7 @@ public class MainActivity extends Activity {
     void updateEmpty() {
         boolean show = continueMode() && heroItems.isEmpty() && !folderMode;
         if (show) {
-            shelfEmpty.setText(MediaWatchService.granted(this)
-                    ? "What you watch appears here."
-                    : !Perms.listenerSupported(this)
-                    ? "Not available on this TV."
-                    : "Allow access in Settings > Permissions.");
+            shelfEmpty.setText("Nothing here yet.");
         }
         shelfEmpty.animate().alpha(show ? 0.75f : 0f).setDuration(250).start();
     }
@@ -2647,7 +2643,6 @@ public class MainActivity extends Activity {
     }
 
     void removeHeroItem(Suggestions.Item it) {
-        MediaWatchService.Store.remove(this, it.key);
         selectRemove(false);
         lastCwSig = "";
         heroVersion = -1;
@@ -2693,7 +2688,6 @@ public class MainActivity extends Activity {
                         act.add(() -> openHeroItem(it));
                         l.add("Remove");
                         act.add(() -> {
-                            MediaWatchService.Store.remove(this, it.key);
                             heroItems = new ArrayList<>();
                             loadHero();
                         });

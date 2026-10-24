@@ -30,10 +30,6 @@ final class Perms {
         return new ComponentName(a, SleepReceiver.Admin.class);
     }
 
-    static ComponentName listener(Activity a) {
-        return new ComponentName(a, MediaWatchService.class);
-    }
-
     static boolean hasLocation(Activity a) {
         return a.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED;
     }
@@ -57,15 +53,6 @@ final class Perms {
     /** Device admin actually works only when Android's device-policy service is on. */
     static boolean adminWorks(Activity a) {
         return a.getPackageManager().hasSystemFeature(PackageManager.FEATURE_DEVICE_ADMIN);
-    }
-
-    /** Android turns notification listeners off for other apps on low-RAM (1 GB) TVs. */
-    static boolean listenerSupported(Activity a) {
-        return !a.getSystemService(android.app.ActivityManager.class).isLowRamDevice();
-    }
-
-    static boolean hasListener(Activity a) {
-        return MediaWatchService.granted(a);
     }
 
     static void requestLocation(Activity a) {
@@ -98,26 +85,6 @@ final class Perms {
         if (tryStart(a, i)) return;
         lastResort(a, "Sleep Timer",
                 "adb shell dpm set-active-admin app.glasshome.launcher/.SleepReceiver\\$Admin");
-    }
-
-    static void requestListener(Activity a) {
-        if (hasListener(a)) return;
-        if (!listenerSupported(a)) {
-            new AlertDialog.Builder(a, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-                    .setTitle("Not Available")
-                    .setMessage("This TV doesn\u2019t allow it.")
-                    .setPositiveButton("OK", null).show();
-            return;
-        }
-        if (Build.VERSION.SDK_INT >= 30) {
-            Intent detail = new Intent(Settings.ACTION_NOTIFICATION_LISTENER_DETAIL_SETTINGS)
-                    .putExtra(Settings.EXTRA_NOTIFICATION_LISTENER_COMPONENT_NAME, listener(a).flattenToString());
-            if (tryStart(a, detail)) return;
-        }
-        if (tryStart(a, new Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))) return;
-        if (tryStart(a, new Intent("android.settings.NOTIFICATION_POLICY_ACCESS_SETTINGS"))) return;
-        lastResort(a, "Continue Watching",
-                "adb shell cmd notification allow_listener app.glasshome.launcher/app.glasshome.launcher.MediaWatchService");
     }
 
     /** Starts a system screen if the TV really has it (many TVs map settings actions to empty stubs). */

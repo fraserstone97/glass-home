@@ -49,7 +49,7 @@ public class SettingsActivity extends Activity {
 
     // tvOS-style pages: the main list opens a page per section; Back returns to the main list.
     static final String ROOT = "root", PROFILES = "Profiles", SHELF = "Top Shelf",
-            INPUTS = "Inputs", WEATHER = "Weather", WATCHING = "Continue Watching", HOME = "Home Screen",
+            INPUTS = "Inputs", WEATHER = "Weather", HOME = "Home Screen",
             PERMS = "Permissions", ABOUT = "About", SAVER = "Screen Saver";
 
     FrameLayout leftPane;
@@ -96,7 +96,6 @@ public class SettingsActivity extends Activity {
             case SHELF: pageShelf(); break;
             case INPUTS: pageInputs(); break;
             case WEATHER: pageWeather(); break;
-            case WATCHING: pageWatching(); break;
             case HOME: pageHome(); break;
             case SAVER: pageSaver(); break;
             case PERMS: pagePermissions(); break;
@@ -278,7 +277,6 @@ public class SettingsActivity extends Activity {
             case SHELF: grad = new int[]{0xFF64D2FF, 0xFF0A84FF}; glyph = "shelf"; break;
             case INPUTS: grad = new int[]{0xFF5A6478, 0xFF1C212C}; glyph = "hdmi"; break;
             case WEATHER: grad = new int[]{0xFF5AC8FA, 0xFF2D6BD8}; glyph = null; break;
-            case WATCHING: grad = new int[]{0xFFFF6482, 0xFFD6305A}; glyph = "present"; break;
             case HOME: grad = new int[]{0xFF30D158, 0xFF1E9E48}; glyph = "house"; break;
             case SAVER: grad = new int[]{0xFF5E5CE6, 0xFF2C2A8C}; glyph = "sparkles"; break;
             case PERMS: grad = new int[]{0xFF8E8E93, 0xFF48484A}; glyph = "shield"; break;
@@ -305,8 +303,6 @@ public class SettingsActivity extends Activity {
         });
         if (!Inputs.list(this).isEmpty()) nav(INPUTS, () -> Inputs.showCard(this) ? "On" : "Off");
         nav(WEATHER, () -> !Weather.enabled(this) ? "Off" : Weather.place(this).isEmpty() ? "On" : Weather.place(this));
-        nav(WATCHING, () -> !Profiles.homePrefs(this).getBoolean("cw_enabled", true) ? "Off" : MediaWatchService.granted(this) ? "On"
-                : Perms.listenerSupported(this) ? "Not Allowed" : "Not on this TV");
         nav(HOME, () -> {
             String k = Profiles.homePrefs(this).getString("wallpaper", "night");
             int i = java.util.Arrays.asList(MainActivity.WALL_KEYS).indexOf(k);
@@ -314,7 +310,7 @@ public class SettingsActivity extends Activity {
         });
         nav(SAVER, this::dreamName);
         nav(PERMS, () -> {
-            int missing = (Perms.hasListener(this) || !Perms.listenerSupported(this) ? 0 : 1) + (Perms.hasLocation(this) ? 0 : 1)
+            int missing = (Perms.hasLocation(this) ? 0 : 1)
                     + (Perms.hasAdmin(this) || !Perms.adminSupported(this) ? 0 : 1) + (Perms.isDefaultHome(this) ? 0 : 1);
             return missing == 0 ? "All Allowed" : missing + " Not Allowed";
         });
@@ -432,20 +428,6 @@ public class SettingsActivity extends Activity {
         });
     }
 
-    void pageWatching() {
-        row("Show on Home Screen", () -> Profiles.homePrefs(this).getBoolean("cw_enabled", true) ? "On" : "Off", () -> {
-            boolean on = !Profiles.homePrefs(this).getBoolean("cw_enabled", true);
-            Profiles.homePrefs(this).edit().putBoolean("cw_enabled", on).apply();
-            if (!on) Toast.makeText(this, "Hidden from the Home Screen.", Toast.LENGTH_SHORT).show();
-        });
-        row("Access", () -> MediaWatchService.granted(this) ? "Allowed"
-                : Perms.listenerSupported(this) ? "Allow\u2026" : "Not on this TV", () -> Perms.requestListener(this));
-        row("Clear History", () -> "", () -> {
-            MediaWatchService.Store.clear(this);
-            Toast.makeText(this, "History cleared.", Toast.LENGTH_SHORT).show();
-        });
-    }
-
     void pageHome() {
         row("Default Home Screen", () -> Perms.isDefaultHome(this) ? getString(R.string.app_name) : "Set as Default\u2026",
                 () -> Perms.requestDefaultHome(this));
@@ -486,9 +468,6 @@ public class SettingsActivity extends Activity {
     }
 
     void pagePermissions() {
-        row("Continue Watching", () -> Perms.hasListener(this) ? "Allowed"
-                : Perms.listenerSupported(this) ? "Allow\u2026" : "Not on this TV",
-                () -> Perms.requestListener(this));
         row("Sleep Timer", () -> Perms.hasAdmin(this) ? "Allowed"
                 : Perms.adminSupported(this) ? "Allow\u2026" : "Not on this TV", () -> Perms.requestAdmin(this));
         row("Home Screen", () -> Perms.isDefaultHome(this) ? "Allowed" : "Allow\u2026",
