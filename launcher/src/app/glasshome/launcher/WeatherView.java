@@ -163,9 +163,14 @@ final class WeatherView extends View {
     }
 
     private void icon(Canvas c, int code, boolean day, float x, float y, float size) {
-        Bitmap b = WeatherIcons.get(code, day, Math.round(size));
-        c.drawBitmap(b, x, y, null);
+        // Drawn at twice the size and filtered down, so it stays crisp when the pill grows on focus.
+        Bitmap b = WeatherIcons.get(code, day, Math.round(size * 2));
+        iconDst.set(x, y, x + size, y + size);
+        c.drawBitmap(b, null, iconDst, iconPaint);
     }
+
+    private final android.graphics.RectF iconDst = new android.graphics.RectF();
+    private final Paint iconPaint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
 
     private void hairline(Canvas c, float x0, float x1, float y) {
         p.setShader(null);

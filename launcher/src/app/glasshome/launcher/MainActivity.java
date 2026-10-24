@@ -597,8 +597,9 @@ public class MainActivity extends Activity {
             fade.setInterpolator(EASE);
             fade.addUpdateListener(an -> ccLit.setAlpha(Math.round((float) an.getAnimatedValue() * 255)));
             fade.start();
-            handler.postDelayed(() -> ccButton.setImageBitmap(Glyphs.get("gear", dp(20),
-                    ccButton.isFocused() ? 0xFF111114 : Color.WHITE)), 100);
+            // Tint the one gear image rather than drawing (and uploading) a new one each time.
+            handler.postDelayed(() -> ccButton.setColorFilter(ccButton.isFocused() ? 0xFF111114 : Color.WHITE,
+                    android.graphics.PorterDuff.Mode.SRC_IN), 100);
             Glass.lift(v, has, 1.12f, 0);
         });
         ccButton.setOnClickListener(v -> openControlCentre());
@@ -651,7 +652,9 @@ public class MainActivity extends Activity {
             if (has) v.setAlpha(1f);
             // Spring up, ease down: a spring back down overshoots below zero height, which put the
             // pill behind the carousel for a moment (it vanished when focus moved to the gear).
-            Glass.lift(v, has, 1.05f, dp(10));
+            // Flat lift: its glass gives the TV no shape for a shadow, so one was drawn as a
+            // rectangle every frame, which made the lift stutter.
+            Glass.lift(v, has, 1.05f, 0);
         });
         weatherCard.setPivotX(0);
         weatherCard.setPivotY(0);

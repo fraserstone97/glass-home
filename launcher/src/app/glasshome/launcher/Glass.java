@@ -111,6 +111,12 @@ final class Glass extends Drawable {
         a.start();
     }
 
+    /**
+     * The spring for small controls: the tiles' quick rise and small overshoot, but settled in
+     * about half the time. A long, slow settle on a wide pill read as jitter.
+     */
+    static final Spring SNAP = new Spring(0.8f, 14f);
+
     /** The last direction the remote moved focus: -1/0/+1 across and down (set by navSound). */
     static int dirX, dirY;
 
@@ -124,11 +130,13 @@ final class Glass extends Drawable {
             float push = 4f * v.getResources().getDisplayMetrics().density;
             v.setTranslationX(-dirX * push);
             v.setTranslationY(-dirY * push);
+            // On a layer while it moves: drawn once and scaled as an image, instead of every
+            // letter being re-drawn at a new size each frame (which made the lift stutter).
             v.animate().scaleX(scale).scaleY(scale).translationX(0).translationY(0).translationZ(z)
-                    .setDuration(560).setInterpolator(MainActivity.LIFT).start();
+                    .setDuration(460).setInterpolator(SNAP).withLayer().start();
         } else {
             v.animate().scaleX(1f).scaleY(1f).translationX(0).translationY(0).translationZ(0)
-                    .setDuration(260).setInterpolator(MainActivity.EASE).start();
+                    .setDuration(260).setInterpolator(MainActivity.EASE).withLayer().start();
         }
     }
 }

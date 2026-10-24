@@ -46,6 +46,8 @@
         android:banner="@drawable/banner"
         android:theme="@style/HomeTheme"
         android:allowBackup="false">
+        <!-- Lets developer tools (simpleperf, Android Studio) sample it from adb; no effect otherwise. -->
+        <profileable android:shell="true" />
 
         <activity
             android:name=".MainActivity"
