@@ -528,7 +528,6 @@ public class MainActivity extends Activity {
         Ui.textSize(time, 16);
         time.setTypeface(Ui.font(this, "medium"));
         time.setTextColor(Color.WHITE);
-        time.setShadowLayer(dp(6), 0, dp(1), 0x66000000);
         time.setFormat12Hour("h:mm a");
         time.setFormat24Hour("H:mm");
         time.setAllCaps(true);
@@ -545,7 +544,8 @@ public class MainActivity extends Activity {
         chipBg.setCornerRadius(btn / 2f);
         chipBg.setColor(0x47000000);
         timeChip.setBackground(chipBg);
-        time.setShadowLayer(dp(8), 0, dp(1), 0x99000000);
+        // No text shadow: the pill gives the contrast, and a blurred shadow is cut off at the
+        // text's own edges, which showed as a faint dark box around the numbers.
         timeChip.addView(netIcon, nlp);
         timeChip.addView(time);
         clockBox.addView(timeChip, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, btn));
