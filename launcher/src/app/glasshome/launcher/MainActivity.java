@@ -158,6 +158,9 @@ public class MainActivity extends Activity {
     String wallStyle;
     /** What Liquid Glass samples: a blurred copy of the wallpaper or of the carousel artwork. */
     Bitmap wallBlur, heroBlur, glassBg;
+    /** The carousel's picture, deeply blurred and dimmed: behind the apps while they're open. */
+    Bitmap heroDrawer;
+    ImageView drawerBack;
     final LiquidGlass.Backdrop glassSource = () -> glassBg;
     View dockRow;
     boolean returningFromSettings;
@@ -439,6 +442,12 @@ public class MainActivity extends Activity {
         heroFront = heroLayer();
         root.addView(heroBack, match());
         root.addView(heroFront, match());
+        // As on tvOS: with the apps open, the last picture from the carousel stays behind them as
+        // soft coloured glass instead of going dark.
+        drawerBack = new ImageView(this);
+        drawerBack.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        drawerBack.setAlpha(0f);
+        root.addView(drawerBack, match());
 
         shade = new View(this);
         shade.setBackground(new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
@@ -537,7 +546,7 @@ public class MainActivity extends Activity {
         timeChip.setOrientation(LinearLayout.HORIZONTAL);
         timeChip.setGravity(Gravity.CENTER_VERTICAL);
         timeChip.setPadding(dp(13), 0, dp(15), 0);
-        timeChip.setBackground(controlGlass(btn / 2f));
+        timeChip.setBackground(pillGlass(btn / 2f));
         // No text shadow: the pill gives the contrast, and a blurred shadow is cut off at the
         // text's own edges, which showed as a faint dark box around the numbers.
         timeChip.addView(netIcon, nlp);
@@ -547,7 +556,7 @@ public class MainActivity extends Activity {
         ccButton = new ImageView(this);
         ccButton.setScaleType(ImageView.ScaleType.CENTER);
         ccButton.setImageBitmap(Glyphs.get("gear", dp(20), Color.WHITE));
-        LiquidGlass ccGlass = controlGlass(btn / 2f);
+        LiquidGlass ccGlass = pillGlass(btn / 2f);
         ccGlass.owner = ccButton;
         GradientDrawable ccLit = new GradientDrawable();
         ccLit.setShape(GradientDrawable.OVAL);
@@ -589,7 +598,7 @@ public class MainActivity extends Activity {
         // Weather overview in the top-left corner, over the top shelf; OK opens the forecast.
         weatherCard = new WeatherView(this, false, unit);
         // The same glass as the clock pill beside the gear: darker over bright pictures, never a glow.
-        weatherGlass = controlGlass(dp(WeatherView.COMPACT_H) / 2f);
+        weatherGlass = pillGlass(dp(WeatherView.COMPACT_H) / 2f);
         weatherCard.setBackground(weatherGlass);
         weatherCard.setFocusable(true);
         weatherCard.setClickable(true);
@@ -827,6 +836,11 @@ public class MainActivity extends Activity {
         g.rimStrength = 0.45f;
         g.lens = Math.min(dp(6), Math.round(r * 0.3f));
         return g;
+    }
+
+    /** Home's own pills (weather, clock, gear): the same glass, clear as tvOS 26's. */
+    LiquidGlass pillGlass(float r) {
+        return controlGlass(r).clear();
     }
 
     void invalidateGlass() {
@@ -1461,12 +1475,12 @@ public class MainActivity extends Activity {
         return dp(20);
     }
 
-    /** Frosted glass dock (tvOS 26): big radius, dark-tinted translucent fill, sheen and rim. */
+    /** The dock (tvOS 26): clear glass with a big radius, the picture showing through, a crisp rim. */
     Drawable dockBackground() {
         // Apple's dock corner is ~2x the card corner (36 px vs ~18 px at 1080p).
-        LiquidGlass g = new LiquidGlass(radius * 2f, 0x0FFFFFFF, glassSource, screenW, screenH, unit);
+        LiquidGlass g = new LiquidGlass(radius * 2f, 0x0AFFFFFF, glassSource, screenW, screenH, unit).clear();
         g.lens = dp(12);
-        g.rimStrength = 0.25f;  // a faint edge, not a bright outline
+        g.rimStrength = 0.5f;
         return g;
     }
 
@@ -1530,6 +1544,21 @@ public class MainActivity extends Activity {
          * brightness behind it \u2014 darker over bright artwork so white text stays legible, a light
          * frost over dark artwork so the control stays visible.
          */
+        /**
+         * Clear glass, as tvOS 26's dock and status pills: the picture behind shows through,
+         * softened rather than frosted over, under a crisp light rim.
+         */
+        LiquidGlass clear() {
+            clear = true;
+            body.setAlpha(105);
+            lens1.setAlpha(90);
+            lens2.setAlpha(90);
+            rimStrength = Math.max(rimStrength, 0.7f);
+            return this;
+        }
+
+        boolean clear;
+
         LiquidGlass adaptive() {
             adaptive = true;
             android.graphics.ColorMatrix cm = new android.graphics.ColorMatrix();
@@ -1620,6 +1649,8 @@ public class MainActivity extends Activity {
                     lumX = loc[0];
                     lumY = loc[1];
                     int t = tintFor(luminanceBehind(b));
+                    // Clear glass keeps just enough shade for white text over a bright picture.
+                    if (clear) t = (Math.round((t >>> 24) * 0.7f) << 24) | (t & 0xFFFFFF);
                     if (t != adaptiveTint) {
                         adaptiveTint = t;
                         if (!lit) fill.setColor(t);
@@ -1934,10 +1965,18 @@ public class MainActivity extends Activity {
         show = show && !heroItems.isEmpty() && !folderMode;
         if (show == heroShown) return;
         heroShown = show;
-        glassBg = show && heroBlur != null ? heroBlur : wallBlur;
+        boolean glassy = !show && heroDrawer != null;
+        glassBg = (show || glassy) && heroBlur != null ? heroBlur : wallBlur;
         invalidateGlass();
         float a = show ? 1f : 0f;
-        if (!show) wallView.setVisibility(View.VISIBLE);
+        if (!show || drawerBack.getAlpha() > 0f) wallView.setVisibility(View.VISIBLE);
+        // The apps open over the carousel's picture as blurred glass; closing them, it clears.
+        drawerBack.animate().cancel();
+        if (glassy) drawerBack.setImageBitmap(heroDrawer);
+        drawerBack.animate().alpha(glassy ? 1f : 0f).setDuration(show ? 420 : 560).setInterpolator(HERO_EASE).withEndAction(() -> {
+            // Fully over the wallpaper: the wallpaper needn't be drawn underneath it.
+            if (!heroShown && drawerBack.getAlpha() >= 1f) wallView.setVisibility(View.INVISIBLE);
+        }).start();
         heroFront.animate().cancel();
         heroFront.animate().alpha(a).setDuration(show ? 480 : 420).setInterpolator(HERO_EASE).withLayer().withEndAction(() -> {
             if (heroShown && heroFront.getAlpha() >= 1f) wallView.setVisibility(View.INVISIBLE);
@@ -1955,6 +1994,23 @@ public class MainActivity extends Activity {
         heroBack.animate().alpha(0f).setDuration(show ? 480 : 420).setInterpolator(HERO_EASE).start();
         handler.removeCallbacks(heroAdvance);
         if (show) scheduleAdvance();
+    }
+
+    /** tvOS's app-drawer backdrop: the picture blurred right down, colour kept and lifted, then dimmed. */
+    static Bitmap drawerGlass(Bitmap src) {
+        if (src == null || src.isRecycled()) return null;
+        Bitmap soft = Ui.blur(src, 240, 135, 6, 3);
+        if (soft == null) return null;
+        android.graphics.ColorMatrix cm = new android.graphics.ColorMatrix();
+        cm.setSaturation(1.3f);
+        cm.postConcat(new android.graphics.ColorMatrix(new float[]{
+                0.56f, 0, 0, 0, 0, 0, 0.56f, 0, 0, 0, 0, 0, 0.56f, 0, 0, 0, 0, 0, 1, 0}));
+        Bitmap out = Bitmap.createBitmap(240, 135, Bitmap.Config.ARGB_8888);
+        Paint p = new Paint(Paint.FILTER_BITMAP_FLAG | Paint.DITHER_FLAG);
+        p.setColorFilter(new android.graphics.ColorMatrixColorFilter(cm));
+        new Canvas(out).drawBitmap(soft, 0, 0, p);
+        soft.recycle();
+        return out;
     }
 
     void scheduleAdvance() {
@@ -2034,17 +2090,20 @@ public class MainActivity extends Activity {
         int want = index;
         io.execute(() -> {
             Bitmap raw = Suggestions.image(this, it.backdrop, "w1280", screenW);
+            Bitmap drawer = drawerGlass(raw);  // before bakeScrims, which reuses raw
             Bitmap bd = bakeScrims(raw);
             Bitmap bdBlur = Ui.glassBackdrop(bd, 160, 90);
             // Starts the GPU upload now, in the background, so the dissolve doesn't stall on it.
             if (bd != null) bd.prepareToDraw();
             if (bdBlur != null) bdBlur.prepareToDraw();
+            if (drawer != null) drawer.prepareToDraw();
             String logoPath = Suggestions.logoFor(this, it);
             Bitmap logo = logoPath.isEmpty() ? null : Suggestions.image(this, logoPath, "w500", 500);
             handler.post(() -> {
                 if (heroIndex != want || heroItems.isEmpty()) return;
                 applyHeroInfo(it, logo, dir);
                 if (bd != null) crossfadeHero(bd, dir);
+                if (drawer != null) heroDrawer = drawer;
                 if (bdBlur != null) {
                     heroBlur = bdBlur;
                     if (heroShown) {

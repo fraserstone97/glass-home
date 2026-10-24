@@ -701,11 +701,12 @@ public class SearchActivity extends Activity {
      */
     android.graphics.drawable.LayerDrawable glassBar() {
         float r = u(24);  // half the field's height: a true capsule, as on tvOS
+        // Subtle, as the App Store's tab bar: a faint capsule with a hairline edge.
         GradientDrawable body = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
-                new int[]{0x30FFFFFF, 0x1AFFFFFF, 0x22FFFFFF});
+                new int[]{0x1CFFFFFF, 0x0FFFFFFF, 0x14FFFFFF});
         body.setCornerRadius(r);
         GradientDrawable sheen = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
-                new int[]{0x26FFFFFF, 0x00FFFFFF});
+                new int[]{0x12FFFFFF, 0x00FFFFFF});
         // Only the top half: rounded on top with the bar's own radius, square below, so its
         // corners follow the bar's curve exactly instead of poking out.
         sheen.setCornerRadii(new float[]{r, r, r, r, 0, 0, 0, 0});
@@ -715,7 +716,7 @@ public class SearchActivity extends Activity {
         barRim = new GradientDrawable();
         barRim.setCornerRadius(r);
         barRim.setColor(0);
-        barRim.setStroke(Math.max(1, u(0.75f)), 0x40FFFFFF);
+        barRim.setStroke(Math.max(1, u(0.6f)), 0x2EFFFFFF);
         glow = new ListenGlow();
         android.graphics.drawable.LayerDrawable l = new android.graphics.drawable.LayerDrawable(
                 new Drawable[]{body, barBody, sheen, barRim, glow});
@@ -807,7 +808,7 @@ public class SearchActivity extends Activity {
         barAnim.addUpdateListener(a -> {
             barGlow = (float) a.getAnimatedValue();
             // The glass rim gives way to the coloured light, so there's one clean edge.
-            barRim.setStroke(Math.max(1, u(0.75f)), (int) ev.evaluate(barGlow, 0x40FFFFFF, 0x00FFFFFF));
+            barRim.setStroke(Math.max(1, u(0.6f)), (int) ev.evaluate(barGlow, 0x2EFFFFFF, 0x00FFFFFF));
             if (wave != null) {
                 wave.setAlpha(barGlow);
                 if (barGlow > 0f) wave.postInvalidateOnAnimation();
@@ -933,7 +934,7 @@ public class SearchActivity extends Activity {
         protected void onDraw(Canvas c) {
             float cx = getWidth() / 2f, cy = getHeight() / 2f, max = Math.min(cx, cy);
             float base = max * 0.76f;
-            int idle = 0x2EFFFFFF;
+            int idle = 0x24FFFFFF;
             int fill = (int) ev.evaluate(focusT, idle, Color.WHITE);
             fill = (int) ev.evaluate(listenT, fill, 0xF2FFFFFF);
             p.setStyle(Paint.Style.FILL);

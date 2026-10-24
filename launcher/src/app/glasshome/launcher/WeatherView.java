@@ -16,7 +16,7 @@ import android.view.View;
  * and a 5-day list with temperature range bars coloured from cool blue to hot red.
  */
 final class WeatherView extends View {
-    static final float COMPACT_W = 214, COMPACT_H = 52, FULL_W = 380, FULL_H = 456;
+    static final float COMPACT_W = 120, COMPACT_H = 34, FULL_W = 380, FULL_H = 456;
 
     final boolean full;
     final float u;
@@ -50,10 +50,8 @@ final class WeatherView extends View {
         }
         float w = COMPACT_W * u;
         if (data != null) {
-            float pad = 12 * u, is = 30 * u;
-            w = pad + is + 6 * u + measure(data.temp + "\u00b0", 22, regular) + 9 * u
-                    + Math.max(measure(Weather.describe(data.code, data.day), 11.5f, semibold), measure(detail(data), 11.5f, medium))
-                    + 16 * u;
+            w = 13 * u + 22 * u + 7 * u + measure(data.temp + "\u00b0", 16, medium) + 8 * u
+                    + measure(Weather.describe(data.code, data.day), 14, medium) + 15 * u;
         }
         setMeasuredDimension(Math.round(w), View.MeasureSpec.getSize(hs));
     }
@@ -62,10 +60,6 @@ final class WeatherView extends View {
         p.setTypeface(tf);
         p.setTextSize(size * u);
         return p.measureText(s);
-    }
-
-    static String detail(Weather.Data d) {
-        return (d.place.isEmpty() ? "" : d.place + "  ") + "H:" + d.max + "\u00b0 L:" + d.min + "\u00b0";
     }
 
     @Override
@@ -78,16 +72,17 @@ final class WeatherView extends View {
         else drawCompact(c);
     }
 
-    /** A small glass pill: icon, temperature, then condition over place and high/low. */
+    /**
+     * A small glass pill the height of the clock's, on one line like it: icon, temperature and
+     * condition. The place and the day's high and low are in the forecast it opens.
+     */
     private void drawCompact(Canvas c) {
         Weather.Data d = data;
-        float h = getHeight(), pad = 12 * u, is = 30 * u;
+        float h = getHeight(), pad = 13 * u, is = 22 * u;
         icon(c, d.code, d.day, pad, (h - is) / 2f, is);
-        float tx = pad + is + 6 * u;
-        float tw = text(c, d.temp + "\u00b0", tx, h / 2f + 8 * u, 22, regular, 1f, Paint.Align.LEFT);
-        float cx = tx + tw + 9 * u;
-        text(c, Weather.describe(d.code, d.day), cx, h / 2f - 2 * u, 11.5f, semibold, 1f, Paint.Align.LEFT);
-        text(c, detail(d), cx, h / 2f + 12 * u, 11.5f, medium, 0.7f, Paint.Align.LEFT);
+        float tx = pad + is + 7 * u, base = h / 2f + 5.6f * u;  // the clock's text sits the same way
+        float tw = text(c, d.temp + "\u00b0", tx, base, 16, medium, 1f, Paint.Align.LEFT);
+        text(c, Weather.describe(d.code, d.day), tx + tw + 8 * u, base, 14, medium, 0.75f, Paint.Align.LEFT);
     }
 
     private void drawFull(Canvas c) {
