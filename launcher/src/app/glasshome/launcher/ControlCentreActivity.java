@@ -165,16 +165,16 @@ public class ControlCentreActivity extends Activity {
 
     // ---------------------------------------------------------------- pages
 
-    /**
-     * Swaps the panel's page like tvOS menus: the old page slides out one way while the new one
-     * slides in from the other (dir 1 = deeper, -1 = back, 0 = first page, no slide).
-     */
     /** Plain glass slides as one cached layer; the dock's glass redraws each frame instead. */
     android.view.ViewPropertyAnimator slide(android.view.ViewPropertyAnimator a) {
         if (liquid) return a.setUpdateListener(v -> sheet.invalidate());
         return a.withLayer();
     }
 
+    /**
+     * Swaps the panel's page like tvOS menus: the old page slides out one way while the new one
+     * slides in from the other (dir 1 = deeper, -1 = back, 0 = first page, no slide).
+     */
     void page(int dir, String title, boolean date, Runnable build) {
         Runnable in = () -> {
             heading.setText(title);
@@ -214,7 +214,7 @@ public class ControlCentreActivity extends Activity {
                     v -> open(tvSettings("com.android.tv.settings.ACCESSORIES_CONNECTED_DEVICES", Settings.ACTION_BLUETOOTH_SETTINGS)));
             g.add("timer", "Sleep Timer", this::timerState, v -> cycleSleepTimer());
             g.add("sparkles", "Screen Saver", null, v -> open(screenSaver()));
-            g.add("shelf", "Home Screen", null, v -> open(new Intent(this, SettingsActivity.class)));
+            g.add("shelf", "Home Screen", null, v -> openSettings());
 
             // Pinned to the bottom, under a hairline: three evenly spaced round buttons.
             body.addView(new View(this), new LinearLayout.LayoutParams(1, 0, 1f));
@@ -314,6 +314,16 @@ public class ControlCentreActivity extends Activity {
         finish();
     }
 
+    /**
+     * Glass Home's settings, opened by Home itself as this panel goes: Settings belongs with Home,
+     * and opened straight from here (another task) this TV hid it for half a second and then cut
+     * to it, where from Home it fades up as a page.
+     */
+    void openSettings() {
+        MainActivity.settingsNext = true;
+        open(new Intent(this, MainActivity.class));
+    }
+
     /** The aerials straight away (tvOS Aerials), or Android's own "start screen saver" when it isn't installed. */
     Intent screenSaver() {
         Intent aerials = new Intent().setClassName("app.glasshome.aerials", "app.glasshome.aerials.AerialActivity");
@@ -330,7 +340,6 @@ public class ControlCentreActivity extends Activity {
 
     // ---------------------------------------------------------------- glass
 
-    /** The panel: dark translucent glass, lighter at the top, with a thin light rim. */
     /**
      * The panel's glass. Over Home it is the dock's own Liquid Glass, drawn from the same blurred
      * picture, so the two read as one material. Over an app, where there's no picture to borrow,

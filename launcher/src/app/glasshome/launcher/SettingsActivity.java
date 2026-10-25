@@ -60,6 +60,20 @@ public class SettingsActivity extends Activity {
     void build() {
         FrameLayout root = new FrameLayout(this);
         root.setBackgroundColor(0xFF0B0B10);
+        // Over Home's last picture, blurred right down and dimmed further (the app drawer's glass):
+        // Settings reads as a layer over Home, in Home's colours, rather than a black page.
+        MainActivity home = MainActivity.live.get();
+        android.graphics.Bitmap glass = home == null ? null : home.heroDrawer != null ? home.heroDrawer : home.wallBlur;
+        if (glass != null && !glass.isRecycled()) {
+            ImageView back = new ImageView(this);
+            back.setScaleType(ImageView.ScaleType.CENTER_CROP);
+            back.setImageBitmap(glass);
+            back.setColorFilter(0x94000000, android.graphics.PorterDuff.Mode.SRC_ATOP);
+            root.addView(back, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+            // It covers the screen: no fills drawn underneath it every frame.
+            root.setBackground(null);
+            getWindow().setBackgroundDrawable(null);
+        }
         LinearLayout split = new LinearLayout(this);
         split.setOrientation(LinearLayout.HORIZONTAL);
         root.addView(split, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
@@ -114,8 +128,12 @@ public class SettingsActivity extends Activity {
             }
         }
         if (focus != null) focus.requestFocus();
-        slideIn(!p.equals(ROOT));
+        // The first page arrives with the window itself (PageTheme); later ones slide.
+        if (shown) slideIn(!p.equals(ROOT));
+        shown = true;
     }
+
+    boolean shown;
 
     /** Pages slide in from the side you're heading (deeper: from the right; back: from the left). */
     void slideIn(boolean deeper) {

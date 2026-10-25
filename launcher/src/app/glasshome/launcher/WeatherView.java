@@ -163,6 +163,21 @@ final class WeatherView extends View {
         text(c, Weather.sourceName(d.source) + "  \u00b7  Updated " + when, mid, getHeight() - 14 * u, 11.5f, medium, 0.5f, Paint.Align.CENTER);
     }
 
+    /**
+     * Draws the forecast's icons ahead, off the main thread, at the sizes drawFull uses: the first
+     * opening of the forecast otherwise drew a dozen of them in its first frame and stalled.
+     */
+    static void prepare(Weather.Data d, float u) {
+        if (d == null) return;
+        for (int i = 0; i < Math.min(6, d.hours.size()); i++) {
+            WeatherIcons.get(d.hours.get(i).code, d.hours.get(i).day, Math.round(26 * u * 2));
+        }
+        for (int i = 0; i < Math.min(5, d.days.size()); i++) {
+            Weather.Day day = d.days.get(i);
+            WeatherIcons.get(day.code, true, Math.round((day.rain >= 20 ? 18 : 24) * u * 2));
+        }
+    }
+
     /** Apple Weather's palette: blue (cold) -> teal -> green -> yellow -> orange -> red (hot). */
     static int tempColor(int t, boolean fahrenheit) {
         float cdeg = fahrenheit ? (t - 32) * 5f / 9f : t;

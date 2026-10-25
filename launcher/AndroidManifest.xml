@@ -122,7 +122,7 @@
             android:exported="false"
             android:excludeFromRecents="true"
             android:screenOrientation="landscape"
-            android:theme="@style/HomeTheme"
+            android:theme="@style/PageTheme"
             android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenSize|smallestScreenSize|screenLayout|uiMode|density" />
 
         <!-- Search: the remote's mic button lands here once the Google/Gemini voice app is disabled. -->
@@ -154,6 +154,7 @@
             android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenSize|smallestScreenSize|screenLayout|uiMode|density" />
         <activity
             android:name=".SettingsActivity"
+            android:theme="@style/PageTheme"
             android:exported="true"
             android:excludeFromRecents="true"
             android:screenOrientation="landscape"

@@ -176,7 +176,7 @@ public class DetailActivity extends Activity {
     @Override
     public void finish() {
         super.finish();
-        overridePendingTransition(android.R.anim.fade_in, android.R.anim.fade_out);
+        overridePendingTransition(R.anim.hold, R.anim.page_out);
     }
 
     LinearLayout.LayoutParams margins(int top) {
@@ -196,8 +196,16 @@ public class DetailActivity extends Activity {
     // ---------------------------------------------------------------- data
 
     void load(String id, String knownBackdrop) {
+        // The picture that was behind the result in Search, carried straight over: the page opens
+        // on it rather than on black, and the full-size one replaces it when it's ready.
+        Bitmap ready = knownBackdrop == null ? null : SearchActivity.AMBIENT.get(knownBackdrop);
+        if (ready != null) {
+            backdrop.setImageBitmap(ready);
+            backdrop.setAlpha(1f);
+            carried = true;
+        }
         // With a TMDB key the page waits for TMDB's full-size artwork instead of showing JustWatch's first.
-        if (knownBackdrop != null && !Suggestions.hasToken(this)) loadBackdrop(knownBackdrop);
+        if (knownBackdrop != null && !Suggestions.hasToken(this) && !carried) loadBackdrop(knownBackdrop);
         fallbackBackdrop = knownBackdrop;
         if (id == null) return;
         io.execute(() -> {
@@ -218,11 +226,24 @@ public class DetailActivity extends Activity {
 
     /** The picture Search passed in, for when TMDB has nothing better. */
     String fallbackBackdrop;
+    /** Showing Search's copy of the picture, until the full-size one arrives. */
+    boolean carried;
 
     void loadBackdrop(String url) {
         io.execute(() -> {
             Bitmap bm = Suggestions.screenImage(this, url, Math.min(1920, Ui.screen(this).x));
             if (bm != null) ui.post(() -> {
+                if (carried && backdrop.getDrawable() != null) {
+                    // Over the copy already showing: a quick dissolve, so a sharper (or a different)
+                    // picture never cuts in.
+                    carried = false;
+                    android.graphics.drawable.TransitionDrawable t = new android.graphics.drawable.TransitionDrawable(
+                            new Drawable[]{backdrop.getDrawable(), new android.graphics.drawable.BitmapDrawable(getResources(), bm)});
+                    t.setCrossFadeEnabled(false);
+                    backdrop.setImageDrawable(t);
+                    t.startTransition(360);
+                    return;
+                }
                 backdrop.setImageBitmap(bm);
                 backdrop.setScaleX(1.04f);
                 backdrop.setScaleY(1.04f);
@@ -237,7 +258,7 @@ public class DetailActivity extends Activity {
         boolean series = "SHOW".equals(n.optString("objectType"));
         String t = Suggestions.cleanTitle(c.optString("title", titleText == null ? "" : titleText));
         title.setText(t);
-        if (backdrop.getDrawable() == null) {
+        if (backdrop.getDrawable() == null || carried) {
             JSONArray bds = c.optJSONArray("backdrops");
             String jw = bds != null && bds.length() > 0 ? "https://images.justwatch.com" + bds.optJSONObject(0)
                     .optString("backdropUrl").replace("{profile}", "s1920").replace("{format}", "jpg") : fallbackBackdrop;
@@ -416,10 +437,11 @@ public class DetailActivity extends Activity {
         t.setBackground(white);
         t.setFocusable(true);
         t.setClickable(true);
+        android.animation.ArgbEvaluator ev = new android.animation.ArgbEvaluator();
+        white.tint = f -> t.setTextColor((int) ev.evaluate(f, Color.WHITE, 0xFF111114));
         t.setOnFocusChangeListener((v, has) -> {
             Glass.focus(white, has);
-            t.setTextColor(has ? 0xFF111114 : Color.WHITE);
-            lift(v, has, 1.06f);
+            Glass.lift(v, has, 1.06f, 0);
         });
         t.setOnClickListener(click);
         parent.addView(t, new LinearLayout.LayoutParams(-2, u(40)));
@@ -464,11 +486,15 @@ public class DetailActivity extends Activity {
         texts.addView(name);
         texts.addView(sub);
         t.addView(texts);
+        // The text darkens with the white plate as it fades in, frame by frame.
+        android.animation.ArgbEvaluator ev = new android.animation.ArgbEvaluator();
+        white.tint = f -> {
+            name.setTextColor((int) ev.evaluate(f, Color.WHITE, 0xFF111114));
+            sub.setTextColor((int) ev.evaluate(f, 0xA6FFFFFF, 0x99111114));
+        };
         t.setOnFocusChangeListener((v, has) -> {
             Glass.focus(white, has);
-            name.setTextColor(has ? 0xFF111114 : Color.WHITE);
-            sub.setTextColor(has ? 0x99111114 : 0xA6FFFFFF);
-            lift(v, has, 1.05f);
+            Glass.lift(v, has, 1.05f, 0);
         });
         t.setOnClickListener(v -> open(o));
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, u(48));
@@ -481,8 +507,4 @@ public class DetailActivity extends Activity {
         return new Glass(radius, u(0.6f), Glass.REGULAR);
     }
 
-    void lift(View v, boolean has, float scale) {
-        v.animate().scaleX(has ? scale : 1f).scaleY(has ? scale : 1f).translationZ(has ? u(8) : 0)
-                .setDuration(has ? 380 : 260).setInterpolator(has ? MainActivity.LIFT : MainActivity.EASE).start();
-    }
 }

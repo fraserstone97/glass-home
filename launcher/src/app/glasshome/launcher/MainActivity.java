@@ -134,7 +134,6 @@ public class MainActivity extends Activity {
     ImageView wallView;
     /** Top shelf carousel: two crossfading backdrops + info panel. */
     ImageView heroBack, heroFront;
-    View heroScrim, shade;
     FrameLayout shelfView;
     LinearLayout heroInfo, heroDots;
     /** The dots themselves, inside heroDots (which moves and fades the whole indicator). */
@@ -360,6 +359,13 @@ public class MainActivity extends Activity {
         // Home never holds the screen on: the TV's screen saver starts when it's idle.
         getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         resetIdle();
+        if (settingsNext) {
+            // Control Centre's Home Screen settings: opened from here, once Home is back in front.
+            settingsNext = false;
+            handler.post(() -> {
+                if (resumed) startActivity(new Intent(this, SettingsActivity.class));
+            });
+        }
         // Opened from the app list while another launcher is the home screen: offer once to take over.
         if (SetupActivity.done(this) && !Perms.isDefaultHome(this) && !prefs.getBoolean("asked_default_home", false)) {
             prefs.edit().putBoolean("asked_default_home", true).apply();
@@ -373,6 +379,9 @@ public class MainActivity extends Activity {
 
     /** An app was opened from Home and hasn't come back yet. */
     boolean appOpened;
+
+    /** Settings to open as soon as Home is in front again (asked for in Control Centre). */
+    static boolean settingsNext;
 
     final Runnable returnRun = () -> {
         if (!appOpened) return;
@@ -448,19 +457,8 @@ public class MainActivity extends Activity {
         drawerBack.setScaleType(ImageView.ScaleType.CENTER_CROP);
         drawerBack.setAlpha(0f);
         root.addView(drawerBack, match());
-
-        shade = new View(this);
-        shade.setBackground(new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
-                new int[]{0x14000000, 0x40000000, 0xB3000000}));
-        root.addView(shade, match());
-        shade.setVisibility(View.GONE);  // baked into wallpaper + artwork instead
-
-        // Left-side scrim so the carousel's title and text stay legible over any artwork.
-        heroScrim = new View(this);
-        heroScrim.setBackground(new GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT,
-                new int[]{0xCC000000, 0x66000000, 0x00000000}));
-        heroScrim.setAlpha(0f);
-        root.addView(heroScrim, new FrameLayout.LayoutParams(screenW * 3 / 4, ViewGroup.LayoutParams.MATCH_PARENT));
+        // The shades that keep text legible are painted into the wallpaper and the artwork
+        // (bakeShade, bakeScrims): one full-screen picture to draw, not three layers.
 
         scroll = new ShelfScrollView(this);
         scroll.setVerticalScrollBarEnabled(false);
@@ -568,16 +566,19 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams cblp = new LinearLayout.LayoutParams(btn, btn);
         cblp.leftMargin = dp(12);
         clockBox.addView(ccButton, cblp);
+        android.animation.ArgbEvaluator gearTint = new android.animation.ArgbEvaluator();
         ccButton.setOnFocusChangeListener((v, has) -> {
-            // The white plate fades over the glass; the gear turns dark halfway through.
+            // The white plate fades over the glass and the gear darkens with it, frame by frame
+            // (one gear image, tinted, rather than a new one drawn and uploaded each time).
             ValueAnimator fade = ValueAnimator.ofFloat(ccLit.getAlpha() / 255f, has ? 1f : 0f);
             fade.setDuration(has ? 200 : 260);
             fade.setInterpolator(EASE);
-            fade.addUpdateListener(an -> ccLit.setAlpha(Math.round((float) an.getAnimatedValue() * 255)));
+            fade.addUpdateListener(an -> {
+                float t = (float) an.getAnimatedValue();
+                ccLit.setAlpha(Math.round(t * 255));
+                ccButton.setColorFilter((int) gearTint.evaluate(t, Color.WHITE, 0xFF111114), android.graphics.PorterDuff.Mode.SRC_IN);
+            });
             fade.start();
-            // Tint the one gear image rather than drawing (and uploading) a new one each time.
-            handler.postDelayed(() -> ccButton.setColorFilter(ccButton.isFocused() ? 0xFF111114 : Color.WHITE,
-                    android.graphics.PorterDuff.Mode.SRC_IN), 100);
             Glass.lift(v, has, 1.12f, 0);
         });
         ccButton.setOnClickListener(v -> openControlCentre());
@@ -605,7 +606,7 @@ public class MainActivity extends Activity {
         weatherCard.setFocusable(true);
         weatherCard.setClickable(true);
         weatherCard.setOnFocusChangeListener((v, has) -> {
-            weatherGlass.setLit(has);
+            weatherGlass.lightUp(has);
             if (has) v.setAlpha(1f);
             // Spring up, ease down: a spring back down overshoots below zero height, which put the
             // pill behind the carousel for a moment (it vanished when focus moved to the gear).
@@ -766,7 +767,9 @@ public class MainActivity extends Activity {
                         v.setTranslationX(sameRow ? -Math.signum(index - from) * push : 0);
                         v.setTranslationY(sameRow ? 0 : -Math.signum(index - from) * push);
                     }
-                    v.animate().withLayer().scaleX(FOCUS_SCALE).scaleY(FOCUS_SCALE).translationX(0).translationY(0)
+                    // No GPU layer: the glare and sheen move inside the card, so one would be
+                    // re-rendered every frame anyway, at the cost of an extra pass.
+                    v.animate().scaleX(FOCUS_SCALE).scaleY(FOCUS_SCALE).translationX(0).translationY(0)
                             .translationZ(dp(18)).setDuration(560).setInterpolator(LIFT).start();
                     label.animate().alpha(1f).translationY(tileH * (FOCUS_SCALE - 1f) / 2f).setDuration(320)
                             .setInterpolator(EASE).start();
@@ -780,9 +783,13 @@ public class MainActivity extends Activity {
                 topSheen.animate().alpha(1f).setDuration(260).setInterpolator(EASE).start();
                 lastTile = index;
                 onTileFocused(index);
+            } else if (menuLayer != null && menuReturnFocus == v) {
+                // Its menu is open beside it: the card stays up, as on tvOS, until focus moves on.
+                glare.animate().cancel();
+                glare.setAlpha(0f);
             } else {
                 cell.setTranslationZ(0);
-                v.animate().withLayer().scaleX(1f).scaleY(1f).translationX(0).translationY(0).translationZ(0)
+                v.animate().scaleX(1f).scaleY(1f).translationX(0).translationY(0).translationZ(0)
                         .setDuration(300).setInterpolator(EASE).start();
                 label.animate().alpha(0f).translationY(0).setDuration(160).setInterpolator(EASE).start();
                 topSheen.animate().alpha(0f).setDuration(220).setInterpolator(EASE).start();
@@ -826,19 +833,19 @@ public class MainActivity extends Activity {
         wallPrefetch = null;
         if (wp == null) wp = makeWallpaper(style);
         wallView.setImageBitmap(wp);
-        wallBlur = Ui.glassBackdrop(wp, 192, 108);
-        if (!heroShown || heroBlur == null) glassBg = wallBlur;
-        invalidateGlass();
+        wallBlur = Ui.glassBackdrop(wp, 160, 90);  // the carousel's size, so the glass can blend between them
+        if (!heroShown || heroBlur == null) glassTo(wallBlur, 0);
+        else invalidateGlass();
     }
+
+    /** How much the weather pill grows when focused. */
+    static final float WEATHER_LIFT = 1.05f;
 
     /**
      * The one glass for Home's small controls (weather, clock, gear) and Control Centre: the
      * picture behind, softly blurred, with a light tint that follows its brightness. The same
      * everywhere, so they always read as one material.
      */
-    /** How much the weather pill grows when focused. */
-    static final float WEATHER_LIFT = 1.05f;
-
     LiquidGlass controlGlass(float r) {
         LiquidGlass g = new LiquidGlass(r, 0x1F000000, glassSource, screenW, screenH, unit).adaptive();
         g.rimStrength = 0.45f;
@@ -857,7 +864,7 @@ public class MainActivity extends Activity {
         // left the gear and clock showing an old picture (the wallpaper) behind them.
         invalidateTree(clockBox);
         invalidateTree(weatherCard);
-        if (menuLayer != null && menuLayer.getChildCount() > 0) menuLayer.getChildAt(0).invalidate();
+        if (menuLayer != null && menuLayer.getChildCount() > 1) menuLayer.getChildAt(1).invalidate();
     }
 
     static void invalidateTree(View v) {
@@ -934,7 +941,6 @@ public class MainActivity extends Activity {
         return b;
     }
 
-    /** System/utility apps that get a drawn tvOS-style card instead of their Android art. */
     /**
      * Left out of the app grid on this TV: TCL's quick panel, T-Solo, TCL Home, Tubi, and Live TV
      * (no aerial is connected; the app itself stays, it also runs the HDMI inputs).
@@ -942,6 +948,7 @@ public class MainActivity extends Activity {
     static final Set<String> NOT_APPS = new HashSet<>(Arrays.asList(
             "com.tcl.dashboard", "com.tcl.t_solo", "com.tcl.suspension", "com.tubitv", "com.tcl.tv"));
 
+    /** System/utility apps that get a drawn tvOS-style card instead of their Android art. */
     static final Set<String> TVOS_CARD_PKGS = new HashSet<>(Arrays.asList(
             TV_SETTINGS, "com.android.vending", "com.mitv.dream",
             // Their own banners crowd the logo and the name; as on Apple TV, the icon on its colour.
@@ -955,14 +962,6 @@ public class MainActivity extends Activity {
     /** Apps whose own banner is right but its logo too small: zoomed in on the logo, on the banner's colour. */
     static final Set<String> ZOOM_BANNER_PKGS = new HashSet<>(Arrays.asList("com.discovery.dplay"));
 
-    /**
-     * tvOS-style card: soft vertical gradient with a top sheen and the app's glyph centred.
-     * Settings gets the silver card with a drawn gear, like tvOS.
-     */
-    /**
-     * The app's own banner, cropped to its logo and enlarged: everything that differs from the
-     * banner's corner colour is the logo; it is scaled to fill the card, on that same colour.
-     */
     /** An app's drawable at 4x density (xxxhdpi) when it has one, else the one already loaded. */
     Drawable hiRes(PackageManager pm, String pkg, int res, Drawable fallback) {
         if (res == 0) return fallback;
@@ -1038,6 +1037,10 @@ public class MainActivity extends Activity {
         return out;
     }
 
+    /**
+     * The app's own banner, cropped to its logo and enlarged: everything that differs from the
+     * banner's corner colour is the logo; it is scaled to fill the card, on that same colour.
+     */
     Bitmap zoomedBanner(AppEntry e) {
         int w = 640, h = 360;
         Bitmap src = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
@@ -1117,7 +1120,6 @@ public class MainActivity extends Activity {
         return fitGlyph(b, size);
     }
 
-    /** The glyph without the icon's built-in padding, scaled so its taller side is size px. */
     /**
      * Prime Video's icon stacks "prime", "video" and the smile; its banner (one line) is only a
      * soft 320 px picture. This re-sets the sharp icon on one line, as the banner has it: the
@@ -1228,6 +1230,7 @@ public class MainActivity extends Activity {
         return Bitmap.createBitmap(out, outW, outH, Bitmap.Config.ARGB_8888);
     }
 
+    /** The glyph without the icon's built-in padding, scaled so its taller side is size px. */
     static Bitmap fitGlyph(Bitmap g, int size) {
         int w = g.getWidth(), h = g.getHeight();
         int[] px = new int[w * h];
@@ -1249,6 +1252,10 @@ public class MainActivity extends Activity {
         return Bitmap.createScaledBitmap(c, Math.max(1, Math.round(c.getWidth() * k)), Math.max(1, Math.round(c.getHeight() * k)), true);
     }
 
+    /**
+     * tvOS-style card: soft vertical gradient with a top sheen and the app's glyph centred.
+     * Settings gets the silver card with a drawn gear, like tvOS.
+     */
     Bitmap tvosCard(AppEntry e) {
         int w = 640, h = 360;
         Bitmap b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
@@ -1396,7 +1403,6 @@ public class MainActivity extends Activity {
         return out;
     }
 
-    /** tvOS Settings-style gear: toothed ring with a hollow centre. */
     /** The Settings tile itself (silver, with the gear), for anywhere else that shows it. */
     static Bitmap settingsArt(int w, int h) {
         Bitmap b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
@@ -1537,20 +1543,16 @@ public class MainActivity extends Activity {
             rim.setStrokeWidth(1.1f * density);
         }
 
-        boolean lit, adaptive;
+        boolean adaptive;
         int adaptiveTint;
+        /** How lit the glass is: 0 resting, 1 focused (a light frost over the picture). */
+        float lit;
         Bitmap lumFor;
-        int lumX = Integer.MIN_VALUE, lumY;
+        int lumGen, lumX = Integer.MIN_VALUE, lumY;
 
         /** The view this glass sits on, when it is drawn inside another drawable (for its position). */
         View owner;
 
-        /**
-         * Glass for small controls (Liquid Glass "regular"): the backdrop is desaturated so the
-         * control reads as clear glass rather than a coloured blob, and the tint follows the
-         * brightness behind it \u2014 darker over bright artwork so white text stays legible, a light
-         * frost over dark artwork so the control stays visible.
-         */
         /**
          * Clear glass, as tvOS 26's dock and status pills: the picture behind shows through,
          * softened rather than frosted over, under a crisp light rim.
@@ -1567,6 +1569,12 @@ public class MainActivity extends Activity {
 
         boolean clear;
 
+        /**
+         * Glass for small controls (Liquid Glass "regular"): the backdrop is desaturated so the
+         * control reads as clear glass rather than a coloured blob, and the tint follows the
+         * brightness behind it \u2014 darker over bright artwork so white text stays legible, a light
+         * frost over dark artwork so the control stays visible.
+         */
         LiquidGlass adaptive() {
             adaptive = true;
             android.graphics.ColorMatrix cm = new android.graphics.ColorMatrix();
@@ -1578,11 +1586,30 @@ public class MainActivity extends Activity {
             return this;
         }
 
-        void setLit(boolean lit) {
-            this.lit = lit;
-            fill.setColor(lit ? 0x52FFFFFF : adaptive && adaptiveTint != 0 ? adaptiveTint : baseTint);
+        static final android.animation.ArgbEvaluator ARGB = new android.animation.ArgbEvaluator();
+
+        void setLit(float t) {
+            lit = t;
+            fill.setColor(fillColor());
             invalidateSelf();
         }
+
+        int fillColor() {
+            int rest = adaptive && adaptiveTint != 0 ? adaptiveTint : baseTint;
+            return lit <= 0f ? rest : (int) ARGB.evaluate(lit, rest, 0x52FFFFFF);
+        }
+
+        /** Fades the light in or out on the shared focus timing, as the white plates do. */
+        void lightUp(boolean on) {
+            if (litAnim != null) litAnim.cancel();
+            litAnim = ValueAnimator.ofFloat(lit, on ? 1f : 0f);
+            litAnim.setDuration(on ? 200 : 260);
+            litAnim.setInterpolator(EASE);
+            litAnim.addUpdateListener(a -> setLit((float) a.getAnimatedValue()));
+            litAnim.start();
+        }
+
+        ValueAnimator litAnim;
 
         /** Average luminance (0..1) of the backdrop under this surface, from up to 8x8 samples. */
         float luminanceBehind(Bitmap b) {
@@ -1651,9 +1678,11 @@ public class MainActivity extends Activity {
                     lens2.setShader(shader3);
                     shaderFor = b;
                 }
-                if (adaptive && (b != lumFor || loc[0] != lumX || loc[1] != lumY)) {
-                    // Only when the backdrop or this surface's position changes, not every frame.
+                if (adaptive && (b != lumFor || b.getGenerationId() != lumGen || loc[0] != lumX || loc[1] != lumY)) {
+                    // Only when the backdrop (or its pixels, mid-blend) or this surface's position
+                    // changes, not every frame.
                     lumFor = b;
+                    lumGen = b.getGenerationId();
                     lumX = loc[0];
                     lumY = loc[1];
                     int t = tintFor(luminanceBehind(b));
@@ -1661,7 +1690,7 @@ public class MainActivity extends Activity {
                     if (clear) t = (Math.round((t >>> 24) * 0.7f) << 24) | (t & 0xFFFFFF);
                     if (t != adaptiveTint) {
                         adaptiveTint = t;
-                        if (!lit) fill.setColor(t);
+                        fill.setColor(fillColor());
                     }
                 }
                 place(shader1, b, 1f);
@@ -1812,26 +1841,32 @@ public class MainActivity extends Activity {
         if (src == null) return null;
         Bitmap b = src.isMutable() ? src : src.copy(Bitmap.Config.ARGB_8888, true);
         if (b != src) src.recycle();
+        // Three shades: from the left for the title (80% fading out three quarters across), from
+        // the bottom for the dock (8% to 70%), along the top for the clock and weather (40% fading
+        // out a fifth of the way down). Each darkens by a factor that depends on x or on y alone,
+        // so they're applied together in one pass of integer sums over the pixels rather than as
+        // three full-size gradients, which kept the processor busy through the dissolve.
         int w = b.getWidth(), h = b.getHeight();
-        Canvas c = new Canvas(b);
-        Paint p = new Paint(Paint.DITHER_FLAG);
-        p.setShader(new LinearGradient(0, 0, w * 0.75f, 0, new int[]{0xCC000000, 0x66000000, 0x00000000},
-                null, Shader.TileMode.CLAMP));
-        c.drawRect(0, 0, w * 0.75f, h, p);
-        p.setShader(new LinearGradient(0, 0, 0, h, new int[]{0x14000000, 0x40000000, 0xB3000000},
-                null, Shader.TileMode.CLAMP));
-        c.drawRect(0, 0, w, h, p);
-        topShade(c, w, h);
+        int[] keepX = new int[w], row = new int[w];
+        for (int x = 0; x < w; x++) {
+            float fx = (x + 0.5f) / w / 0.75f;
+            float left = fx >= 1f ? 0f : fx < 0.5f ? 0.8f - 0.4f * fx / 0.5f : 0.4f * (1f - (fx - 0.5f) / 0.5f);
+            keepX[x] = Math.round((1f - left) * 256);
+        }
+        for (int y = 0; y < h; y++) {
+            float fy = (y + 0.5f) / h;
+            float bottom = fy < 0.5f ? 0.078f + 0.173f * fy / 0.5f : 0.251f + 0.451f * (fy - 0.5f) / 0.5f;
+            float top = fy < 0.2f ? 0.4f * (1f - fy / 0.2f) : 0f;
+            int keepY = Math.round((1f - bottom) * (1f - top) * 256);
+            b.getPixels(row, 0, w, 0, y, w, 1);
+            for (int x = 0; x < w; x++) {
+                int k = keepX[x] * keepY >> 8, p = row[x];
+                row[x] = (p & 0xFF000000) | ((p >> 16 & 0xFF) * k >> 8) << 16 | ((p >> 8 & 0xFF) * k >> 8) << 8 | (p & 0xFF) * k >> 8;
+            }
+            b.setPixels(row, 0, w, 0, y, w, 1);
+        }
         return b;
     }
-
-    /** A soft shade along the top so the time and status icons stay legible over bright artwork. */
-    static void topShade(Canvas c, int w, int h) {
-        Paint p = new Paint(Paint.DITHER_FLAG);
-        p.setShader(new LinearGradient(0, 0, 0, h * 0.2f, 0x66000000, 0x00000000, Shader.TileMode.CLAMP));
-        c.drawRect(0, 0, w, h * 0.2f, p);
-    }
-
 
     /** Info block sits just above the dock while a dock app is focused... */
     float heroInfoRestY() {
@@ -1881,6 +1916,7 @@ public class MainActivity extends Activity {
         boolean reconfigured = v != heroVersion;
         heroVersion = v;
         io.execute(() -> {
+            Suggestions.byService(this);  // read here, so settling on a dock app never waits on the disk
             List<Suggestions.Item> base = Suggestions.cached(this, true);
             if (base != null && (reconfigured || heroItems.isEmpty())) {
                 handler.post(() -> setHeroBase(base));
@@ -1949,10 +1985,12 @@ public class MainActivity extends Activity {
             setHeroShown(false);
             return;
         }
+        // The carousel shows unless focus is down in the app grid: a list refreshed while the
+        // status row (gear, weather) or nothing had focus used to hide it behind the drawer's glass.
         View f = getCurrentFocus();
         int i = tiles.indexOf(f);
-        boolean dock = f == shelfView || (hasDock() && i >= 0 && i < COLS);
-        setHeroShown(dock);
+        boolean inGrid = i >= 0 && !(hasDock() && i < COLS);
+        setHeroShown(f == null ? heroShown || tiles.isEmpty() || focusedIndex < COLS : !inGrid);
         if (!(same && items.get(keep).title.equals(curTitle))) showHero(keep, heroDissolve && heroShown ? 2 : 0);
         else selectDot(keep, false);
         // Fetching the rest of the shelf's artwork ahead happens in its own lane, so the picture
@@ -1962,7 +2000,13 @@ public class MainActivity extends Activity {
         preload.execute(() -> {
             for (Suggestions.Item it : pre) {
                 if (gen != preloadGen) return;
-                Suggestions.image(this, it.backdrop, "w1280", 64);  // downloads to disk; tiny decode
+                // Onto the disk only: decoding them here (even small) cost a second and a half of
+                // processor for a full shelf, which the TV took from the animation running meanwhile.
+                try {
+                    if (it.backdrop != null && !it.backdrop.isEmpty()) Suggestions.download(this, it.backdrop, "w1280");
+                } catch (Exception ignored) {
+                    // fetched when it's shown instead
+                }
                 Suggestions.logoFor(this, it);
             }
         });
@@ -1974,8 +2018,7 @@ public class MainActivity extends Activity {
         if (show == heroShown) return;
         heroShown = show;
         boolean glassy = !show && heroDrawer != null;
-        glassBg = (show || glassy) && heroBlur != null ? heroBlur : wallBlur;
-        invalidateGlass();
+        glassTo((show || glassy) && heroBlur != null ? heroBlur : wallBlur, show ? 480 : 420);
         float a = show ? 1f : 0f;
         if (!show || drawerBack.getAlpha() > 0f) wallView.setVisibility(View.VISIBLE);
         // The apps open over the carousel's picture as blurred glass; closing them, it clears.
@@ -1986,10 +2029,9 @@ public class MainActivity extends Activity {
             if (!heroShown && drawerBack.getAlpha() >= 1f) wallView.setVisibility(View.INVISIBLE);
         }).start();
         heroFront.animate().cancel();
-        heroFront.animate().alpha(a).setDuration(show ? 480 : 420).setInterpolator(HERO_EASE).withLayer().withEndAction(() -> {
+        heroFront.animate().alpha(a).setDuration(show ? 480 : 420).setInterpolator(HERO_EASE).withEndAction(() -> {
             if (heroShown && heroFront.getAlpha() >= 1f) wallView.setVisibility(View.INVISIBLE);
         }).start();
-        heroScrim.setVisibility(View.GONE);
 
         // Leaving for the apps: the title and dots go at once, before the rows slide over them;
         // coming back: they return after the artwork has settled.
@@ -2002,6 +2044,68 @@ public class MainActivity extends Activity {
         heroBack.animate().alpha(0f).setDuration(show ? 480 : 420).setInterpolator(HERO_EASE).start();
         handler.removeCallbacks(heroAdvance);
         if (show) scheduleAdvance();
+    }
+
+    /** The glass's picture part-way between two (the same small size): its own, reused. */
+    Bitmap glassMixed;
+    int[] glassFrom, glassTarget, glassOut;
+    ValueAnimator glassAnim;
+
+    /**
+     * Moves every piece of glass on Home (dock, weather, clock, gear) to a new backdrop over ms,
+     * on the carousel's own easing: blended pixel by pixel in the glass's tiny picture (160x90,
+     * a fraction of a millisecond a frame), so the glass takes on the new picture's colours as the
+     * picture itself dissolves in, instead of switching the moment the dissolve begins.
+     */
+    void glassTo(Bitmap to, long ms) {
+        if (glassAnim != null) glassAnim.cancel();
+        Bitmap from = glassBg;
+        if (to == null || from == null || from == to || ms <= 0 || from.isRecycled()
+                || from.getWidth() != to.getWidth() || from.getHeight() != to.getHeight()) {
+            glassBg = to;
+            invalidateGlass();
+            return;
+        }
+        int w = to.getWidth(), h = to.getHeight(), n = w * h;
+        if (glassOut == null || glassOut.length != n) {
+            glassFrom = new int[n];
+            glassTarget = new int[n];
+            glassOut = new int[n];
+        }
+        from.getPixels(glassFrom, 0, w, 0, 0, w, h);  // where it is now, even part-way through a blend
+        to.getPixels(glassTarget, 0, w, 0, 0, w, h);
+        if (glassMixed == null || glassMixed.getWidth() != w || glassMixed.getHeight() != h) {
+            glassMixed = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+        }
+        glassMixed.setPixels(glassFrom, 0, w, 0, 0, w, h);
+        glassBg = glassMixed;
+        glassAnim = ValueAnimator.ofFloat(0f, 1f);
+        glassAnim.setDuration(ms);
+        glassAnim.setInterpolator(HERO_EASE);
+        glassAnim.addUpdateListener(a -> {
+            int k = Math.round((float) a.getAnimatedValue() * 256), j = 256 - k;
+            for (int i = 0; i < n; i++) {
+                int p = glassFrom[i], q = glassTarget[i];
+                glassOut[i] = 0xFF000000 | (((p >> 16 & 0xFF) * j + (q >> 16 & 0xFF) * k) >> 8) << 16
+                        | (((p >> 8 & 0xFF) * j + (q >> 8 & 0xFF) * k) >> 8) << 8 | ((p & 0xFF) * j + (q & 0xFF) * k) >> 8;
+            }
+            glassMixed.setPixels(glassOut, 0, w, 0, 0, w, h);
+            invalidateGlass();
+        });
+        glassAnim.addListener(new android.animation.AnimatorListenerAdapter() {
+            boolean cancelled;
+
+            @Override public void onAnimationCancel(android.animation.Animator a) {
+                cancelled = true;
+            }
+
+            @Override public void onAnimationEnd(android.animation.Animator a) {
+                if (cancelled) return;  // a newer move carries on from where this one got to
+                glassBg = to;
+                invalidateGlass();
+            }
+        });
+        glassAnim.start();
     }
 
     /** tvOS's app-drawer backdrop: the picture blurred right down, colour kept and lifted, then dimmed. */
@@ -2101,8 +2205,8 @@ public class MainActivity extends Activity {
             Bitmap drawer = drawerGlass(raw);  // before bakeScrims, which reuses raw
             Bitmap bd = bakeScrims(raw);
             Bitmap bdBlur = Ui.glassBackdrop(bd, 160, 90);
-            // Starts the GPU upload now, in the background, so the dissolve doesn't stall on it.
-            if (bd != null) bd.prepareToDraw();
+            // On the GPU now, in the background, so the dissolve doesn't stall on the upload.
+            Bitmap shown = Suggestions.onGpu(bd);
             if (bdBlur != null) bdBlur.prepareToDraw();
             if (drawer != null) drawer.prepareToDraw();
             String logoPath = Suggestions.logoFor(this, it);
@@ -2110,14 +2214,12 @@ public class MainActivity extends Activity {
             handler.post(() -> {
                 if (heroIndex != want || heroItems.isEmpty()) return;
                 applyHeroInfo(it, logo, dir);
-                if (bd != null) crossfadeHero(bd, dir);
+                if (shown != null) crossfadeHero(shown, dir);
                 if (drawer != null) heroDrawer = drawer;
                 if (bdBlur != null) {
                     heroBlur = bdBlur;
-                    if (heroShown) {
-                        glassBg = heroBlur;
-                        invalidateGlass();
-                    }
+                    // The glass changes colour with the dissolve, not ahead of it.
+                    if (heroShown) glassTo(heroBlur, dir == 0 ? 0 : 820);
                 }
             });
         });
@@ -2150,16 +2252,11 @@ public class MainActivity extends Activity {
         heroMeta.setText(String.join("  \u00B7  ", meta));
         heroOverview.setText(it.overview);
         Suggestions.Provider p = it.provider();
-        heroBtnText.setText(p != null && !Suggestions.installed(this, p.pkg) ? "Get" : "\u25B6  Open");
+        heroBtnText.setText(p != null && !installed(p.pkg) ? "Get" : "\u25B6  Open");
         // The service's own app icon as its badge.
         Drawable appIcon = null;
         String badge = p != null ? p.pkg : null;
-        if (badge != null && Suggestions.installed(this, badge)) {
-            try {
-                appIcon = getPackageManager().getApplicationIcon(badge);
-            } catch (PackageManager.NameNotFoundException ignored) {
-            }
-        }
+        if (badge != null && installed(badge)) appIcon = badgeIcon(badge);
         heroProvider.setImageDrawable(appIcon);
         heroProvider.setVisibility(appIcon == null ? View.GONE : View.VISIBLE);
         heroBtnIcon.setVisibility(View.GONE);
@@ -2176,6 +2273,28 @@ public class MainActivity extends Activity {
             heroInfo.setTranslationX(dir == 2 ? 0 : dp(18) * dir);
             heroInfo.animate().withLayer().alpha(1f).translationX(0).setDuration(680).setStartDelay(60).setInterpolator(HERO_EASE).start();
         }
+    }
+
+    /** Apps' icons and whether they're installed, asked on every slide: kept until an app changes. */
+    final Map<String, Drawable> badges = new java.util.HashMap<>();
+    final Map<String, Boolean> installedApps = new java.util.HashMap<>();
+
+    boolean installed(String pkg) {
+        Boolean b = installedApps.get(pkg);
+        if (b == null) installedApps.put(pkg, b = Suggestions.installed(this, pkg));
+        return b;
+    }
+
+    Drawable badgeIcon(String pkg) {
+        if (badges.containsKey(pkg)) return badges.get(pkg);
+        Drawable d = null;
+        try {
+            d = getPackageManager().getApplicationIcon(pkg);
+        } catch (PackageManager.NameNotFoundException ignored) {
+            // no badge
+        }
+        badges.put(pkg, d);
+        return d;
     }
 
     /**
@@ -2198,7 +2317,8 @@ public class MainActivity extends Activity {
         }
         // The new artwork dissolves in on top while the old one stays solid underneath (no dip to
         // dark mid-way, one blend per frame), both drifting a little with the direction pressed.
-        // GPU layers keep it to texture compositing on the render thread.
+        // No GPU layers: a picture alone fades as cheaply without one, and building one made the
+        // TV render (and upload) the whole new picture again in the frame the dissolve began.
         ViewGroup layer = (ViewGroup) next.getParent();
         if (layer != null && layer == old.getParent() && layer.indexOfChild(next) < layer.indexOfChild(old)) {
             // Draw the incoming image just above the outgoing one (never above the titles or dock).
@@ -2208,10 +2328,10 @@ public class MainActivity extends Activity {
         int slide = dir == 2 ? 0 : dir;  // 2: a shelf change dissolves in place
         next.setTranslationX(screenW * 0.05f * slide);
         next.setAlpha(0f);
-        next.animate().translationX(0).alpha(1f).setDuration(820).setInterpolator(HERO_EASE).withLayer().start();
+        next.animate().translationX(0).alpha(1f).setDuration(820).setInterpolator(HERO_EASE).start();
         old.animate().cancel();
         old.setAlpha(1f);
-        old.animate().translationX(-screenW * 0.025f * slide).setDuration(820).setInterpolator(HERO_EASE).withLayer()
+        old.animate().translationX(-screenW * 0.025f * slide).setDuration(820).setInterpolator(HERO_EASE)
                 .withEndAction(() -> {
                     old.setAlpha(0f);
                     old.setTranslationX(0);
@@ -2234,35 +2354,52 @@ public class MainActivity extends Activity {
             return;
         }
         if (!has) heroRequested = false;
+        heroButtonLit(has);
         if (has) {
             setHeroShown(true);
             heroButton.animate().scaleX(1.08f).scaleY(1.08f).setDuration(420).setInterpolator(LIFT).start();
             heroButton.setElevation(dp(10));
-            heroBtnBg.setColor(0xFFFFFFFF);
-            heroBtnText.setTextColor(0xFF111114);
             scroll.smoothScrollTo(0, 0);
-            scroll.animate().withLayer().translationY(screenH - shelfH + dp(30)).setDuration(500).setInterpolator(EASE)
+            // Slid as it is, not as a GPU layer: the dock card settling inside it would have the
+            // whole grid re-rendered into the layer every frame (the dock's glass has its own).
+            scroll.animate().translationY(screenH - shelfH + dp(30)).setDuration(500).setInterpolator(EASE)
                     .setUpdateListener(null).withEndAction(this::invalidateGlass).start();
             moveHeroInfo(0, 0, 500);
             heroOverview.setVisibility(View.VISIBLE);
             heroButton.setVisibility(View.VISIBLE);
-            heroOverview.animate().alpha(0.85f).setDuration(400).setStartDelay(120).start();
-            heroButton.animate().alpha(1f).setDuration(400).setStartDelay(120).start();
+            heroOverview.animate().alpha(0.85f).setDuration(400).setStartDelay(120).setInterpolator(EASE).start();
+            heroButton.animate().alpha(1f).setDuration(400).setStartDelay(120).setInterpolator(EASE).start();
             handler.removeCallbacks(heroAdvance);
         } else {
             heroButton.animate().scaleX(1f).scaleY(1f).setDuration(240).setInterpolator(EASE).start();
             heroButton.setElevation(0);
-            heroBtnBg.setColor(0x47FFFFFF);
-            heroBtnText.setTextColor(Color.WHITE);
-            scroll.animate().withLayer().translationY(0).setDuration(450).setInterpolator(EASE)
+            scroll.animate().translationY(0).setDuration(450).setInterpolator(EASE)
                     .setUpdateListener(null).withEndAction(this::invalidateGlass).start();
             moveHeroInfo(heroInfoRestY(), heroDotsRestY(), 450);
-            heroOverview.animate().alpha(0f).setDuration(160).setStartDelay(0)
+            heroOverview.animate().alpha(0f).setDuration(160).setStartDelay(0).setInterpolator(EASE)
                     .withEndAction(() -> heroOverview.setVisibility(View.GONE)).start();
-            heroButton.animate().alpha(0f).setDuration(160).setStartDelay(0)
+            heroButton.animate().alpha(0f).setDuration(160).setStartDelay(0).setInterpolator(EASE)
                     .withEndAction(() -> heroButton.setVisibility(View.GONE)).start();
             scheduleAdvance();
         }
+    }
+
+    ValueAnimator heroBtnAnim;
+    float heroBtnT;
+
+    /** The Open capsule turns white with dark text as the carousel takes focus: a fade, never a flip. */
+    void heroButtonLit(boolean on) {
+        if (heroBtnAnim != null) heroBtnAnim.cancel();
+        android.animation.ArgbEvaluator ev = new android.animation.ArgbEvaluator();
+        heroBtnAnim = ValueAnimator.ofFloat(heroBtnT, on ? 1f : 0f);
+        heroBtnAnim.setDuration(on ? 200 : 260);
+        heroBtnAnim.setInterpolator(EASE);
+        heroBtnAnim.addUpdateListener(a -> {
+            heroBtnT = (float) a.getAnimatedValue();
+            heroBtnBg.setColor((int) ev.evaluate(heroBtnT, 0x47FFFFFF, 0xFFFFFFFF));
+            heroBtnText.setTextColor((int) ev.evaluate(heroBtnT, Color.WHITE, 0xFF111114));
+        });
+        heroBtnAnim.start();
     }
 
     /** Carousel and capsule navigation: LEFT/RIGHT browse, OK opens, UP/DOWN move between capsule, carousel and dock. */
@@ -2475,7 +2612,7 @@ public class MainActivity extends Activity {
     void exitFolder() {
         animateGridSwap(() -> {
             folderMode = false;
-            weatherCard.animate().alpha(weatherAlpha()).setDuration(250).start();
+            weatherCard.animate().alpha(weatherAlpha()).setDuration(250).setInterpolator(EASE).start();
             buildGrid();
             int i = indexOfKey(FOLDER_KEY);
             focusIndex(i >= 0 ? i : 0);
@@ -2758,6 +2895,8 @@ public class MainActivity extends Activity {
     void registerPackageReceiver() {
         pkgReceiver = new BroadcastReceiver() {
             @Override public void onReceive(Context c, Intent i) {
+                badges.clear();
+                installedApps.clear();
                 handler.removeCallbacks(reloadRun);
                 handler.postDelayed(reloadRun, 600);
             }
@@ -2919,7 +3058,6 @@ public class MainActivity extends Activity {
         return b;
     }
 
-    /** SF-style Wi-Fi: a wedge and two equal bands fanning 90 degrees from a point near the bottom. */
     /**
      * Apple's Wi-Fi fan: a quarter circle split into a wedge and two bands with even gaps, the band
      * ends cut straight along the fan's edges and every corner slightly rounded. Drawn four times
@@ -3061,14 +3199,15 @@ public class MainActivity extends Activity {
         idleDotsY = heroDotsY;
         idleOverviewShown = heroOverview.getVisibility() == View.VISIBLE;
         scroll.animate().cancel();
-        scroll.animate().withLayer().translationY(screenH).alpha(0f).setDuration(900).setInterpolator(EASE)
+        // The apps slide away whole, as on tvOS: no fade, so no full-screen layer to blend.
+        scroll.animate().translationY(screenH).setDuration(900).setInterpolator(EASE)
                 .setUpdateListener(null).start();
         moveHeroInfo(0, dp(4), 900);
-        weatherCard.animate().alpha(0f).setDuration(500).start();
-        heroButton.animate().alpha(0f).setDuration(300).start();
+        weatherCard.animate().alpha(0f).setDuration(500).setInterpolator(EASE).start();
+        heroButton.animate().alpha(0f).setDuration(300).setInterpolator(EASE).start();
         heroOverview.animate().cancel();
         heroOverview.setVisibility(heroOverview.getText().length() > 0 ? View.VISIBLE : View.GONE);
-        heroOverview.animate().alpha(0.85f).setDuration(600).start();
+        heroOverview.animate().alpha(0.85f).setDuration(600).setInterpolator(EASE).start();
         handler.removeCallbacks(heroAdvance);
         scheduleAdvance();
     }
@@ -3096,16 +3235,16 @@ public class MainActivity extends Activity {
             handler.postDelayed(() -> focusIndex(back), 120);
         }
         scroll.animate().cancel();
-        scroll.animate().withLayer().translationY(idleScrollY).alpha(1f).setDuration(450).setInterpolator(EASE)
+        scroll.animate().translationY(idleScrollY).setDuration(450).setInterpolator(EASE)
                 .setUpdateListener(null).withEndAction(this::invalidateGlass).start();
         moveHeroInfo(idleInfoY, idleDotsY, 450);
-        weatherCard.animate().alpha(toGrid ? 0f : weatherAlpha()).setDuration(350).start();
+        weatherCard.animate().alpha(toGrid ? 0f : weatherAlpha()).setDuration(350).setInterpolator(EASE).start();
         if (shelfView.isFocused()) {
-            heroButton.animate().alpha(1f).setDuration(300).start();
+            heroButton.animate().alpha(1f).setDuration(300).setInterpolator(EASE).start();
             handler.removeCallbacks(heroAdvance);  // browsing by hand: no auto-advance
         }
         if (!idleOverviewShown) {
-            heroOverview.animate().alpha(0f).setDuration(200)
+            heroOverview.animate().alpha(0f).setDuration(200).setInterpolator(EASE)
                     .withEndAction(() -> heroOverview.setVisibility(View.GONE)).start();
         }
         resetIdle();
@@ -3147,6 +3286,7 @@ public class MainActivity extends Activity {
         if (!show && weatherCard.isFocused()) focusTop();
         weatherCard.setVisibility(show ? View.VISIBLE : View.GONE);
         weatherCard.setData(d);
+        if (show) io.execute(() -> WeatherView.prepare(d, unit));
         if (show && !weatherCard.isFocused()) weatherCard.setAlpha(weatherAlpha());
     }
 
@@ -3181,11 +3321,23 @@ public class MainActivity extends Activity {
         pickerCells = new ArrayList<>();
         pickerCells.add(panel);
         weatherOpen = true;
-        weatherCard.animate().alpha(0f).setDuration(150).start();
-        layer.setAlpha(0f);
-        panel.setTranslationY(-dp(10));
-        layer.animate().alpha(1f).setDuration(200).start();
-        panel.animate().translationY(0).setDuration(260).setInterpolator(EASE).start();
+        // The forecast grows out of the pill, from its corner, on the focus spring; the pill
+        // fades into it and the shade comes up behind.
+        weatherCard.animate().alpha(0f).setDuration(140).setInterpolator(EASE).start();
+        shade.setAlpha(0f);
+        shade.animate().alpha(1f).setDuration(300).setInterpolator(EASE).start();
+        panel.setPivotX(0);
+        panel.setPivotY(0);
+        panel.setScaleX(0.7f);
+        panel.setScaleY(0.7f);
+        panel.setAlpha(0f);
+        // As one picture while it grows (no text redrawn at each size); it lands at its own size.
+        panel.animate().scaleX(1f).scaleY(1f).setDuration(520).setInterpolator(Glass.SNAP).withLayer().start();
+        ValueAnimator in = ValueAnimator.ofFloat(0f, 1f);
+        in.setDuration(200);
+        in.setInterpolator(EASE);
+        in.addUpdateListener(a -> panel.setAlpha((float) a.getAnimatedValue()));
+        in.start();
         panel.requestFocus();
         Weather.refresh(this, false, () -> {
             Weather.Data nd = Weather.cached(this);
@@ -3244,12 +3396,17 @@ public class MainActivity extends Activity {
         if (pickerLayer == null) return;
         FrameLayout l = pickerLayer;
         pickerLayer = null;
-        l.animate().alpha(0f).setDuration(220).withEndAction(() -> root.removeView(l)).start();
+        // Back into the pill: the panel shrinks towards its corner as it fades, and the pill returns.
+        View panel = l.getChildCount() > 1 ? l.getChildAt(1) : null;
+        if (panel != null) panel.animate().scaleX(0.8f).scaleY(0.8f).alpha(0f).setDuration(200).setInterpolator(EASE).withLayer().start();
+        l.getChildAt(0).animate().alpha(0f).setDuration(240).setInterpolator(EASE).withEndAction(() -> root.removeView(l)).start();
         weatherOpen = false;
-        weatherCard.animate().alpha(weatherAlpha()).setDuration(220).start();
         if (popoverReturn != null && popoverReturn.isAttachedToWindow()) popoverReturn.requestFocus();
         else goTop();
         popoverReturn = null;
+        // Faded up after focus has landed: focusing the pill lifts it, and the lift would stop a fade begun before.
+        weatherCard.setAlpha(0f);
+        weatherCard.animate().alpha(weatherAlpha()).setDuration(260).setInterpolator(EASE).start();
     }
 
     // ---------------------------------------------------------------- tvOS context menu
@@ -3265,8 +3422,12 @@ public class MainActivity extends Activity {
         closeMenu();
         menuReturnFocus = anchor;
         menuLayer = new FrameLayout(this);
-        menuLayer.setBackgroundColor(0x00000000);
         menuLayer.setClickable(true);
+        // The dim behind the menu fades with it (its own view, so the fade is a single alpha).
+        View dim = new View(this);
+        dim.setBackgroundColor(0x59000000);
+        dim.setAlpha(0f);
+        menuLayer.addView(dim, match());
 
         LinearLayout panel = new LinearLayout(this);
         panel.setOrientation(LinearLayout.VERTICAL);
@@ -3288,6 +3449,7 @@ public class MainActivity extends Activity {
         panel.addView(head);
 
         List<View> rows = new ArrayList<>();
+        boolean[] opening = {true};  // the first row starts lit, so the menu pops as one still picture
         for (int i = 0; i < labels.size(); i++) {
             int idx = i;
             TextView row = text(14, Ui.font(this, "medium"), 1f);
@@ -3306,6 +3468,11 @@ public class MainActivity extends Activity {
             row.setBackground(pill);
             int focusedText = idx == destructive ? 0xFFD7372A : 0xFF111114;
             row.setOnFocusChangeListener((v, has) -> {
+                if (opening[0]) {
+                    pill.setAlpha(255);
+                    row.setTextColor(focusedText);
+                    return;
+                }
                 // The white plate and the text colour fade together, like every other control.
                 android.animation.ArgbEvaluator ev = new android.animation.ArgbEvaluator();
                 ValueAnimator fade = ValueAnimator.ofFloat(pill.getAlpha() / 255f, has ? 1f : 0f);
@@ -3358,23 +3525,34 @@ public class MainActivity extends Activity {
         menuLayer.addView(panel, plp);
         root.addView(menuLayer, match());
 
-        // Pop in from the card's side.
+        // Pops out of the card's side on a spring, fading up as it grows. It moves as one picture
+        // (a GPU layer), so its words aren't redrawn at a new size every frame; it lands at exactly
+        // its own size, so there's no change when the picture gives way to the real thing.
         panel.setPivotX(x > loc[0] ? 0 : w);
         panel.setPivotY(h / 2f);
         panel.setAlpha(0f);
-        panel.setScaleX(0.9f);
-        panel.setScaleY(0.9f);
-        panel.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(400).setInterpolator(LIFT).start();
-        menuLayer.animate().setDuration(220).start();
-        menuLayer.setBackgroundColor(0x59000000);
+        panel.setScaleX(0.86f);
+        panel.setScaleY(0.86f);
         if (!rows.isEmpty()) rows.get(0).requestFocus();
+        opening[0] = false;
+        panel.animate().scaleX(1f).scaleY(1f).setDuration(460).setInterpolator(Glass.SNAP).withLayer().start();
+        // Alpha on its own, shorter animator: the menu is opaque well before the spring settles.
+        ValueAnimator in = ValueAnimator.ofFloat(0f, 1f);
+        in.setDuration(180);
+        in.setInterpolator(EASE);
+        in.addUpdateListener(a -> panel.setAlpha((float) a.getAnimatedValue()));
+        in.start();
+        dim.animate().alpha(1f).setDuration(240).setInterpolator(EASE).start();
     }
 
     void closeMenu() {
         if (menuLayer == null) return;
         FrameLayout m = menuLayer;
         menuLayer = null;
-        m.animate().alpha(0f).setDuration(150).withEndAction(() -> root.removeView(m)).start();
+        // Back into the card it came from: a little smaller as it fades, and the dim lifts.
+        View panel = m.getChildCount() > 1 ? m.getChildAt(1) : null;
+        if (panel != null) panel.animate().scaleX(0.92f).scaleY(0.92f).alpha(0f).setDuration(160).setInterpolator(EASE).withLayer().start();
+        m.getChildAt(0).animate().alpha(0f).setDuration(200).setInterpolator(EASE).withEndAction(() -> root.removeView(m)).start();
         if (menuReturnFocus != null && menuReturnFocus.isAttachedToWindow()) menuReturnFocus.requestFocus();
         menuReturnFocus = null;
     }
@@ -3445,12 +3623,13 @@ public class MainActivity extends Activity {
                         cell.setAlpha(0f);
                         cell.setScaleX(0.86f);
                         cell.setScaleY(0.86f);
-                        cell.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(240).setInterpolator(EASE).start();
+                        cell.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(400).setInterpolator(Glass.SNAP).start();
                         continue;
                     }
+                    // Neighbours make room on the focus spring: quick, with a small settle.
                     t.setTranslationX(dx);
                     t.setTranslationY(dy);
-                    t.animate().translationX(0).translationY(0).setDuration(260).setInterpolator(EASE).start();
+                    t.animate().translationX(0).translationY(0).setDuration(420).setInterpolator(Glass.SNAP).start();
                 }
                 return true;
             }

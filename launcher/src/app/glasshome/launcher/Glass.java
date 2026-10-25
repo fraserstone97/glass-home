@@ -135,6 +135,7 @@ final class Glass extends Drawable {
      */
     static void lift(android.view.View v, boolean has, float scale, float z, float rest, boolean asImage) {
         v.animate().cancel();
+        v.animate().setStartDelay(0);  // a delay set for an earlier fade would hold the lift back
         android.view.ViewPropertyAnimator a;
         if (has) {
             float push = 4f * v.getResources().getDisplayMetrics().density;

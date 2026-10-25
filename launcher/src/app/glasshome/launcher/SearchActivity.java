@@ -147,6 +147,17 @@ public class SearchActivity extends Activity {
      * otherwise a drawn tomato or splat. Certified falls back to the fresh tomato.
      */
     static android.graphics.drawable.Drawable icon(android.content.Context c, char kind, int size) {
+        // Each kind and size is made once: a page of results asks for dozens, and decoding the
+        // picture for every card cost a results page a sixth of its build time.
+        String key = kind + ":" + size;
+        android.graphics.Bitmap made = ICONS.get(key);
+        if (made == null) ICONS.put(key, made = iconBitmap(c, kind, size));
+        return new android.graphics.drawable.BitmapDrawable(c.getResources(), made);
+    }
+
+    static final java.util.Map<String, android.graphics.Bitmap> ICONS = new java.util.HashMap<>();
+
+    static android.graphics.Bitmap iconBitmap(android.content.Context c, char kind, int size) {
         String[] names = kind == CERTIFIED ? new String[]{"rt_certified", "rt_fresh"}
                 : kind == FRESH ? new String[]{"rt_fresh"} : new String[]{"rt_rotten"};
         for (String n : names) {
@@ -161,10 +172,9 @@ public class SearchActivity extends Activity {
                 if (h != b) b.recycle();
                 b = h;
             }
-            android.graphics.Bitmap fit = android.graphics.Bitmap.createScaledBitmap(b, size, size, true);
-            return new android.graphics.drawable.BitmapDrawable(c.getResources(), fit);
+            return android.graphics.Bitmap.createScaledBitmap(b, size, size, true);
         }
-        return new android.graphics.drawable.BitmapDrawable(c.getResources(), tomatoIcon(kind != ROTTEN, size * 2));
+        return tomatoIcon(kind != ROTTEN, size * 2);
     }
 
     /** A red tomato with a green crown (fresh), or a green splat (rotten), drawn at s px. */
@@ -360,6 +370,10 @@ public class SearchActivity extends Activity {
         header.setTranslationY(-u(30));
         header.setScaleX(0.96f);
         header.setScaleY(0.96f);
+        // Results that arrive while the page is arriving wait for it (show), so building their
+        // rows never takes frames from the entrance.
+        root.post(() -> entering = true);
+        ui.postDelayed(() -> entering = false, 660);
         root.animate().alpha(1f).setDuration(300).setInterpolator(MainActivity.EASE).withEndAction(() -> {
             // Faded in over Home: from now on the page is solid, so the TV draws only it, not Home
             // underneath as well. (Over another app it stays see-through, so that app isn't stopped.)
@@ -376,13 +390,13 @@ public class SearchActivity extends Activity {
         super.onUserLeaveHint();
         stopListening();
         finish();
-        overridePendingTransition(0, android.R.anim.fade_out);
+        overridePendingTransition(0, R.anim.page_out);
     }
 
     @Override
     public void onBackPressed() {
         super.onBackPressed();
-        overridePendingTransition(0, android.R.anim.fade_out);
+        overridePendingTransition(0, R.anim.page_out);
     }
 
     @Override
@@ -1095,7 +1109,16 @@ public class SearchActivity extends Activity {
      * Results as tvOS shelves: a heading over a row that scrolls sideways. Top Results, More
      * Like This and Apps for a search; Popular Films and Popular Series before one.
      */
+    boolean entering;
+    Runnable pendingShow;
+
     void show(List<SearchBrain.Shelf> shelves) {
+        ui.removeCallbacks(pendingShow);
+        if (entering && !shelves.isEmpty()) {
+            pendingShow = () -> show(shelves);
+            ui.postDelayed(pendingShow, Math.max(0, createdAt + 660 - android.os.SystemClock.uptimeMillis()));
+            return;
+        }
         if (!lastQuery.isEmpty() && shelves.size() == showing.size() && !shelves.isEmpty()) {
             boolean all = true;
             for (int i = 0; i < shelves.size(); i++) all &= same(showing.get(i), shelves.get(i));
@@ -1190,12 +1213,20 @@ public class SearchActivity extends Activity {
         hs.addView(row);
         int gap = u(22);
         int w = (Ui.screen(this).x - 2 * u(48) - (COLS - 1) * gap) / COLS;
-        for (int i = 0; i < items.size(); i++) {
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(w, -2);
-            if (i > 0) lp.leftMargin = gap;
+        // The cards on screen now; the rest follow a few at a time over the next frames, so a
+        // page of results never stalls a frame on building eighty cards at once.
+        int now = Math.min(items.size(), COLS + 1);
+        for (int i = 0; i < now; i++) {
             View card = card(items.get(i), w);
             if (firstCard == null || grid.getChildCount() == 0 && i == 0) firstCard = ((ViewGroup) card).getChildAt(0);
-            row.addView(card, lp);
+            row.addView(card, cardParams(w, gap, i));
+        }
+        for (int from = now; from < items.size(); from += COLS) {
+            int a = from, b = Math.min(items.size(), from + COLS);
+            ui.post(() -> {
+                if (!row.isAttachedToWindow()) return;  // replaced by newer results meanwhile
+                for (int i = a; i < b; i++) row.addView(card(items.get(i), w), cardParams(w, gap, i));
+            });
         }
         section.addView(hs, new LinearLayout.LayoutParams(-1, -2));
         LinearLayout.LayoutParams sl = new LinearLayout.LayoutParams(-1, -2);
@@ -1209,6 +1240,12 @@ public class SearchActivity extends Activity {
             section.animate().alpha(1f).translationY(0).setStartDelay(Math.min(delay[0]++, 4) * 70L).setDuration(460)
                     .setInterpolator(MainActivity.EASE).withLayer().start();
         }
+    }
+
+    static LinearLayout.LayoutParams cardParams(int w, int gap, int i) {
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(w, -2);
+        if (i > 0) lp.leftMargin = gap;
+        return lp;
     }
 
     /** Scrolls so the whole shelf holding v (heading to the title under the poster) is on screen. */
@@ -1404,7 +1441,6 @@ public class SearchActivity extends Activity {
 
     Runnable ambientRun = () -> { };
 
-    /** An app opens; a show or film opens its page, with the synopsis and every way to watch it. */
     // ---------------------------------------------------------------- recent searches
 
     static final int RECENT = 6;
@@ -1453,9 +1489,11 @@ public class SearchActivity extends Activity {
             pill.setPadding(u(16), 0, u(16), 0);
             pill.setBackground(white);
             pill.setFocusable(true);
+            // The text darkens with the plate as it fades, not ahead of it.
+            android.animation.ArgbEvaluator ev = new android.animation.ArgbEvaluator();
+            white.tint = f -> pill.setTextColor((int) ev.evaluate(f, Color.WHITE, 0xFF111114));
             pill.setOnFocusChangeListener((v, has) -> {
                 Glass.focus(white, has);
-                pill.setTextColor(has ? 0xFF111114 : Color.WHITE);
                 Glass.lift(v, has, 1.08f, u(6));
                 if (has) keepInView(v);
             });
@@ -1475,6 +1513,7 @@ public class SearchActivity extends Activity {
         grid.addView(row, rl);
     }
 
+    /** An app opens; a show or film opens its page, with the synopsis and every way to watch it. */
     void open(Result r) {
         remember(lastQuery);
         if (r.appLaunch != null) {
@@ -1503,6 +1542,6 @@ public class SearchActivity extends Activity {
         startActivity(new Intent(this, DetailActivity.class).addFlags(Intent.FLAG_ACTIVITY_NO_USER_ACTION)
                 .putExtra("id", r.id).putExtra("title", r.title)
                 .putExtra("backdrop", r.backdrop));
-        overridePendingTransition(android.R.anim.fade_in, android.R.anim.fade_out);
+        overridePendingTransition(R.anim.page_in, R.anim.hold);
     }
 }

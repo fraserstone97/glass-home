@@ -328,19 +328,39 @@ final class Suggestions {
 
     /** The titles for the app with this package (its own top shelf), or an empty list. */
     static List<Item> forService(Context c, String pkg) {
-        List<Item> out = new ArrayList<>();
         Provider p = null;
         for (Provider q : PROVIDERS) if (q.pkg.equals(pkg)) p = q;
+        List<Item> l = p == null ? null : byService(c).get(p.id);
+        return l == null ? new ArrayList<>() : new ArrayList<>(l);
+    }
+
+    static Map<Integer, List<Item>> byService = new java.util.HashMap<>();
+    static long byServiceStamp = -1;
+
+    /**
+     * Every service's shelf, read from disk only when the saved file has changed: settling on a
+     * dock app happens mid-animation, and parsing the file there cost a frame.
+     */
+    static synchronized Map<Integer, List<Item>> byService(Context c) {
         File f = serviceFile(c);
-        if (p == null || !f.exists()) return out;
+        long stamp = f.exists() ? f.lastModified() : 0;
+        if (stamp == byServiceStamp) return byService;
+        Map<Integer, List<Item>> m = new java.util.HashMap<>();
         try {
             JSONObject o = new JSONObject(new String(readAll(new FileInputStream(f)), StandardCharsets.UTF_8));
-            JSONArray a = o.optJSONArray(String.valueOf(p.id));
-            for (int i = 0; a != null && i < a.length(); i++) out.add(Item.fromJson(a.getJSONObject(i)));
+            for (java.util.Iterator<String> k = o.keys(); k.hasNext(); ) {
+                String id = k.next();
+                JSONArray a = o.optJSONArray(id);
+                List<Item> l = new ArrayList<>();
+                for (int i = 0; a != null && i < a.length(); i++) l.add(Item.fromJson(a.getJSONObject(i)));
+                m.put(parseInt(id), l);
+            }
         } catch (Exception ignored) {
-            // nothing for this app
+            // nothing saved yet
         }
-        return out;
+        byService = m;
+        byServiceStamp = stamp;
+        return m;
     }
 
     /** Artwork older than three days leaves the disk cache, so it can't fill the TV's storage. */
@@ -632,6 +652,7 @@ final class Suggestions {
             o.inSampleSize = 1;
             while (o.outWidth / (o.inSampleSize * 2) >= maxWidth) o.inSampleSize *= 2;
             o.inJustDecodeBounds = false;
+            o.inMutable = true;  // the carousel paints its shades straight onto it, with no copy
             return BitmapFactory.decodeFile(f.getPath(), o);
         } catch (Exception e) {
             return null;
@@ -640,8 +661,8 @@ final class Suggestions {
 
     /**
      * A full-screen picture (backdrop): opened at about the width given in 16-bit colour (half the
-     * memory, and no difference under the dark shades it sits beneath), and sent to the graphics
-     * chip straight away, so showing it doesn't stall a frame.
+     * memory, and no difference under the dark shades it sits beneath), and handed to the
+     * graphics chip here, in the background, so the frame that first shows it doesn't stall.
      */
     static Bitmap screenImage(Context c, String url, int width) {
         try {
@@ -660,12 +681,26 @@ final class Suggestions {
                 o.inDensity = w;
                 o.inTargetDensity = width;
             }
-            Bitmap b = BitmapFactory.decodeFile(f.getPath(), o);
-            if (b != null) b.prepareToDraw();
-            return b;
+            return onGpu(BitmapFactory.decodeFile(f.getPath(), o));
         } catch (Exception e) {
             return null;
         }
+    }
+
+    /**
+     * The picture as a GPU-only bitmap, uploaded on this (background) thread. Drawn as it is, a new
+     * picture is uploaded in the frame that first shows it, which made that frame miss its slot.
+     * Only for pictures that are just shown: their pixels can't be read back.
+     */
+    static Bitmap onGpu(Bitmap b) {
+        if (b == null || android.os.Build.VERSION.SDK_INT < 26) return b;
+        Bitmap hw = b.copy(Bitmap.Config.HARDWARE, false);
+        if (hw == null) {
+            b.prepareToDraw();
+            return b;
+        }
+        b.recycle();
+        return hw;
     }
 
     /** The image's file in the disk cache, downloaded on first use; null when it can't be fetched. */

@@ -42,10 +42,10 @@ final class Inputs {
         return prefs(c).getBoolean(K_CARD, true);
     }
 
-    /** Hardware inputs in a natural order: HDMI first, then AV and the rest, tuner last. */
     /** No aerial is connected to this TV, so the tuner (Live TV) isn't offered as an input. */
     static final boolean HIDE_TUNER = true;
 
+    /** Hardware inputs in a natural order: HDMI first, then AV and the rest, tuner last. */
     static List<Input> list(Context c) {
         List<Input> out = new ArrayList<>();
         TvInputManager tm;

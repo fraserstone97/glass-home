@@ -6,6 +6,26 @@
         <item name="android:windowNoTitle">true</item>
         <item name="android:windowFullscreen">true</item>
     </style>
+    <!-- Settings and title pages: they open over Home as a page that fades up and settles, and
+         close the same way, with Home held still beneath (the TV's own transition left a blank
+         half second, then cut). -->
+    <style name="PageTheme" parent="HomeTheme">
+        <item name="android:windowAnimationStyle">@style/PageAnimations</item>
+    </style>
+    <style name="PageAnimations" parent="@android:style/Animation.Activity">
+        <item name="android:activityOpenEnterAnimation">@anim/page_in</item>
+        <item name="android:activityOpenExitAnimation">@anim/hold</item>
+        <item name="android:activityCloseEnterAnimation">@anim/hold</item>
+        <item name="android:activityCloseExitAnimation">@anim/page_out</item>
+        <item name="android:taskOpenEnterAnimation">@anim/page_in</item>
+        <item name="android:taskOpenExitAnimation">@anim/hold</item>
+        <item name="android:taskCloseEnterAnimation">@anim/hold</item>
+        <item name="android:taskCloseExitAnimation">@anim/page_out</item>
+        <item name="android:taskToFrontEnterAnimation">@anim/page_in</item>
+        <item name="android:taskToFrontExitAnimation">@anim/hold</item>
+        <item name="android:taskToBackEnterAnimation">@anim/hold</item>
+        <item name="android:taskToBackExitAnimation">@anim/page_out</item>
+    </style>
     <!-- Control Centre over another app: see-through, no system animation (it animates itself). -->
     <style name="OverlayTheme" parent="@android:style/Theme.DeviceDefault.NoActionBar">
         <item name="android:windowIsTranslucent">true</item>
