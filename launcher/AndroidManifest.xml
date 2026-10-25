@@ -104,6 +104,17 @@
             <meta-data android:name="android.accessibilityservice" android:resource="@xml/keys_service" />
         </service>
 
+        <!-- Now Playing in Control Centre: media sessions are only shared with a notification listener. -->
+        <service
+            android:name=".MediaListener"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+
         <!-- Control Centre over the current app, for the remote's Quick Settings button (KeysService). -->
         <activity
             android:name=".ControlCentreActivity"

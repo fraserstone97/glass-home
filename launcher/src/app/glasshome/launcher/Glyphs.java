@@ -223,6 +223,39 @@ final class Glyphs {
                 p.setStyle(Paint.Style.FILL);
                 c.drawCircle(m, s * 0.36f, s * 0.06f, p);
                 break;
+            case "play": {  // play.fill: a solid triangle with softened corners, nudged right to look centred
+                p.setStyle(Paint.Style.FILL);
+                p.setPathEffect(new android.graphics.CornerPathEffect(s * 0.06f));
+                path.moveTo(s * 0.3f, s * 0.16f);
+                path.lineTo(s * 0.84f, m);
+                path.lineTo(s * 0.3f, s * 0.84f);
+                path.close();
+                c.drawPath(path, p);
+                p.setPathEffect(null);
+                break;
+            }
+            case "pause":  // pause.fill: two rounded bars
+                p.setStyle(Paint.Style.FILL);
+                r.set(s * 0.24f, s * 0.16f, s * 0.42f, s * 0.84f);
+                c.drawRoundRect(r, s * 0.05f, s * 0.05f, p);
+                r.offset(s * 0.34f, 0);
+                c.drawRoundRect(r, s * 0.05f, s * 0.05f, p);
+                break;
+            case "playpause": {  // playpause.fill: a smaller play triangle and the two pause bars
+                p.setStyle(Paint.Style.FILL);
+                p.setPathEffect(new android.graphics.CornerPathEffect(s * 0.04f));
+                path.moveTo(s * 0.1f, s * 0.26f);
+                path.lineTo(s * 0.5f, m);
+                path.lineTo(s * 0.1f, s * 0.74f);
+                path.close();
+                c.drawPath(path, p);
+                p.setPathEffect(null);
+                r.set(s * 0.58f, s * 0.26f, s * 0.69f, s * 0.74f);
+                c.drawRoundRect(r, s * 0.035f, s * 0.035f, p);
+                r.offset(s * 0.2f, 0);
+                c.drawRoundRect(r, s * 0.035f, s * 0.035f, p);
+                break;
+            }
             case "house": {  // Home Screen: a solid house with eaves and an arched door, like SF Symbols' house.fill
                 p.setStyle(Paint.Style.FILL);
                 p.setPathEffect(new android.graphics.CornerPathEffect(s * 0.05f));

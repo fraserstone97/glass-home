@@ -1,11 +1,14 @@
 package app.glasshome.launcher;
 
 import android.app.Activity;
+import android.content.Context;
 import android.content.Intent;
+import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.LayerDrawable;
+import android.media.session.PlaybackState;
 import android.os.Bundle;
 import android.provider.Settings;
 import android.text.TextUtils;
@@ -18,12 +21,14 @@ import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import java.util.List;
+
 /**
- * Control Centre: a translucent glass panel docked to the right of the screen, over Home or any
+ * Control Centre: a translucent glass panel at the top right of the screen, over Home or any
  * app. Opened by the gear on Home and by the remote's Quick Settings button (KeysService); a
  * second press, Back, or opening anything closes it. It holds what a TV needs at hand, like the
- * quick panels on Google TV, LG and Samsung sets: inputs, picture, sound, network, Bluetooth,
- * sleep timer, screen saver, and power and settings.
+ * quick panels on Google TV, LG and Samsung sets: power, Home and settings beside the time, what's
+ * playing, then inputs, picture, sound, network, Bluetooth, sleep timer and screen saver.
  */
 public class ControlCentreActivity extends Activity {
 
@@ -34,7 +39,7 @@ public class ControlCentreActivity extends Activity {
     FrameLayout root;
     /** The sheet is the dock's glass: it redraws as it slides, so the picture in it stays put. */
     boolean liquid;
-    LinearLayout sheet, body;
+    LinearLayout sheet, header, buttons, body;
     View shade;
     TextView heading, dateLine;
     boolean closing, onInputs;
@@ -66,25 +71,41 @@ public class ControlCentreActivity extends Activity {
         sheet.setPadding(dp(PAD), dp(PAD), dp(PAD), dp(PAD));
         sheet.setBackground(glassSheet());
         // No elevation: a 16 dp shadow over the live Home behind costs this GPU more than the rim is worth.
-        // Inside the TV safe area (Apple: 60 pt top and bottom, 80 pt sides), so overscan never trims it.
-        FrameLayout.LayoutParams slp = new FrameLayout.LayoutParams(sheetWidth(), -1, Gravity.END);
+        // Inside the TV safe area (Apple: 60 pt top and bottom, 80 pt sides), so overscan never trims
+        // it, and only as tall as what's in it, like tvOS's.
+        FrameLayout.LayoutParams slp = new FrameLayout.LayoutParams(sheetWidth(), -2, Gravity.END | Gravity.TOP);
         slp.topMargin = dp(30);
-        slp.bottomMargin = dp(30);
         slp.rightMargin = dp(40);
         root.addView(sheet, slp);
+
+        // The time (or the page's name) and the date, with the round buttons beside them on the
+        // main page, as along the top of tvOS's Control Centre.
+        header = new LinearLayout(this);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        header.setClipChildren(false);
+        header.forceHasOverlappingRendering(false);  // fades as one alpha, without an off-screen pass
+        LinearLayout titles = new LinearLayout(this);
+        titles.setOrientation(LinearLayout.VERTICAL);
+        header.addView(titles, new LinearLayout.LayoutParams(0, -2, 1f));
+        buttons = new LinearLayout(this);
+        buttons.setClipChildren(false);
+        header.addView(buttons, new LinearLayout.LayoutParams(-2, -2));
+        sheet.addView(header, new LinearLayout.LayoutParams(-1, -2));
 
         heading = new TextView(this);
         heading.setTextColor(Color.WHITE);
         heading.setTypeface(Ui.font(this, "display"));
         Ui.textSize(heading, 24);
         heading.setLetterSpacing(-0.01f);
-        sheet.addView(heading);
+        titles.addView(heading);
         dateLine = new TextView(this);
         dateLine.setTextColor(0x99FFFFFF);
         dateLine.setTypeface(Ui.font(this, "medium"));
         Ui.textSize(dateLine, 11.5f);
+        dateLine.setSingleLine(true);  // beside the buttons now: one line, whatever the date
+        dateLine.setEllipsize(TextUtils.TruncateAt.END);
         dateLine.setText(new java.text.SimpleDateFormat("EEEE d MMMM", java.util.Locale.UK).format(new java.util.Date()));
-        sheet.addView(dateLine);
+        titles.addView(dateLine);
         body = new LinearLayout(this);
         body.setOrientation(LinearLayout.VERTICAL);
         body.setClipChildren(false);
@@ -94,7 +115,7 @@ public class ControlCentreActivity extends Activity {
         int room = dp(12);
         body.setPadding(room, room, room, room);
         body.setClipToPadding(false);
-        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(-1, 0, 1f);
+        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(-1, -2);
         blp.topMargin = dp(16) - room;
         blp.leftMargin = blp.rightMargin = blp.bottomMargin = -room;
         sheet.addView(body, blp);
@@ -146,6 +167,12 @@ public class ControlCentreActivity extends Activity {
     }
 
     @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        unwatch();
+    }
+
+    @Override
     public void finish() {
         MainActivity home = MainActivity.live.get();
         if (home != null) home.statusRow(true);
@@ -184,17 +211,17 @@ public class ControlCentreActivity extends Activity {
             if (dir != 0) {
                 body.setTranslationX(dp(36) * dir);
                 body.setAlpha(0f);
-                heading.setAlpha(0f);
+                header.setAlpha(0f);
                 // No off-screen layer: it's cut to the page's edges, which sliced the lifting button square.
                 body.animate().translationX(0).alpha(1f).setDuration(380).setInterpolator(MainActivity.EASE).start();
-                heading.animate().alpha(1f).setDuration(380).setInterpolator(MainActivity.EASE).start();
+                header.animate().alpha(1f).setDuration(380).setInterpolator(MainActivity.EASE).start();
             }
         };
         if (dir == 0 || body.getChildCount() == 0) {
             in.run();
             return;
         }
-        heading.animate().alpha(0f).setDuration(160).setInterpolator(MainActivity.EASE).start();
+        header.animate().alpha(0f).setDuration(160).setInterpolator(MainActivity.EASE).start();
         body.animate().translationX(-dp(36) * dir).alpha(0f).setDuration(170).setInterpolator(MainActivity.EASE)
                 .withEndAction(in).start();
     }
@@ -203,6 +230,18 @@ public class ControlCentreActivity extends Activity {
         onInputs = false;
         String now = new java.text.SimpleDateFormat("H:mm", java.util.Locale.UK).format(new java.util.Date());
         page(dir, now, true, () -> {
+            buttons.removeAllViews();
+            button("power", "Turn Off", v -> {
+                if (SleepReceiver.sleepNow(this)) finish();
+                else Perms.requestAdmin(this);
+            });
+            button("house", "Home", v -> {
+                open(new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME));
+                finish();
+            });
+            button("gear", "Settings", v -> open(new Intent(Settings.ACTION_SETTINGS)));
+            android.media.session.MediaController mc = nowPlaying();
+            if (mc != null) nowPlayingRow(mc);
             Tiles g = new Tiles(dp(TILE_W), dp(TILE_H), dp(GAP));
             if (!Inputs.list(this).isEmpty()) g.add("hdmi", "Inputs", null, v -> showInputs());
             g.add("picture", "Picture", null,
@@ -213,28 +252,8 @@ public class ControlCentreActivity extends Activity {
             g.add("bluetooth", "Bluetooth", null,
                     v -> open(tvSettings("com.android.tv.settings.ACCESSORIES_CONNECTED_DEVICES", Settings.ACTION_BLUETOOTH_SETTINGS)));
             g.add("timer", "Sleep Timer", this::timerState, v -> cycleSleepTimer());
-            g.add("sparkles", "Screen Saver", null, v -> open(screenSaver()));
+            g.add("sparkles", "Screen Saver", null, v -> open(screenSaver(this)));
             g.add("shelf", "Home Screen", null, v -> openSettings());
-
-            // Pinned to the bottom, under a hairline: three evenly spaced round buttons.
-            body.addView(new View(this), new LinearLayout.LayoutParams(1, 0, 1f));
-            View rule = new View(this);
-            rule.setBackgroundColor(0x1FFFFFFF);
-            LinearLayout.LayoutParams rl = new LinearLayout.LayoutParams(-1, Math.max(1, dp(0.5f)));
-            rl.bottomMargin = dp(11);
-            body.addView(rule, rl);
-            LinearLayout bottom = new LinearLayout(this);
-            bottom.setClipChildren(false);
-            body.addView(bottom, new LinearLayout.LayoutParams(-1, -2));
-            action(bottom, "power", "Turn Off", v -> {
-                if (SleepReceiver.sleepNow(this)) finish();
-                else Perms.requestAdmin(this);
-            });
-            action(bottom, "house", "Home", v -> {
-                open(new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME));
-                finish();
-            });
-            action(bottom, "gear", "Settings", v -> open(new Intent(Settings.ACTION_SETTINGS)));
             if (g.first != null) g.first.requestFocus();
         });
     }
@@ -247,11 +266,14 @@ public class ControlCentreActivity extends Activity {
     /** HDMI ports, AV and Live TV as tiles in the same panel. Back returns. */
     void showInputs() {
         onInputs = true;
+        sheet.setMinimumHeight(sheet.getHeight());  // the panel keeps its size from page to page
         page(1, "Inputs", false, this::inputTiles);
     }
 
     void inputTiles() {
         {
+            buttons.removeAllViews();
+            unwatch();
             Tiles g = new Tiles(dp(TILE_W), dp(TILE_H), dp(GAP));
             for (Inputs.Input in : Inputs.list(this)) {
                 g.add(Inputs.glyph(in), in.label, null, v -> {
@@ -263,16 +285,10 @@ public class ControlCentreActivity extends Activity {
         }
     }
 
-    /** A round glass button centred in one third of the row, so the three sit evenly spaced. */
-    void action(LinearLayout row, String glyph, String name, View.OnClickListener click) {
-        FrameLayout cell = new FrameLayout(this);
-        cell.setClipChildren(false);
-        LinearLayout holder = new LinearLayout(this);
-        holder.setClipChildren(false);
-        View b = circle(holder, dp(46), glyph, click);
-        b.setContentDescription(name);
-        cell.addView(holder, new FrameLayout.LayoutParams(-2, -2, Gravity.CENTER));
-        row.addView(cell, new LinearLayout.LayoutParams(0, dp(52), 1f));
+    /** A round glass button beside the time. */
+    void button(String glyph, String name, View.OnClickListener click) {
+        if (buttons.getChildCount() > 0) space(buttons, dp(10));
+        circle(buttons, dp(40), glyph, click).setContentDescription(name);
     }
 
     /** Lays tiles out two to a row in the panel body. */
@@ -325,9 +341,9 @@ public class ControlCentreActivity extends Activity {
     }
 
     /** The aerials straight away (tvOS Aerials), or Android's own "start screen saver" when it isn't installed. */
-    Intent screenSaver() {
+    static Intent screenSaver(Context c) {
         Intent aerials = new Intent().setClassName("app.glasshome.aerials", "app.glasshome.aerials.AerialActivity");
-        if (aerials.resolveActivity(getPackageManager()) != null) return aerials;
+        if (aerials.resolveActivity(c.getPackageManager()) != null) return aerials;
         return new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_DESK_DOCK)
                 .setClassName("com.android.systemui", "com.android.systemui.Somnambulator");
     }
@@ -423,7 +439,7 @@ public class ControlCentreActivity extends Activity {
         ImageView t = new ImageView(this);
         t.setBackground(white);
         t.setScaleType(ImageView.ScaleType.CENTER);
-        t.setImageBitmap(Glyphs.get(glyph, dp(22), Color.WHITE));
+        t.setImageBitmap(Glyphs.get(glyph, Math.round(s * 0.48f), Color.WHITE));
         t.setFocusable(true);
         t.setClickable(true);
         android.animation.ArgbEvaluator ev = new android.animation.ArgbEvaluator();
@@ -451,6 +467,187 @@ public class ControlCentreActivity extends Activity {
 
     void lift(View v, boolean has) {
         Glass.lift(v, has, 1.05f, 0);
+    }
+
+    // ---------------------------------------------------------------- now playing
+
+    /**
+     * What's playing, else what's paused; null when nothing is, or notification access is off.
+     * Some players (BBC iPlayer) keep a session open but never say what's on or whether it's
+     * playing: over an app, the most recent such session stands in, shown by the app's name.
+     */
+    android.media.session.MediaController nowPlaying() {
+        try {
+            android.media.session.MediaSessionManager m = getSystemService(android.media.session.MediaSessionManager.class);
+            List<android.media.session.MediaController> all =
+                    m.getActiveSessions(new android.content.ComponentName(this, MediaListener.class));
+            android.media.session.MediaController paused = null;
+            for (android.media.session.MediaController c : all) {
+                int st = state(c);
+                if (st == PlaybackState.STATE_PLAYING || st == PlaybackState.STATE_BUFFERING) return c;
+                if (st == PlaybackState.STATE_PAUSED && paused == null) paused = c;
+            }
+            if (paused != null || all.isEmpty() || MainActivity.onScreen) return paused;
+            return all.get(0);  // sessions come most recently active first
+        } catch (SecurityException e) {
+            return null;
+        }
+    }
+
+    static int state(android.media.session.MediaController c) {
+        PlaybackState s = c.getPlaybackState();
+        return s == null ? PlaybackState.STATE_NONE : s.getState();
+    }
+
+    /** The player being followed while the panel is open, and what it calls when it changes. */
+    android.media.session.MediaController watched;
+    android.media.session.MediaController.Callback watcher;
+
+    void unwatch() {
+        if (watched != null) watched.unregisterCallback(watcher);
+        watched = null;
+    }
+
+    /**
+     * Now Playing, as in tvOS's Control Centre: the artwork with the title and who it's by (or the
+     * app), which opens the app, and play/pause beside it. Both follow the player while it's open.
+     */
+    void nowPlayingRow(android.media.session.MediaController mc) {
+        LinearLayout row = new LinearLayout(this);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setClipChildren(false);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
+        lp.bottomMargin = dp(GAP);
+        body.addView(row, lp);
+
+        Glass white = glass(dp(20));
+        LinearLayout card = new LinearLayout(this);
+        card.setGravity(Gravity.CENTER_VERTICAL);
+        card.setBackground(white);
+        card.setPadding(dp(8), dp(8), dp(12), dp(8));
+        card.setFocusable(true);
+        card.setClickable(true);
+        int side = dp(TILE_H - 16);
+        ImageView art = new ImageView(this);
+        GradientDrawable well = new GradientDrawable();
+        well.setCornerRadius(dp(10));
+        well.setColor(0x29FFFFFF);
+        art.setBackground(well);
+        art.setClipToOutline(true);
+        art.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        card.addView(art, new LinearLayout.LayoutParams(side, side));
+        LinearLayout words = new LinearLayout(this);
+        words.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout.LayoutParams wp = new LinearLayout.LayoutParams(0, -2, 1f);
+        wp.leftMargin = dp(10);
+        card.addView(words, wp);
+        TextView title = label(12f, "semibold", "");
+        TextView by = label(10.5f, "regular", "");
+        by.setTextColor(0xA6FFFFFF);
+        words.addView(title);
+        words.addView(by);
+        android.animation.ArgbEvaluator ev = new android.animation.ArgbEvaluator();
+        white.tint = f -> {
+            title.setTextColor((int) ev.evaluate(f, Color.WHITE, 0xFF1C1C1E));
+            by.setTextColor((int) ev.evaluate(f, 0xA6FFFFFF, 0x991C1C1E));
+        };
+        card.setOnFocusChangeListener((v, has) -> {
+            Glass.focus(white, has);
+            lift(v, has);
+        });
+        card.setOnClickListener(v -> {
+            android.content.pm.PackageManager pm = getPackageManager();
+            Intent i = pm.getLeanbackLaunchIntentForPackage(mc.getPackageName());
+            if (i == null) i = pm.getLaunchIntentForPackage(mc.getPackageName());
+            if (i != null) open(i);
+        });
+        row.addView(card, new LinearLayout.LayoutParams(0, dp(TILE_H), 1f));
+        space(row, dp(GAP));
+        int button = dp(46);
+        ImageView toggle = (ImageView) circle(row, button, "pause", v -> {
+            int st = state(mc);
+            if (st == PlaybackState.STATE_PLAYING) mc.getTransportControls().pause();
+            else if (st == PlaybackState.STATE_PAUSED) mc.getTransportControls().play();
+            else {
+                // A player that doesn't say: the remote's own Play/Pause button, which it does answer.
+                mc.dispatchMediaButtonEvent(new KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE));
+                mc.dispatchMediaButtonEvent(new KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE));
+            }
+        });
+        toggle.setContentDescription("Play or Pause");
+
+        Runnable showState = () -> {
+            int st = state(mc);
+            String g = st == PlaybackState.STATE_PLAYING ? "pause" : st == PlaybackState.STATE_PAUSED ? "play" : "playpause";
+            toggle.setImageBitmap(Glyphs.get(g, Math.round(button * 0.48f), Color.WHITE));
+        };
+        Runnable showTrack = () -> {
+            String app = mc.getPackageName();
+            try {
+                android.content.pm.PackageManager pm = getPackageManager();
+                app = pm.getApplicationLabel(pm.getApplicationInfo(app, 0)).toString();
+            } catch (android.content.pm.PackageManager.NameNotFoundException ignored) {
+                // the package name will do
+            }
+            android.media.MediaMetadata md = mc.getMetadata();
+            android.media.MediaDescription d = md == null ? null : md.getDescription();
+            String t = d == null || d.getTitle() == null ? "" : d.getTitle().toString();
+            String s = d == null || d.getSubtitle() == null ? "" : d.getSubtitle().toString();
+            title.setText(t.isEmpty() ? app : t);
+            by.setText(t.isEmpty() ? "" : s.isEmpty() ? app : s);
+            Bitmap pic = d == null ? null : d.getIconBitmap();
+            if (pic == null) {
+                art.setScaleType(ImageView.ScaleType.FIT_CENTER);
+                art.setPadding(dp(8), dp(8), dp(8), dp(8));
+                try {
+                    art.setImageDrawable(getPackageManager().getApplicationIcon(mc.getPackageName()));
+                } catch (android.content.pm.PackageManager.NameNotFoundException ignored) {
+                    art.setImageDrawable(null);
+                }
+                return;
+            }
+            // Shrunk to the card's size off the main thread: players hand over full-size artwork.
+            int px = Math.round(side * 1.05f);
+            new Thread(() -> {
+                Bitmap small = square(pic, px);
+                art.post(() -> {
+                    if (!art.isAttachedToWindow()) return;
+                    art.setScaleType(ImageView.ScaleType.CENTER_CROP);
+                    art.setPadding(0, 0, 0, 0);
+                    art.setImageBitmap(small);
+                });
+            }).start();
+        };
+        showState.run();
+        showTrack.run();
+        unwatch();
+        watcher = new android.media.session.MediaController.Callback() {
+            @Override
+            public void onPlaybackStateChanged(PlaybackState s) {
+                showState.run();
+            }
+
+            @Override
+            public void onMetadataChanged(android.media.MediaMetadata m) {
+                showTrack.run();
+            }
+        };
+        watched = mc;
+        mc.registerCallback(watcher);
+    }
+
+    /** The middle square of a picture at s x s, halved in steps first so it shrinks cleanly. */
+    static Bitmap square(Bitmap src, int s) {
+        int side = Math.min(src.getWidth(), src.getHeight());
+        Bitmap cur = Bitmap.createBitmap(src, (src.getWidth() - side) / 2, (src.getHeight() - side) / 2, side, side);
+        while (cur.getWidth() > s * 2) {
+            Bitmap half = Bitmap.createScaledBitmap(cur, cur.getWidth() / 2, cur.getHeight() / 2, true);
+            if (cur != src) cur.recycle();
+            cur = half;
+        }
+        Bitmap out = Bitmap.createScaledBitmap(cur, s, s, true);
+        if (cur != src && cur != out) cur.recycle();
+        return out;
     }
 
     // ---------------------------------------------------------------- states

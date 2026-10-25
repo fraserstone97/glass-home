@@ -11,7 +11,8 @@ import android.view.accessibility.AccessibilityEvent;
 /**
  * Remote buttons that only the stock Google TV home answered (its GlobalKeyListener receiver), so
  * they do nothing once it is disabled: the app buttons open their apps again, and the Quick
- * Settings button opens Control Centre. Every other key passes straight through untouched.
+ * Settings button opens Control Centre. Home pressed twice opens the App Switcher. Every other
+ * key passes straight through untouched.
  * Turned on over ADB (enabled_accessibility_services); it reads nothing on screen.
  *
  * Trade-off on this TCL (G08, Android 14): while any key-filtering service is bound, the firmware
@@ -59,10 +60,40 @@ public class KeysService extends AccessibilityService {
             }
             return true;
         }
+        if (k == KeyEvent.KEYCODE_HOME) return home(e);
         String target = KEYS.get(k);
         if (target == null) return false;
         if (e.getAction() == KeyEvent.ACTION_DOWN && e.getRepeatCount() == 0) open(target);
         return true;
+    }
+
+    /** How soon a second Home press has to follow the first to count as pressing it twice. */
+    static final long TWICE_MS = 400;
+    /** When Home was last let go. */
+    long homeUp;
+    /** The second press of a double press: kept from the system, along with its release. */
+    boolean homeTwice;
+
+    /**
+     * Home pressed twice quickly opens the App Switcher, as on Apple TV. The first press is Home as
+     * always, never held back waiting for a second, so Home stays instant; only the second is taken.
+     */
+    boolean home(KeyEvent e) {
+        if (e.getAction() == KeyEvent.ACTION_DOWN) {
+            if (e.getRepeatCount() == 0 && e.getDownTime() - homeUp < TWICE_MS) {
+                homeTwice = true;
+                startActivity(new Intent(this, MainActivity.class).putExtra("panel", "switcher")
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+            }
+            return homeTwice;
+        }
+        if (homeTwice) {
+            homeTwice = false;
+            homeUp = 0;  // a third press is Home again, which closes it
+            return true;
+        }
+        homeUp = e.getEventTime();
+        return false;
     }
 
     /** D-pad, volume, media and the like: not worth a log line on every press. */

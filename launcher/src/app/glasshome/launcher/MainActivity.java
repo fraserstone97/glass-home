@@ -91,8 +91,19 @@ public class MainActivity extends Activity {
             "org.videolan.vlc");
 
     static final PathInterpolator EASE = new PathInterpolator(0.2f, 0f, 0f, 1f);
-    /** Carousel cross-dissolve: a soft start and a long settle, like the Apple TV Top Shelf. */
+    /** The carousel's motion and the apps' glass: a soft start and a long settle, like the Apple TV Top Shelf. */
     static final PathInterpolator HERO_EASE = new PathInterpolator(0.25f, 0.1f, 0.1f, 1f);
+    /**
+     * The carousel's fade from one picture to the next: a soft start and a gentle landing, half
+     * done in about a fifth of a second (an even fade over a second read as slow).
+     */
+    static final PathInterpolator DISSOLVE = new PathInterpolator(0.3f, 0f, 0.2f, 1f);
+    static final long DISSOLVE_MS = 650;
+    /**
+     * How far the old and new pictures pan together through a dissolve, as a fraction of the
+     * screen. They're drawn this much bigger on each side, so the pan never shows an edge.
+     */
+    static final float HERO_PAN = 0.02f;
     /** tvOS focused icon is ~1.2x its resting size (303x183 vs 248x148 px in Apple's reference). */
     static final float FOCUS_SCALE = 1.2f;
     /** Focus lift: a damped spring (about 5% overshoot, settled well before the end), like tvOS. */
@@ -132,8 +143,16 @@ public class MainActivity extends Activity {
 
     FrameLayout root;
     ImageView wallView;
-    /** Top shelf carousel: two crossfading backdrops + info panel. */
-    ImageView heroBack, heroFront;
+    /**
+     * Top shelf carousel: crossfading backdrops + info panel. heroFront is the newest picture,
+     * heroBack the one it fades in over; heroUnder is a third, so a press mid-fade carries on from
+     * the blend on screen instead of jumping to one picture.
+     */
+    ImageView heroUnder, heroBack, heroFront;
+
+    ImageView[] heroLayers() {
+        return new ImageView[]{heroUnder, heroBack, heroFront};
+    }
     FrameLayout shelfView;
     LinearLayout heroInfo, heroDots;
     /** The dots themselves, inside heroDots (which moves and fades the whole indicator). */
@@ -265,7 +284,7 @@ public class MainActivity extends Activity {
             switch (perf) {
                 case "weather": weatherCard.setVisibility(View.GONE); break;
                 case "status": clockBox.setVisibility(View.GONE); break;
-                case "hero": heroFront.setVisibility(View.GONE); heroBack.setVisibility(View.GONE); break;
+                case "hero": for (ImageView v : heroLayers()) v.setVisibility(View.GONE); break;
                 case "dockglass": if (dockRow != null) dockRow.setBackground(null); break;
                 case "shadows": for (View t : tiles) t.setElevation(0); break;
                 default: recreate(); break;
@@ -279,12 +298,16 @@ public class MainActivity extends Activity {
             if (panel.equals("cc")) openControlCentre();
             else if (panel.equals("inputs")) openInputs();
             else if (panel.equals("weather")) showWeather();
+            else if (panel.equals("switcher") && switcher == null) AppSwitcher.open(this);  // Home twice (KeysService)
             return;
         }
         if (idle) exitIdle();
         resetIdle();
-        // Home always lands on the first app in the dock: close any overlay first
-        // (Control Center, Inputs, weather forecast, menus, move mode, folder).
+        // Home lands on the card of the app you just left, as on Apple TV (in the dock, the grid
+        // or the folder), else on the first app in the dock. Close any overlay first (Control
+        // Center, Inputs, weather forecast, menus, move mode, folder).
+        int back = away && appOpened && openedKey != null ? indexOfKey(openedKey) : -1;
+        if (switcher != null) switcher.close();
         if (pickerLayer != null) {
             popoverReturn = null;
             FrameLayout l = pickerLayer;
@@ -296,14 +319,15 @@ public class MainActivity extends Activity {
         closeMenu();
         // Home pressed while already on the home screen: jump back to the top of the home grid.
         if (moveIndex >= 0) endMove();
-        if (folderMode) {
+        if (back >= 0) {
+            focusIndex(back);
+        } else if (folderMode) {
             folderMode = false;
             weatherCard.setAlpha(weatherAlpha());
             buildGrid();
             scroll.scrollTo(0, 0);
             focusIndex(0);
         } else {
-            closeMenu();
             goTop();
         }
     }
@@ -329,12 +353,21 @@ public class MainActivity extends Activity {
     protected void onStop() {
         super.onStop();
         onScreen = false;
+        away = true;
+        if (switcher != null) switcher.dismissNow();
     }
+
+    /** The App Switcher while it's up (Home pressed twice). */
+    AppSwitcher switcher;
+
+    /** Home went out of sight (an app in front) and hasn't been back in front since. */
+    boolean away;
 
     @Override
     protected void onResume() {
         super.onResume();
         resumed = true;
+        away = false;
         KeysService.ensureOn(this);
         String ws = Profiles.homePrefs(this).getString("wallpaper", "night");
         if (!ws.equals(wallStyle)) {
@@ -380,6 +413,9 @@ public class MainActivity extends Activity {
     /** An app was opened from Home and hasn't come back yet. */
     boolean appOpened;
 
+    /** The app last opened from Home: pressing Home in it comes back to its card. */
+    String openedKey;
+
     /** Settings to open as soon as Home is in front again (asked for in Control Centre). */
     static boolean settingsNext;
 
@@ -401,6 +437,12 @@ public class MainActivity extends Activity {
     /** What Home refreshes when it comes back: the carousel and weather, and the minute timer. */
     final Runnable resumeWork = () -> {
         if (!resumed) return;
+        if (switcher != null) {
+            // The App Switcher opened over Home as it came back: the carousel and weather refresh
+            // once it's gone, not while its cards are rising.
+            handler.postDelayed(this.resumeWork, 500);
+            return;
+        }
         loadHero();
         updateWeather();
         resetIdle();  // the return clears pending callbacks, the idle timer among them
@@ -447,8 +489,10 @@ public class MainActivity extends Activity {
         setWallpaper(wallStyle);
         root.addView(wallView, match());
 
+        heroUnder = heroLayer();
         heroBack = heroLayer();
         heroFront = heroLayer();
+        root.addView(heroUnder, match());
         root.addView(heroBack, match());
         root.addView(heroFront, match());
         // As on tvOS: with the apps open, the last picture from the carousel stays behind them as
@@ -999,7 +1043,11 @@ public class MainActivity extends Activity {
      */
     Bitmap tileArt(Drawable d) {
         if (d == null || tileW <= 0) return null;
-        int w = Math.round(tileW * FOCUS_SCALE), h = Math.round(tileH * FOCUS_SCALE);
+        return art(d, Math.round(tileW * FOCUS_SCALE), Math.round(tileH * FOCUS_SCALE));
+    }
+
+    /** Art cropped to w x h from the middle, as a tile shows it (the App Switcher's cards too). */
+    static Bitmap art(Drawable d, int w, int h) {
         Bitmap src;
         if (d instanceof BitmapDrawable && ((BitmapDrawable) d).getBitmap() != null) {
             src = ((BitmapDrawable) d).getBitmap();
@@ -1731,6 +1779,8 @@ public class MainActivity extends Activity {
     ImageView heroLayer() {
         ImageView v = new ImageView(this);
         v.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        v.setScaleX(1f + 2f * HERO_PAN);
+        v.setScaleY(1f + 2f * HERO_PAN);
         v.setAlpha(0f);
         return v;
     }
@@ -2020,28 +2070,48 @@ public class MainActivity extends Activity {
         boolean glassy = !show && heroDrawer != null;
         glassTo((show || glassy) && heroBlur != null ? heroBlur : wallBlur, show ? 480 : 420);
         float a = show ? 1f : 0f;
-        if (!show || drawerBack.getAlpha() > 0f) wallView.setVisibility(View.VISIBLE);
-        // The apps open over the carousel's picture as blurred glass; closing them, it clears.
         drawerBack.animate().cancel();
-        if (glassy) drawerBack.setImageBitmap(heroDrawer);
-        drawerBack.animate().alpha(glassy ? 1f : 0f).setDuration(show ? 420 : 560).setInterpolator(HERO_EASE).withEndAction(() -> {
-            // Fully over the wallpaper: the wallpaper needn't be drawn underneath it.
-            if (!heroShown && drawerBack.getAlpha() >= 1f) wallView.setVisibility(View.INVISIBLE);
-        }).start();
-        heroFront.animate().cancel();
-        heroFront.animate().alpha(a).setDuration(show ? 480 : 420).setInterpolator(HERO_EASE).withEndAction(() -> {
-            if (heroShown && heroFront.getAlpha() >= 1f) wallView.setVisibility(View.INVISIBLE);
-        }).start();
+        if (glassy) {
+            // The apps open over the carousel's picture as blurred glass that fades in over it. The
+            // picture stays solid underneath until it's covered: fading it out at the same time let
+            // the wallpaper show through mid-way, and the screen brightened.
+            drawerBack.setImageBitmap(heroDrawer);
+            drawerBack.animate().alpha(1f).setDuration(560).setInterpolator(HERO_EASE).withEndAction(() -> {
+                if (heroShown || drawerBack.getAlpha() < 1f) return;
+                // Fully covered: the pictures and the wallpaper needn't be drawn underneath.
+                for (ImageView v : heroLayers()) hideHeroLayer(v);
+                wallView.setVisibility(View.INVISIBLE);
+            }).start();
+        } else if (show && drawerBack.getAlpha() > 0f) {
+            // Back from the apps: the picture goes back solid under the glass, which clears off it.
+            for (ImageView v : heroLayers()) if (v != heroFront) hideHeroLayer(v);
+            heroFront.animate().cancel();
+            heroFront.setTranslationX(0);
+            heroFront.setAlpha(1f);
+            wallView.setVisibility(View.INVISIBLE);
+            drawerBack.animate().alpha(0f).setDuration(420).setInterpolator(HERO_EASE).start();
+        } else {
+            // No glass (no picture for it yet): the carousel and the wallpaper crossfade.
+            wallView.setVisibility(View.VISIBLE);
+            drawerBack.animate().alpha(0f).setDuration(420).setInterpolator(HERO_EASE).start();
+            heroFront.animate().cancel();
+            heroFront.animate().alpha(a).setDuration(show ? 480 : 420).setInterpolator(HERO_EASE).withEndAction(() -> {
+                if (heroShown && heroFront.getAlpha() >= 1f) wallView.setVisibility(View.INVISIBLE);
+            }).start();
+            for (ImageView v : heroLayers()) {
+                if (v != heroFront) v.animate().alpha(0f).setDuration(show ? 480 : 420).setInterpolator(HERO_EASE).start();
+            }
+        }
 
         // Leaving for the apps: the title and dots go at once, before the rows slide over them;
         // coming back: they return after the artwork has settled.
+        flushHeroInfo();
         heroInfo.animate().cancel();
         heroDots.animate().cancel();
         heroInfo.animate().withLayer().alpha(a).translationY(heroInfoY).setStartDelay(show ? 160 : 0).setDuration(show ? 420 : 140)
                 .setInterpolator(EASE).start();
         heroDots.animate().alpha(a).translationY(heroDotsY).setStartDelay(show ? 160 : 0).setDuration(show ? 420 : 140).setInterpolator(EASE).start();
         chevron.animate().alpha(1f - a).setDuration(show ? 140 : 420).setInterpolator(EASE).start();
-        heroBack.animate().alpha(0f).setDuration(show ? 480 : 420).setInterpolator(HERO_EASE).start();
         handler.removeCallbacks(heroAdvance);
         if (show) scheduleAdvance();
     }
@@ -2058,6 +2128,10 @@ public class MainActivity extends Activity {
      * picture itself dissolves in, instead of switching the moment the dissolve begins.
      */
     void glassTo(Bitmap to, long ms) {
+        glassTo(to, ms, HERO_EASE);
+    }
+
+    void glassTo(Bitmap to, long ms, android.animation.TimeInterpolator curve) {
         if (glassAnim != null) glassAnim.cancel();
         Bitmap from = glassBg;
         if (to == null || from == null || from == to || ms <= 0 || from.isRecycled()
@@ -2081,7 +2155,7 @@ public class MainActivity extends Activity {
         glassBg = glassMixed;
         glassAnim = ValueAnimator.ofFloat(0f, 1f);
         glassAnim.setDuration(ms);
-        glassAnim.setInterpolator(HERO_EASE);
+        glassAnim.setInterpolator(curve);
         glassAnim.addUpdateListener(a -> {
             int k = Math.round((float) a.getAnimatedValue() * 256), j = 256 - k;
             for (int i = 0; i < n; i++) {
@@ -2108,15 +2182,19 @@ public class MainActivity extends Activity {
         glassAnim.start();
     }
 
-    /** tvOS's app-drawer backdrop: the picture blurred right down, colour kept and lifted, then dimmed. */
+    /**
+     * tvOS's app-drawer backdrop: the picture as it's shown (shades and all) blurred right down,
+     * colour kept and lifted, and darker: the blur spreads a bright middle into the shaded top,
+     * which at 85% left the top of the screen lighter than the picture it covered.
+     */
     static Bitmap drawerGlass(Bitmap src) {
         if (src == null || src.isRecycled()) return null;
         Bitmap soft = Ui.blur(src, 240, 135, 6, 3);
         if (soft == null) return null;
         android.graphics.ColorMatrix cm = new android.graphics.ColorMatrix();
-        cm.setSaturation(1.3f);
+        cm.setSaturation(1.2f);
         cm.postConcat(new android.graphics.ColorMatrix(new float[]{
-                0.56f, 0, 0, 0, 0, 0, 0.56f, 0, 0, 0, 0, 0, 0.56f, 0, 0, 0, 0, 0, 1, 0}));
+                0.75f, 0, 0, 0, 0, 0, 0.75f, 0, 0, 0, 0, 0, 0.75f, 0, 0, 0, 0, 0, 1, 0}));
         Bitmap out = Bitmap.createBitmap(240, 135, Bitmap.Config.ARGB_8888);
         Paint p = new Paint(Paint.FILTER_BITMAP_FLAG | Paint.DITHER_FLAG);
         p.setColorFilter(new android.graphics.ColorMatrixColorFilter(cm));
@@ -2128,7 +2206,7 @@ public class MainActivity extends Activity {
     void scheduleAdvance() {
         handler.removeCallbacks(heroAdvance);
         int sec = Suggestions.advanceSeconds(this);
-        if (sec > 0 && heroShown && resumed) handler.postDelayed(heroAdvance, sec * 1000L);
+        if (sec > 0 && heroShown && resumed && switcher == null) handler.postDelayed(heroAdvance, sec * 1000L);
     }
 
     void heroStep(int dir, boolean user) {
@@ -2202,15 +2280,15 @@ public class MainActivity extends Activity {
         int want = index;
         io.execute(() -> {
             Bitmap raw = Suggestions.image(this, it.backdrop, "w1280", screenW);
-            Bitmap drawer = drawerGlass(raw);  // before bakeScrims, which reuses raw
             Bitmap bd = bakeScrims(raw);
+            Bitmap drawer = drawerGlass(bd);
             Bitmap bdBlur = Ui.glassBackdrop(bd, 160, 90);
             // On the GPU now, in the background, so the dissolve doesn't stall on the upload.
             Bitmap shown = Suggestions.onGpu(bd);
             if (bdBlur != null) bdBlur.prepareToDraw();
             if (drawer != null) drawer.prepareToDraw();
             String logoPath = Suggestions.logoFor(this, it);
-            Bitmap logo = logoPath.isEmpty() ? null : Suggestions.image(this, logoPath, "w500", 500);
+            Bitmap logo = Suggestions.onGpu(logoPath.isEmpty() ? null : Suggestions.image(this, logoPath, "w500", 500));
             handler.post(() -> {
                 if (heroIndex != want || heroItems.isEmpty()) return;
                 applyHeroInfo(it, logo, dir);
@@ -2219,14 +2297,45 @@ public class MainActivity extends Activity {
                 if (bdBlur != null) {
                     heroBlur = bdBlur;
                     // The glass changes colour with the dissolve, not ahead of it.
-                    if (heroShown) glassTo(heroBlur, dir == 0 ? 0 : 820);
+                    if (heroShown) glassTo(heroBlur, dir == 0 ? 0 : DISSOLVE_MS, DISSOLVE);
                 }
             });
         });
     }
 
-    /** Title/meta/overview for an item, applied in the same frame as its artwork. */
+    /** The next title, waiting for the old one to fade out; put in at once if that fade is cut short. */
+    Runnable heroInfoNext;
+
+    void flushHeroInfo() {
+        Runnable r = heroInfoNext;
+        heroInfoNext = null;
+        if (r != null) r.run();
+    }
+
+    /**
+     * Title/meta/overview for an item, with its artwork. Changing slides, the old title fades and
+     * drifts off before the new one glides in from the side you pressed, like the artwork (swapped
+     * in one frame, the title cut while the picture faded).
+     */
     void applyHeroInfo(Suggestions.Item it, Bitmap logo, int dir) {
+        if (!heroShown || dir == 0) {
+            heroInfoNext = null;
+            fillHeroInfo(it, logo);
+            return;
+        }
+        int slide = dir == 2 ? 0 : dir;
+        heroInfoNext = () -> fillHeroInfo(it, logo);
+        heroInfo.animate().cancel();
+        heroInfo.animate().withLayer().alpha(0f).translationX(-dp(10) * slide).translationY(heroInfoY)
+                .setStartDelay(0).setDuration(heroInfo.getAlpha() > 0f ? 160 : 0).setInterpolator(EASE).withEndAction(() -> {
+                    flushHeroInfo();
+                    heroInfo.setTranslationX(dp(18) * slide);
+                    heroInfo.animate().withLayer().alpha(1f).translationX(0).translationY(heroInfoY)
+                            .setStartDelay(30).setDuration(520).setInterpolator(HERO_EASE).start();
+                }).start();
+    }
+
+    void fillHeroInfo(Suggestions.Item it, Bitmap logo) {
         if (shelfView.isFocused()) {
             heroButton.setVisibility(View.VISIBLE);
             heroButton.setAlpha(1f);
@@ -2265,14 +2374,6 @@ public class MainActivity extends Activity {
             heroLogo.setVisibility(View.VISIBLE);
             heroTitle.setVisibility(View.GONE);
         }
-        if (heroShown && dir != 0) {
-            // Text glides in from the side you pressed, like the artwork.
-            heroInfo.animate().cancel();
-            heroInfo.setTranslationY(heroInfoY);
-            heroInfo.setAlpha(0f);
-            heroInfo.setTranslationX(dir == 2 ? 0 : dp(18) * dir);
-            heroInfo.animate().withLayer().alpha(1f).translationX(0).setDuration(680).setStartDelay(60).setInterpolator(HERO_EASE).start();
-        }
     }
 
     /** Apps' icons and whether they're installed, asked on every slide: kept until an app changes. */
@@ -2298,25 +2399,39 @@ public class MainActivity extends Activity {
     }
 
     /**
-     * Artwork transition (tvOS carousel): the new image slides in from the side you pressed and
-     * fades up over the old one, which drifts the other way and fades out.
+     * Artwork transition (tvOS carousel): the new image fades up over the old one while both pan
+     * a little together towards the side you pressed, as one movement.
      */
     void crossfadeHero(Bitmap bd, int dir) {
-        ImageView next = heroBack;
+        ImageView next = heroUnder;
+        if (next.getAlpha() > 0f && heroBack.getAlpha() < 1f) {
+            // A third press mid-fade: the oldest picture is needed for the new one, so the one
+            // above it takes its place (a picture for a picture, never a dip to dark).
+            heroBack.animate().cancel();
+            heroBack.setAlpha(1f);
+        }
+        heroUnder = heroBack;
         heroBack = heroFront;
         heroFront = next;
         ImageView old = heroBack;
         next.animate().cancel();
         next.setImageBitmap(bd);
-        float target = heroShown ? 1f : 0f;
         if (dir == 0 || !heroShown) {
             next.setTranslationX(0);
-            next.setAlpha(target);
-            old.setAlpha(0f);
+            next.setAlpha(heroShown ? 1f : 0f);
+            // Behind the apps' glass while it's still fading in, the pictures stay as they are
+            // (the glass hides them once it covers them).
+            if (heroShown || drawerBack.getAlpha() >= 1f) {
+                hideHeroLayer(old);
+                hideHeroLayer(heroUnder);
+            }
             return;
         }
-        // The new artwork dissolves in on top while the old one stays solid underneath (no dip to
-        // dark mid-way, one blend per frame), both drifting a little with the direction pressed.
+        // The new artwork dissolves in on top while what was on screen stays as it is underneath:
+        // a picture still fading in stops where it is (no jump to one picture, no dip to dark
+        // mid-way, one blend per frame). Both pan the same distance on the same curve: the old
+        // one panning by half as much as the new one made the picture seem to jolt back as the
+        // new one took over.
         // No GPU layers: a picture alone fades as cheaply without one, and building one made the
         // TV render (and upload) the whole new picture again in the frame the dissolve began.
         ViewGroup layer = (ViewGroup) next.getParent();
@@ -2326,16 +2441,24 @@ public class MainActivity extends Activity {
             layer.addView(next, layer.indexOfChild(old) + 1);
         }
         int slide = dir == 2 ? 0 : dir;  // 2: a shelf change dissolves in place
-        next.setTranslationX(screenW * 0.05f * slide);
+        float max = screenW * HERO_PAN, pan = max * slide;
+        next.setTranslationX(pan);
         next.setAlpha(0f);
-        next.animate().translationX(0).alpha(1f).setDuration(820).setInterpolator(HERO_EASE).start();
-        old.animate().cancel();
-        old.setAlpha(1f);
-        old.animate().translationX(-screenW * 0.025f * slide).setDuration(820).setInterpolator(HERO_EASE)
+        next.animate().translationX(0).alpha(1f).setStartDelay(0).setDuration(DISSOLVE_MS).setInterpolator(DISSOLVE)
                 .withEndAction(() -> {
-                    old.setAlpha(0f);
-                    old.setTranslationX(0);
+                    // Fully over: what's underneath needn't be drawn.
+                    for (ImageView v : heroLayers()) if (v != next) hideHeroLayer(v);
+                    if (heroShown) wallView.setVisibility(View.INVISIBLE);
                 }).start();
+        old.animate().cancel();
+        old.animate().translationX(Math.max(-max, Math.min(max, old.getTranslationX() - pan))).setStartDelay(0)
+                .setDuration(DISSOLVE_MS).setInterpolator(DISSOLVE).start();
+    }
+
+    void hideHeroLayer(ImageView v) {
+        v.animate().cancel();
+        v.setAlpha(0f);
+        v.setTranslationX(0);
     }
 
     /** Carousel focused: the dock slides away and the artwork takes the whole screen (tvOS Top Shelf). */
@@ -2499,6 +2622,7 @@ public class MainActivity extends Activity {
             Bundle opts = ActivityOptions.makeScaleUpAnimation(tile, 0, 0, w, h).toBundle();
             startActivity(a.launch, opts);
             appOpened = true;
+            openedKey = a.key;
         } catch (ActivityNotFoundException | SecurityException e) {
             toast("Can't open " + a.label);
         }
@@ -2649,6 +2773,7 @@ public class MainActivity extends Activity {
         }
         resetIdle();
         navSound(this, ev);
+        if (switcher != null) return switcher.key(ev) || super.dispatchKeyEvent(ev);
         if (pickerLayer != null && menuLayer == null) {
             int pk = ev.getKeyCode();
             boolean pd = ev.getAction() == KeyEvent.ACTION_DOWN;
@@ -2696,14 +2821,22 @@ public class MainActivity extends Activity {
             return true;
         }
         if (k == KeyEvent.KEYCODE_BACK) {
-            if (!down) {
+            // Only a press that started here: the release of a Back that closed an app or the
+            // screen saver isn't one.
+            if (down && ev.getRepeatCount() == 0) backDownAt = ev.getDownTime();
+            if (!down && ev.getDownTime() == backDownAt) {
                 if (folderMode) exitFolder();
+                // On the first app in the dock, as on Apple TV: the screen saver, straight away.
+                else if (tiles.indexOf(getCurrentFocus()) == 0) Suggestions.start(this, ControlCentreActivity.screenSaver(this));
                 else goTop();
             }
             return true;
         }
         return super.dispatchKeyEvent(ev);
     }
+
+    /** When the Back being pressed went down. */
+    long backDownAt;
 
     // ---------------------------------------------------------------- apps
 
@@ -3178,7 +3311,7 @@ public class MainActivity extends Activity {
      */
     void enterIdle() {
         if (idle || !resumed || heroItems.isEmpty() || folderMode
-                || pickerLayer != null || menuLayer != null || moveIndex >= 0) {
+                || pickerLayer != null || menuLayer != null || moveIndex >= 0 || switcher != null) {
             resetIdle();
             return;
         }

@@ -23,10 +23,11 @@ Android 7 or newer.
   to that app's own titles. Leave it alone and it goes full screen, then the screen saver takes over.
 - **Liquid Glass everywhere.** The dock, Control Centre, the weather and clock are glass that takes
   its colour from the picture behind it, with spring motion on every focus change.
-- **Apps open out of their tile**, the way they do on Apple TV.
-- **Control Centre** (the gear, or your remote's Quick Settings button, from any app): inputs,
-  picture, sound, Wi-Fi, Bluetooth, sleep timer, screen saver and Glass Home's settings, as a glass
-  panel over whatever you're watching.
+- **Apps open out of their tile**, the way they do on Apple TV, and Home brings you back to the
+  app you left. Press Home twice for the **App Switcher**: your recent apps as big cards.
+- **Control Centre** (the gear, or your remote's Quick Settings button, from any app): what's
+  playing, with play and pause, then inputs, picture, sound, Wi-Fi, Bluetooth, sleep timer, screen
+  saver and Glass Home's settings, as a glass panel over whatever you're watching.
 - **Search that understands you.** Type, or hold the mic button and ask the way you'd ask a
   person: *slow horses*, *films like Inception*, *comedies with Will Ferrell*, *films directed by
   Greta Gerwig*, *documentaries about space*, *80s films*, *kids films*, *what's new on Netflix*,
@@ -133,6 +134,8 @@ your household uses? Point it at [`PROMPT.md`](PROMPT.md).
   dock.
 - **Hide an app:** hold OK, choose **Hide**. Hidden apps live in the *More Apps* folder.
 - **Control Centre:** the gear at the top right, or your remote's Quick Settings button.
+- **App Switcher:** press Home twice quickly. Left and right, OK to go back into an app.
+- **Screen saver now:** on the first app in the dock, press Back.
 - **Glass Home's settings:** Control Centre › Home Screen. Top Shelf (which services, films or
   series), Weather, Home Screen (wallpaper, sounds, full screen when idle), Screen Saver (which one,
   when it starts, when the TV turns off), and more.
