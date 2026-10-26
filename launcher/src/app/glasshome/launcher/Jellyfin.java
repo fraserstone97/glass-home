@@ -21,7 +21,7 @@ import java.util.List;
 import java.util.Set;
 
 /**
- * Your own Jellyfin server as Wholphin's top shelf: what's new in your library, opened straight
+ * Your own Jellyfin server as Wholphin's top shelf: your library shuffled, opened straight
  * in Wholphin. The server is found on the network by Jellyfin's own discovery
  * broadcast, and signed in with Quick Connect (a code approved in Jellyfin), so no password or key
  * is ever typed on the TV. Settings -> Jellyfin.
@@ -260,9 +260,9 @@ final class Jellyfin {
     }
 
     /**
-     * Fetches the shelf: what's new in your library, one card per film or series. Nothing you're
-     * part-way through: the shelf is for finding something. Off the main thread. A moved server
-     * is found again.
+     * Fetches the shelf: films and series picked at random from your library, a new draw each
+     * time it's fetched, one card per film or series. Off the main thread. A moved server is found
+     * again.
      */
     static List<Suggestions.Item> refresh(Context c) {
         if (!connected(c)) return null;
@@ -316,8 +316,9 @@ final class Jellyfin {
         String fields = "&Fields=Overview,Genres,ProductionYear,ParentBackdropItemId,ParentBackdropImageTags,BackdropImageTags,ImageTags"
                 + "&EnableImageTypes=Backdrop,Logo";
         Set<String> seen = new HashSet<>();
-        // A few more than are shown, as titles without a backdrop are skipped.
-        add(c, call(c, "GET", "/Users/" + u + "/Items/Latest?Limit=16&IncludeItemTypes=Movie,Series" + fields, null),
+        // Only titles with a backdrop to show behind them; a few more than are shown all the same.
+        add(c, call(c, "GET", "/Users/" + u + "/Items?Recursive=true&SortBy=Random&ImageTypes=Backdrop&Limit=16"
+                + "&IncludeItemTypes=Movie,Series" + fields, null),
                 out, seen);
     }
 
