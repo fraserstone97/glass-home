@@ -7,24 +7,31 @@ import android.graphics.LinearGradient;
 import android.graphics.Paint;
 import android.graphics.RectF;
 import android.graphics.Shader;
+import android.graphics.Typeface;
 import android.view.View;
 
 /**
  * Weather drawn on a glass surface, in Apple Weather's layout.
- * Compact: the overview under the status row - place, icon, temperature, condition, high/low and
- * five small day columns. Full: the forecast opened from it - a centred header, the next hours
- * and a 5-day list with temperature range bars coloured from cool blue to hot red.
+ * Compact: a pill in the top-left corner, level with the clock, with the icon, temperature and
+ * condition. Full: the forecast opened from it - a centred header, the next hours (with the chance
+ * of rain, sunrise and sunset) and a 5-day list whose range bars are cut from Apple's fixed
+ * temperature gradient.
  */
 final class WeatherView extends View {
-    static final float COMPACT_W = 120, COMPACT_H = 34, FULL_W = 380, FULL_H = 456;
+    static final float COMPACT_H = 34, FULL_W = 380, FULL_H = 476;
+    private static final int RAIN = 0xFF3CD3FE;  // Apple's systemCyan, as the drops
 
     final boolean full;
     final float u;
     Weather.Data data;
     private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.SUBPIXEL_TEXT_FLAG);
     private final Paint bar = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final android.graphics.Typeface regular, medium, semibold;
+    private final Typeface regular, medium, semibold;
     private final RectF r = new RectF();
+    // The 5-day bars' gradients, made once for each forecast rather than on every draw.
+    private final Shader[] ranges = new Shader[5];
+    private Weather.Data rangesFor;
+    private float rangesW;
 
     WeatherView(Context c, boolean full, float unit) {
         super(c);
@@ -36,9 +43,19 @@ final class WeatherView extends View {
     }
 
     void setData(Weather.Data d) {
+        if (d == data) return;
+        Weather.Data was = data;
         data = d;
-        if (!full) requestLayout();
-        invalidate();
+        if (full) {
+            invalidate();
+            return;
+        }
+        // The pill shows only the icon, temperature and condition: a new forecast that leaves them
+        // as they were costs no layout pass over Home and no redraw.
+        if (was == null || d == null || was.temp != d.temp || was.code != d.code || was.day != d.day) {
+            requestLayout();
+            invalidate();
+        }
     }
 
     /** The compact pill is as wide as its contents, with even margins. */
@@ -48,7 +65,7 @@ final class WeatherView extends View {
             super.onMeasure(ws, hs);
             return;
         }
-        float w = COMPACT_W * u;
+        float w = 0;
         if (data != null) {
             w = 13 * u + 22 * u + 7 * u + measure(data.temp + "\u00b0", 16, medium) + 8 * u
                     + measure(Weather.describe(data.code, data.day), 14, medium) + 15 * u;
@@ -56,7 +73,7 @@ final class WeatherView extends View {
         setMeasuredDimension(Math.round(w), View.MeasureSpec.getSize(hs));
     }
 
-    private float measure(String s, float size, android.graphics.Typeface tf) {
+    private float measure(String s, float size, Typeface tf) {
         p.setTypeface(tf);
         p.setTextSize(size * u);
         return p.measureText(s);
@@ -64,10 +81,7 @@ final class WeatherView extends View {
 
     @Override
     protected void onDraw(Canvas c) {
-        if (data == null) {
-            text(c, "Loading\u2026", getWidth() / 2f, getHeight() / 2f + 5 * u, 13, medium, 0.7f, Paint.Align.CENTER);
-            return;
-        }
+        if (data == null) return;
         if (full) drawFull(c);
         else drawCompact(c);
     }
@@ -79,7 +93,7 @@ final class WeatherView extends View {
     private void drawCompact(Canvas c) {
         Weather.Data d = data;
         float h = getHeight(), pad = 13 * u, is = 22 * u;
-        icon(c, d.code, d.day, pad, (h - is) / 2f, is);
+        icon(c, WeatherIcons.symbol(d.code, d.day), pad, (h - is) / 2f, is);
         float tx = pad + is + 7 * u, base = h / 2f + 5.6f * u;  // the clock's text sits the same way
         float tw = text(c, d.temp + "\u00b0", tx, base, 16, medium, 1f, Paint.Align.LEFT);
         text(c, Weather.describe(d.code, d.day), tx + tw + 8 * u, base, 14, medium, 0.75f, Paint.Align.LEFT);
@@ -105,7 +119,15 @@ final class WeatherView extends View {
             Weather.Hour h = d.hours.get(i);
             float hx = x0 + hw * (i + 0.5f);
             text(c, h.label, hx, y + 27 * u, 12, semibold, i == 0 ? 1f : 0.8f, Paint.Align.CENTER);
-            icon(c, h.code, h.day, hx - 13 * u, y + 34 * u, 26 * u);
+            if (h.type != Weather.Hour.HOUR) {  // sunrise or sunset at its exact time, the word where the temperature goes
+                icon(c, hourSymbol(h), hx - 12 * u, y + 35 * u, 24 * u);
+                text(c, h.type == Weather.Hour.SUNRISE ? "Sunrise" : "Sunset", hx, y + 79 * u, 12.5f, semibold, 1f, Paint.Align.CENTER);
+                continue;
+            }
+            // The chance of rain under the icon, from 10%, as Apple Weather shows it; the icon keeps its size.
+            int rain = Weather.chance(h.rain);
+            icon(c, hourSymbol(h), hx - 12 * u, y + (rain > 0 ? 29 : 35) * u, 24 * u);
+            if (rain > 0) text(c, rain + "%", hx, y + 65 * u, 10.5f, semibold, 1f, Paint.Align.CENTER, RAIN);
             text(c, h.temp + "\u00b0", hx, y + 79 * u, 14, semibold, 1f, Paint.Align.CENTER);
         }
 
@@ -120,8 +142,10 @@ final class WeatherView extends View {
         lo = Math.min(lo, d.temp);
         hi = Math.max(hi, d.temp);
         float span = Math.max(1, hi - lo);
-        float row = 32 * u, by0 = x0 + 150 * u, by1 = x1 - 40 * u;
-        boolean f = d.windUnit.contains("mp");
+        float row = 36 * u, by0 = x0 + 150 * u, by1 = x1 - 40 * u;
+        boolean remake = rangesFor != d || rangesW != w;
+        rangesFor = d;
+        rangesW = w;
         for (int i = 0; i < Math.min(5, d.days.size()); i++) {
             Weather.Day day = d.days.get(i);
             float ry = y + 8 * u + row * i;
@@ -129,13 +153,9 @@ final class WeatherView extends View {
             float base = ry + row / 2f + 5 * u;
             text(c, day.label, x0, base, 15, semibold, 1f, Paint.Align.LEFT);
             float ix = x0 + 64 * u;
-            if (day.rain >= 20) {
-                // The chance of rain under the icon, as Apple Weather shows it, with room between.
-                icon(c, day.code, true, ix + 2 * u, ry + 2 * u, 18 * u);
-                text(c, day.rain + "%", ix + 11 * u, ry + row - 2.5f * u, 10.5f, semibold, 1f, Paint.Align.CENTER, 0xFF64C8FF);
-            } else {
-                icon(c, day.code, true, ix - 1 * u, ry + 5 * u, 24 * u);
-            }
+            int rain = Weather.chance(day.rain);
+            icon(c, WeatherIcons.symbol(day.code, true), ix, ry + (rain > 0 ? 2 : 7) * u, 22 * u);
+            if (rain > 0) text(c, rain + "%", ix + 11 * u, ry + row - 2.5f * u, 10.5f, semibold, 1f, Paint.Align.CENTER, RAIN);
             text(c, day.min + "\u00b0", by0 - 10 * u, base, 15, semibold, 0.55f, Paint.Align.RIGHT);
             text(c, day.max + "\u00b0", x1, base, 15, semibold, 1f, Paint.Align.RIGHT);
             // Track, then this day's range coloured by temperature.
@@ -146,7 +166,8 @@ final class WeatherView extends View {
             c.drawRoundRect(r, th / 2, th / 2, bar);
             float a = by0 + (by1 - by0) * (day.min - lo) / span, b = by0 + (by1 - by0) * (day.max - lo) / span;
             bar.setColor(0xFFFFFFFF);  // opaque: the track's 20% alpha must not carry over to the range
-            bar.setShader(new LinearGradient(a, 0, Math.max(b, a + 1), 0, tempColor(day.min, f), tempColor(day.max, f), Shader.TileMode.CLAMP));
+            if (remake) ranges[i] = rangeShader(day.min, day.max, d.fahrenheit, a, Math.max(b, a + 1));
+            bar.setShader(ranges[i]);
             r.set(a, cy - th / 2, Math.max(b, a + th), cy + th / 2);
             c.drawRoundRect(r, th / 2, th / 2, bar);
             if (i == 0) {  // current temperature on today's bar
@@ -159,8 +180,23 @@ final class WeatherView extends View {
             }
         }
         // Source and time of the last update.
-        String when = android.text.format.DateFormat.getTimeFormat(getContext()).format(new java.util.Date(d.fetchedAt));
-        text(c, Weather.sourceName(d.source) + "  \u00b7  Updated " + when, mid, getHeight() - 14 * u, 11.5f, medium, 0.5f, Paint.Align.CENTER);
+        text(c, Weather.sourceName(d.source) + "  \u00b7  Updated " + timeOf(d.fetchedAt), mid, getHeight() - 14 * u, 11.5f, medium, 0.5f, Paint.Align.CENTER);
+    }
+
+    // The footer's time format, kept from one opening of the forecast to the next: making one looks
+    // up the language's pattern. Made again when the time zone, language or 12/24-hour clock changes.
+    private static java.text.DateFormat timeFmt;
+    private static String timeFmtFor;
+
+    private String timeOf(long t) {
+        Context ctx = getContext();
+        String key = java.util.TimeZone.getDefault().getID() + " " + java.util.Locale.getDefault()
+                + " " + android.text.format.DateFormat.is24HourFormat(ctx);
+        if (!key.equals(timeFmtFor)) {
+            timeFmt = android.text.format.DateFormat.getTimeFormat(ctx);
+            timeFmtFor = key;
+        }
+        return timeFmt.format(new java.util.Date(t));
     }
 
     /**
@@ -170,27 +206,51 @@ final class WeatherView extends View {
     static void prepare(Weather.Data d, float u) {
         if (d == null) return;
         for (int i = 0; i < Math.min(6, d.hours.size()); i++) {
-            WeatherIcons.get(d.hours.get(i).code, d.hours.get(i).day, Math.round(26 * u * 2));
+            WeatherIcons.get(hourSymbol(d.hours.get(i)), Math.round(24 * u * 2));
         }
         for (int i = 0; i < Math.min(5, d.days.size()); i++) {
-            Weather.Day day = d.days.get(i);
-            WeatherIcons.get(day.code, true, Math.round((day.rain >= 20 ? 18 : 24) * u * 2));
+            WeatherIcons.get(WeatherIcons.symbol(d.days.get(i).code, true), Math.round(22 * u * 2));
         }
     }
 
-    /** Apple Weather's palette: blue (cold) -> teal -> green -> yellow -> orange -> red (hot). */
-    static int tempColor(int t, boolean fahrenheit) {
-        float cdeg = fahrenheit ? (t - 32) * 5f / 9f : t;
-        float[] at = {-5, 8, 16, 22, 28, 35};
-        int[] col = {0xFF5E9BFF, 0xFF56D6E4, 0xFF8FDB6A, 0xFFF7D74A, 0xFFFF9F2E, 0xFFFF5A3C};
-        if (cdeg <= at[0]) return col[0];
-        for (int i = 1; i < at.length; i++) {
-            if (cdeg <= at[i]) {
-                float k = (cdeg - at[i - 1]) / (at[i] - at[i - 1]);
-                return mix(col[i - 1], col[i], k);
+    /** An hourly cell's symbol: the weather that hour, or sunrise or sunset. */
+    private static String hourSymbol(Weather.Hour h) {
+        return h.type == Weather.Hour.SUNRISE ? WeatherIcons.SUNRISE : h.type == Weather.Hour.SUNSET ? WeatherIcons.SUNSET
+                : WeatherIcons.symbol(h.code, h.day);
+    }
+
+    // Apple's temperature gradient (WeatherCore's default scale) from -120 to 120 \u00b0F. Every bar is
+    // the slice between its day's low and high, so a temperature always has the same colour.
+    private static final float[] STOP_F = {-120, -60, 0, 30, 50, 70, 80, 100, 120};
+    private static final int[] STOP_C = {0xFF30004D, 0xFF5856D6, 0xFF007AFF, 0xFF5AC8FA, 0xFF66D4CF,
+            0xFFFFCC00, 0xFFFF9500, 0xFFFF3B30, 0xFF770700};
+
+    /** One day's bar from x a to b: the gradient from lo to hi, with each of Apple's stops in between. */
+    private static Shader rangeShader(int lo, int hi, boolean fahrenheit, float a, float b) {
+        float lf = fahrenheit ? lo : lo * 9f / 5f + 32, hf = fahrenheit ? hi : hi * 9f / 5f + 32;
+        int n = 0;
+        for (float s : STOP_F) if (s > lf && s < hf) n++;
+        int[] colors = new int[n + 2];
+        float[] at = new float[n + 2];
+        colors[0] = colorAt(lf);
+        for (int i = 0, k = 1; i < STOP_F.length; i++) {
+            if (STOP_F[i] > lf && STOP_F[i] < hf) {
+                colors[k] = STOP_C[i];
+                at[k++] = (STOP_F[i] - lf) / (hf - lf);
             }
         }
-        return col[col.length - 1];
+        colors[n + 1] = colorAt(hf);  // the same colour twice for a day with no range
+        at[n + 1] = 1;
+        return new LinearGradient(a, 0, b, 0, colors, at, Shader.TileMode.CLAMP);
+    }
+
+    /** The gradient's colour at a temperature in \u00b0F, blended in sRGB between the stops either side. */
+    private static int colorAt(float tf) {
+        if (tf <= STOP_F[0]) return STOP_C[0];
+        for (int i = 1; i < STOP_F.length; i++) {
+            if (tf <= STOP_F[i]) return mix(STOP_C[i - 1], STOP_C[i], (tf - STOP_F[i - 1]) / (STOP_F[i] - STOP_F[i - 1]));
+        }
+        return STOP_C[STOP_C.length - 1];
     }
 
     private static int mix(int a, int b, float k) {
@@ -200,14 +260,15 @@ final class WeatherView extends View {
         return 0xFF000000 | (r << 16) | (g << 8) | bl;
     }
 
-    private void icon(Canvas c, int code, boolean day, float x, float y, float size) {
+    private void icon(Canvas c, String symbol, float x, float y, float size) {
         // Drawn at twice the size and filtered down, so it stays crisp when the pill grows on focus.
-        Bitmap b = WeatherIcons.get(code, day, Math.round(size * 2));
+        // prepare() must ask for the same sizes.
+        Bitmap b = WeatherIcons.get(symbol, Math.round(size * 2));
         iconDst.set(x, y, x + size, y + size);
         c.drawBitmap(b, null, iconDst, iconPaint);
     }
 
-    private final android.graphics.RectF iconDst = new android.graphics.RectF();
+    private final RectF iconDst = new RectF();
     private final Paint iconPaint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
 
     private void hairline(Canvas c, float x0, float x1, float y) {
@@ -217,11 +278,11 @@ final class WeatherView extends View {
         c.drawLine(x0, y, x1, y, p);
     }
 
-    private float text(Canvas c, String s, float x, float y, float size, android.graphics.Typeface tf, float alpha, Paint.Align al) {
+    private float text(Canvas c, String s, float x, float y, float size, Typeface tf, float alpha, Paint.Align al) {
         return text(c, s, x, y, size, tf, alpha, al, 0xFFFFFFFF);
     }
 
-    private float text(Canvas c, String s, float x, float y, float size, android.graphics.Typeface tf, float alpha, Paint.Align al, int color) {
+    private float text(Canvas c, String s, float x, float y, float size, Typeface tf, float alpha, Paint.Align al, int color) {
         p.setTypeface(tf);
         p.setTextSize(size * u);
         p.setTextAlign(al);

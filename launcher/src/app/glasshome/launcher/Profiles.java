@@ -40,8 +40,13 @@ final class Profiles {
         return id.equals("p1") ? "home" : "home_" + id;
     }
 
-    /** Layout/background preferences of the current profile. */
+    /** The current profile's store, worked out once: profiles can't be switched any more. */
+    private static volatile String name;
+
+    /** Layout/background preferences of the current profile; the profile list is parsed only the first time. */
     static SharedPreferences homePrefs(Context c) {
-        return c.getSharedPreferences(prefsName(currentId(c)), Context.MODE_PRIVATE);
+        String n = name;
+        if (n == null) name = n = prefsName(currentId(c));
+        return c.getSharedPreferences(n, Context.MODE_PRIVATE);
     }
 }

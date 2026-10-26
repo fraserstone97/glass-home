@@ -1,5 +1,7 @@
 package app.glasshome.launcher;
 
+import android.animation.ArgbEvaluator;
+import android.animation.ObjectAnimator;
 import android.app.Activity;
 import android.content.Intent;
 import android.graphics.Bitmap;
@@ -23,12 +25,14 @@ import java.util.List;
 
 /**
  * First-time setup, in the style of Apple TV's own setup: one question per page, a large title
- * and a short line of help at the top, choices as a centred list (white when focused), OK moves
- * on and Back goes back. Pages: Welcome, background, Home Screen, weather,
- * home screen & permissions, done. Shown once; Settings \u2192 Home \u2192 Run Setup Again repeats it.
+ * and a short line of help at the top, choices as a centred list of capsules (white when
+ * focused) and the way on as a capsule button beneath them; Back goes back. Pages: Welcome,
+ * background, Home Screen, weather, permissions, done. Shown once; Settings › Home Screen ›
+ * Run Setup Again repeats it.
  */
 public class SetupActivity extends Activity {
     static final String K_DONE = "setup_done";
+    static final ArgbEvaluator EV = new ArgbEvaluator();
 
     FrameLayout root;
     ImageView backdrop;
@@ -41,6 +45,8 @@ public class SetupActivity extends Activity {
     }
 
     final List<Step> steps = new ArrayList<>();
+    /** The pages that show what's been allowed or chosen elsewhere: re-drawn on coming back. */
+    static final int WEATHER_STEP = 3, PERMISSIONS_STEP = 4;  // must match the order below
 
     static boolean done(Activity a) {
         return a.getSharedPreferences("setup", MODE_PRIVATE).getBoolean(K_DONE, false);
@@ -89,20 +95,58 @@ public class SetupActivity extends Activity {
 
     // ---------------------------------------------------------------- navigation
 
+    /** Focus is being placed by the page, not the remote: rows take it at once, already lit. */
+    boolean snap;
+    ObjectAnimator fade;
+
     void show(int i, int dir) {
         handler.removeCallbacksAndMessages(null);
         index = Math.max(0, Math.min(i, steps.size() - 1));
         page.animate().cancel();
+        if (fade != null) fade.cancel();
         page.removeAllViews();
+        snap = true;
         steps.get(index).build();
-        // New page: slide and fade. Same page re-drawn after a switch: a quick fade only.
-        page.setAlpha(dir == 0 ? 0.6f : 0f);
+        snap = false;
+        if (dir == 0) {
+            // The same page re-drawn after a change: a quick fade only.
+            page.setTranslationX(0);
+            page.setAlpha(0.6f);
+            page.animate().alpha(1f).setDuration(120).setInterpolator(SettingsActivity.LINEAR).start();
+            return;
+        }
+        // A new page fades in over 300 ms as it settles from the side you're heading, on the
+        // Apple TV app's page curve.
+        page.setAlpha(0f);
         page.setTranslationX(u(30) * dir);
-        page.animate().alpha(1f).translationX(0).setDuration(dir == 0 ? 120 : 320).start();
+        page.animate().translationX(0).setDuration(500).setInterpolator(SettingsActivity.SLIDE).start();
+        fade = ObjectAnimator.ofFloat(page, View.ALPHA, 1f);
+        fade.setDuration(300);
+        fade.setInterpolator(SettingsActivity.LINEAR);
+        fade.start();
     }
 
     void next() {
         show(index + 1, 1);
+    }
+
+    /** The same page again after a change (a switch, a permission, a city), with focus where it was. */
+    void redraw() {
+        View list = page.findViewWithTag("list");
+        View f = getCurrentFocus();
+        int at = list instanceof ViewGroup && f != null ? ((ViewGroup) list).indexOfChild(f) : -1;
+        show(index, 0);
+        focusRow(at);
+    }
+
+    /** Puts focus on the list's row `i` (the last one if there are fewer now). */
+    void focusRow(int i) {
+        View v = page.findViewWithTag("list");
+        if (i < 0 || !(v instanceof LinearLayout) || ((LinearLayout) v).getChildCount() == 0) return;
+        LinearLayout l = (LinearLayout) v;
+        snap = true;
+        l.getChildAt(Math.min(i, l.getChildCount() - 1)).requestFocus();
+        snap = false;
     }
 
     @Override
@@ -111,37 +155,44 @@ public class SetupActivity extends Activity {
         // The first page has nowhere to go back to: setup stays until it is finished.
     }
 
+    /** Away to a permission prompt, the Home role's dialog or Settings (Choose a City). */
+    boolean paused;
+
     @Override
-    public void onRequestPermissionsResult(int code, String[] p, int[] r) {
-        if (index == 6) show(6, 0);  // refresh the ticks
+    protected void onPause() {
+        super.onPause();
+        paused = true;
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        if (index == 6) show(6, 0);
+        // Back from it: show what was allowed or chosen there.
+        if (paused && (index == WEATHER_STEP || index == PERMISSIONS_STEP)) redraw();
+        paused = false;
     }
 
     // ---------------------------------------------------------------- building blocks
 
-    TextView title(String s) {
+    TextView text(String s, float size, String weight, int color) {
         TextView t = new TextView(this);
         t.setText(s);
-        t.setTextColor(Color.WHITE);
-        t.setTypeface(Ui.font(this, "display"));
+        Ui.textSize(t, size);
+        t.setTypeface(Ui.font(this, weight));
+        t.setTextColor(color);
+        return t;
+    }
+
+    TextView title(String s) {
+        TextView t = text(s, 34, "display", Color.WHITE);
         t.setLetterSpacing(-0.02f);
-        Ui.textSize(t, 34);
         t.setGravity(Gravity.CENTER);
         page.addView(t, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         return t;
     }
 
     TextView subtitle(String s) {
-        TextView t = new TextView(this);
-        t.setText(s);
-        t.setTextColor(0xB3FFFFFF);
-        t.setTypeface(Ui.font(this, "regular"));
-        Ui.textSize(t, 14);
+        TextView t = text(s, 14, "regular", 0xB3FFFFFF);
         t.setGravity(Gravity.CENTER);
         t.setLineSpacing(0, 1.15f);
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(u(520), ViewGroup.LayoutParams.WRAP_CONTENT);
@@ -157,69 +208,84 @@ public class SetupActivity extends Activity {
         l.setClipChildren(false);
         l.setClipToPadding(false);
         if (page.findViewWithTag("list") == null) l.setTag("list");
-        page.addView(l, new LinearLayout.LayoutParams(u(440), ViewGroup.LayoutParams.WRAP_CONTENT));
+        page.addView(l, new LinearLayout.LayoutParams(u(380), ViewGroup.LayoutParams.WRAP_CONTENT));
         return l;
     }
 
-    /** A choice row: title, optional detail and a tick; white with dark text when focused. */
+    /**
+     * A capsule that grows 4 px each way and turns white when focused, the words staying the same
+     * size; `words` darken with it. Focus placed while a page is built arrives already lit.
+     */
+    Glass capsule(View v, long inMs, long outMs, TextView... words) {
+        Glass bg = new Glass(u(40), u(0.5f), Glass.REGULAR);
+        bg.grow = u(2);
+        int[] rest = new int[words.length];
+        for (int i = 0; i < words.length; i++) rest[i] = words[i].getCurrentTextColor();
+        bg.tint = f -> {
+            for (int i = 0; i < words.length; i++) {
+                // Secondary words keep their transparency on the white plate.
+                words[i].setTextColor((int) EV.evaluate(f, rest[i], (rest[i] & 0xFF000000) | 0x111114));
+            }
+        };
+        v.setBackground(bg);
+        v.setFocusable(true);
+        v.setClickable(true);
+        v.setOnFocusChangeListener((x, has) -> {
+            if (snap) {
+                if (bg.anim != null) bg.anim.cancel();
+                bg.setFocus(has ? 1f : 0f);
+            } else {
+                Glass.focus(bg, has, inMs, outMs, SettingsActivity.ROW_IN, SettingsActivity.ROW_OUT);
+            }
+        });
+        return bg;
+    }
+
+    /** A choice row: title, optional detail and a tick (in the title's colour), as Settings' rows. */
     View option(LinearLayout list, String label, String detail, boolean checked, Runnable action) {
         LinearLayout r = new LinearLayout(this);
         r.setOrientation(LinearLayout.HORIZONTAL);
         r.setGravity(Gravity.CENTER_VERTICAL);
-        r.setFocusable(true);
-        r.setClickable(true);
-        r.setPadding(u(18), u(8), u(16), u(8));
-        Glass bg = new Glass(u(12), u(0.5f), Glass.REGULAR);
-        r.setBackground(bg);
+        r.setPadding(u(18), 0, u(18), 0);
         LinearLayout texts = new LinearLayout(this);
         texts.setOrientation(LinearLayout.VERTICAL);
-        TextView l = new TextView(this);
-        l.setText(label);
-        l.setTextColor(Color.WHITE);
-        l.setTypeface(Ui.font(this, "medium"));
-        Ui.textSize(l, 15);
+        TextView l = text(label, 16, "medium", Color.WHITE);
         texts.addView(l);
         TextView d = null;
         if (detail != null && !detail.isEmpty()) {
-            d = new TextView(this);
-            d.setText(detail);
-            d.setTextColor(0x99FFFFFF);
-            d.setTypeface(Ui.font(this, "regular"));
-            Ui.textSize(d, 12);
+            d = text(detail, 12, "regular", 0x99FFFFFF);
             d.setSingleLine(true);
             d.setEllipsize(TextUtils.TruncateAt.END);
             texts.addView(d);
         }
         r.addView(texts, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        TextView tick = new TextView(this);
-        tick.setText(checked ? "\u2713" : "");
-        tick.setTextColor(0xFF30D158);
-        tick.setTypeface(Ui.font(this, "semibold"));
-        Ui.textSize(tick, 17);
+        TextView tick = text(checked ? "✓" : "", 17, "semibold", Color.WHITE);
         r.addView(tick);
-        TextView dRef = d;
-        r.setOnFocusChangeListener((v, has) -> {
-            Glass.focus(bg, has);
-            android.animation.ArgbEvaluator ev = new android.animation.ArgbEvaluator();
-            android.animation.ValueAnimator fade = android.animation.ValueAnimator.ofFloat(has ? 0f : 1f, has ? 1f : 0f);
-            fade.setDuration(has ? 200 : 260);
-            fade.setInterpolator(MainActivity.EASE);
-            fade.addUpdateListener(a -> {
-                float t = (float) a.getAnimatedValue();
-                l.setTextColor((int) ev.evaluate(t, Color.WHITE, 0xFF111114));
-                if (dRef != null) dRef.setTextColor((int) ev.evaluate(t, 0x99FFFFFF, 0x99111114));
-                tick.setTextColor((int) ev.evaluate(t, 0xFF30D158, 0xFF1E9E48));
-            });
-            fade.start();
-            Glass.lift(v, has, 1.04f, 0);
-        });
+        if (d != null) capsule(r, 100, 200, l, d, tick);
+        else capsule(r, 100, 200, l, tick);
         r.setOnClickListener(v -> action.run());
+        // 66 px capsules (84 with a detail line) on tvOS's 80 px pitch, with room to grow.
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
-                d == null ? u(46) : u(56));
-        lp.bottomMargin = u(8);
+                d == null ? u(37) : u(46));
+        lp.bottomMargin = u(3);
         list.addView(r, lp);
         if (list.getChildCount() == 1) r.requestFocus();
         return r;
+    }
+
+    /** The way on (Get Started, Continue, Done): a capsule button centred under the choices. */
+    View button(LinearLayout list, String label, Runnable action) {
+        TextView b = text(label, 15.5f, "semibold", Color.WHITE);
+        b.setGravity(Gravity.CENTER);
+        b.setSingleLine(true);
+        capsule(b, 75, 150, b);
+        b.setOnClickListener(v -> action.run());
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(u(300), u(37));
+        lp.gravity = Gravity.CENTER_HORIZONTAL;
+        if (list.getChildCount() > 0) lp.topMargin = u(12);
+        list.addView(b, lp);
+        if (list.getChildCount() == 1) b.requestFocus();
+        return b;
     }
 
     void dots() {
@@ -259,11 +325,10 @@ public class SetupActivity extends Activity {
         hi.setTranslationY(u(12));
         hi.animate().alpha(1f).translationY(0).setDuration(700).start();
         LinearLayout l = list();
-        option(l, "Get Started", null, false, this::next);
+        button(l, "Get Started", this::next);
         View mid = new View(this);
         page.addView(mid, new LinearLayout.LayoutParams(1, 0, 1f));
     }
-
 
     /** Backgrounds preview live behind the page as you move through them. */
     void look() {
@@ -295,53 +360,54 @@ public class SetupActivity extends Activity {
         subtitle("Choose what appears at the top.");
         boolean recs = Suggestions.showRecs(this);
         LinearLayout l = list();
-        option(l, "Recommendations", "What\u2019s popular on your apps.", recs, () -> {
-            Suggestions.setShelf(this, !recs);
-            show(index, 0);
-            focusRow(0);
+        option(l, "Recommendations", "What’s popular on your apps.", recs, () -> {
+            Suggestions.setShelf(this, recs ? Suggestions.SHELF_NONE : Suggestions.SHELF_RECS);
+            redraw();
         });
-        option(l, "Continue", null, false, this::next);
+        button(l, "Continue", this::next);
         dots();
     }
 
-    /** After re-building a page, put focus back on the row that was pressed. */
-    void focusRow(int i) {
-        View v = page.findViewWithTag("list");
-        if (v instanceof LinearLayout && i < ((LinearLayout) v).getChildCount()) ((LinearLayout) v).getChildAt(i).requestFocus();
-    }
+    /** The city the TV's internet address puts it in has been looked up (once per setup). */
+    boolean lookedUpCity;
 
     void weather() {
         title("Weather");
         subtitle("See the forecast on the Home Screen.");
         LinearLayout l = list();
-        String city = Weather.place(this);
-        option(l, "Use My Location", city.isEmpty() ? null : city,
-                Weather.enabled(this) && !Weather.manual(this), () -> {
-                    Weather.prefs(this).edit().putBoolean(Weather.K_ENABLED, true).apply();
-                    Weather.setPlace(this, null);
-                    next();
-                });
-        option(l, "Choose a City\u2026", Weather.manual(this) ? Weather.place(this) : null, Weather.manual(this), () -> {
+        boolean manual = Weather.manual(this);
+        String city = manual ? "" : Weather.place(this);
+        option(l, "Use My Location", city.isEmpty() ? null : city, Weather.enabled(this) && !manual, () -> {
             Weather.prefs(this).edit().putBoolean(Weather.K_ENABLED, true).apply();
-            Intent i = new Intent(this, SettingsActivity.class).putExtra("page", SettingsActivity.WEATHER);
-            startActivity(i);
+            Weather.setPlace(this, null);
+            next();
+        });
+        option(l, "Choose a City…", manual ? Weather.place(this) : null, manual, () -> {
+            Weather.prefs(this).edit().putBoolean(Weather.K_ENABLED, true).apply();
+            startActivity(new Intent(this, SettingsActivity.class).putExtra("page", SettingsActivity.WEATHER));
         });
         option(l, "Not Now", null, !Weather.enabled(this), () -> {
             Weather.prefs(this).edit().putBoolean(Weather.K_ENABLED, false).apply();
             Weather.changed(this);
             next();
         });
-        if (city.isEmpty()) Weather.refresh(this, true, () -> {
-            if (index == 3) show(3, 0);  // show the detected city
-        });
+        // On with what's ticked: the only way past a city chosen in Settings that keeps it.
+        button(l, "Continue", this::next);
+        // Shows the city it finds. Asked only once: when it can't be found (offline, or the
+        // look-up services busy) the page would otherwise ask again on every re-draw, for ever.
+        if (!manual && city.isEmpty() && !lookedUpCity) {
+            lookedUpCity = true;
+            Weather.refresh(this, true, () -> {
+                if (index == WEATHER_STEP && !isDestroyed()) redraw();
+            });
+        }
         dots();
     }
-
 
     boolean askedLocation;
 
     void homeAndPermissions() {
-        // Ask right away: Android's own prompt for location (the Wi-Fi name in Control Center).
+        // Ask right away: Android's own prompt for location (the Wi-Fi name in Control Centre).
         if (!Perms.hasLocation(this) && !askedLocation) {
             askedLocation = true;
             handler.postDelayed(() -> Perms.requestLocation(this), 600);
@@ -356,10 +422,10 @@ public class SetupActivity extends Activity {
             option(l, "Show Wi-Fi Name", "Needs location access.", false,
                     () -> Perms.requestLocation(this));
         }
-        if (Perms.adminSupported(this) && !Perms.hasAdmin(this)) {
+        if (Perms.adminSupported(this) && !SleepReceiver.canSleep(this)) {
             option(l, "Sleep Timer", "Lets " + getString(R.string.app_name) + " turn off the TV.", false, () -> Perms.requestAdmin(this));
         }
-        option(l, "Continue", null, false, this::next);
+        button(l, "Continue", this::next);
         dots();
     }
 
@@ -388,14 +454,15 @@ public class SetupActivity extends Activity {
         LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(u(64), u(64));
         clp.bottomMargin = u(18);
         page.addView(check, clp);
-        title("You\u2019re All Set");
+        title("You’re All Set");
         subtitle("You can change this anytime in Settings.");
         LinearLayout l = list();
-        option(l, "Done", null, false, () -> {
+        button(l, "Done", () -> {
             getSharedPreferences("setup", MODE_PRIVATE).edit().putBoolean(K_DONE, true).apply();
             startActivity(new Intent(this, MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP));
             finish();
-            overridePendingTransition(android.R.anim.fade_in, android.R.anim.fade_out);
+            // Home stays still while Setup fades away, as every page closes.
+            overridePendingTransition(R.anim.hold, R.anim.page_out);
         });
         View bottom = new View(this);
         page.addView(bottom, new LinearLayout.LayoutParams(1, 0, 1.4f));

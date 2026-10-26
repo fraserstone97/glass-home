@@ -1,8 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- A page opening over Home: it fades up as it settles from a touch larger, as tvOS pages do. -->
-<set xmlns:android="http://schemas.android.com/apk/res/android"
-    android:interpolator="@interpolator/ease" android:shareInterpolator="true">
-    <alpha android:fromAlpha="0" android:toAlpha="1" android:duration="260" />
-    <scale android:fromXScale="1.04" android:toXScale="1" android:fromYScale="1.04" android:toYScale="1"
-        android:pivotX="50%" android:pivotY="50%" android:duration="420" />
-</set>
+<!-- A page opening: it fades in over the page beneath, which stays still, as the Apple TV app
+     does (a plain 300 ms linear crossfade, no scale). -->
+<alpha xmlns:android="http://schemas.android.com/apk/res/android"
+    android:interpolator="@android:anim/linear_interpolator"
+    android:fromAlpha="0" android:toAlpha="1" android:duration="300" />

@@ -45,27 +45,28 @@ final class Clicks {
     /**
      * A struck, glassy tone: partials that die away quickly (decay seconds), a soft 1 ms attack so
      * nothing clicks, a touch of breath at the very start, and an optional pitch fall (glide, as a
-     * fraction over the sound's length).
+     * fraction over the sound's length). Made only the first time: after that the cached file goes
+     * straight into the pool, with nothing synthesised at start-up.
      */
     private static int load(Context c, String name, float[] freqs, float[] amps, float decay, float len, float gain, float glide) {
-        int rate = 44100, n = Math.round(rate * len);
-        short[] pcm = new short[n];
-        java.util.Random noise = new java.util.Random(7);
-        for (int i = 0; i < n; i++) {
-            float t = i / (float) rate;
-            float env = (float) Math.exp(-t / decay) * Math.min(1f, t / 0.001f);
-            float v = 0;
-            for (int k = 0; k < freqs.length; k++) {
-                float f = freqs[k] * (1f + glide * t / len);
-                // Higher partials fade faster, as on struck glass.
-                v += amps[k] * Math.sin(2 * Math.PI * f * t) * Math.exp(-t * k * 60);
-            }
-            v += (noise.nextFloat() - 0.5f) * 0.25f * Math.exp(-t / 0.0012f);
-            pcm[i] = (short) Math.round(Math.max(-1f, Math.min(1f, v * env * gain)) * 32767);
-        }
         File f = new File(c.getCacheDir(), "click_" + name + "_v2.wav");
         try {
             if (!f.exists()) {
+                int rate = 44100, n = Math.round(rate * len);
+                short[] pcm = new short[n];
+                java.util.Random noise = new java.util.Random(7);
+                for (int i = 0; i < n; i++) {
+                    float t = i / (float) rate;
+                    float env = (float) Math.exp(-t / decay) * Math.min(1f, t / 0.001f);
+                    float v = 0;
+                    for (int k = 0; k < freqs.length; k++) {
+                        float fr = freqs[k] * (1f + glide * t / len);
+                        // Higher partials fade faster, as on struck glass.
+                        v += amps[k] * Math.sin(2 * Math.PI * fr * t) * Math.exp(-t * k * 60);
+                    }
+                    v += (noise.nextFloat() - 0.5f) * 0.25f * Math.exp(-t / 0.0012f);
+                    pcm[i] = (short) Math.round(Math.max(-1f, Math.min(1f, v * env * gain)) * 32767);
+                }
                 ByteBuffer b = ByteBuffer.allocate(44 + n * 2).order(ByteOrder.LITTLE_ENDIAN);
                 b.put("RIFF".getBytes()).putInt(36 + n * 2).put("WAVE".getBytes()).put("fmt ".getBytes())
                         .putInt(16).putShort((short) 1).putShort((short) 1).putInt(rate).putInt(rate * 2)
@@ -81,26 +82,34 @@ final class Clicks {
         }
     }
 
-    private static void play(Context c, int id, float volume) {
+    private static void play(Context c, int id, float left, float right) {
         init(c);
-        if (id != 0 && enabled(c)) pool.play(id, volume, volume, 1, 0, 1f);
+        if (id != 0 && enabled(c)) pool.play(id, left, right, 1, 0, 1f);
     }
 
-    /** Focus moved. Held arrows repeat fast: the ticks thin out rather than buzz. */
-    static void move(Context c, int keyCode) {
+    /**
+     * Focus moved to something x across the screen (0 the left edge, 1 the right). As tvOS's focus
+     * sound, the tick pans with it and is quieter on fast moves. Held arrows repeat fast: the ticks
+     * thin out rather than buzz.
+     */
+    static void move(Context c, float x, boolean fast) {
         long now = android.os.SystemClock.uptimeMillis();
         if (now - lastMove < 55) return;
         lastMove = now;
-        play(c, move, 0.7f);
+        // In the middle it plays at 0.7, as it always has (0.45 on a quick move); towards a side,
+        // that side's channel rises to full and the other falls to 0.4 of it.
+        float vol = fast ? 0.45f / 0.7f : 1f;
+        x = Math.max(0f, Math.min(1f, x));
+        play(c, move, vol * (1f - 0.6f * x), vol * (0.4f + 0.6f * x));
     }
 
     /** Something was chosen. */
     static void select(Context c) {
-        play(c, select, 0.75f);
+        play(c, select, 0.75f, 0.75f);
     }
 
     /** Back. */
     static void back(Context c) {
-        play(c, back, 0.6f);
+        play(c, back, 0.6f, 0.6f);
     }
 }

@@ -1,4 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- What's beneath a page stays exactly as it is while the page opens or closes over it. -->
+<!-- What's beneath a page stays exactly as it is while the page opens or closes over it (as long as
+     the page's own fade, so the TV never shows black underneath). -->
 <alpha xmlns:android="http://schemas.android.com/apk/res/android"
-    android:fromAlpha="1" android:toAlpha="1" android:duration="420" />
+    android:fromAlpha="1" android:toAlpha="1" android:duration="300" />

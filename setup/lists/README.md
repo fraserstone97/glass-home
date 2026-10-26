@@ -7,6 +7,7 @@ back on.
 | List | TV |
 |---|---|
 | [`tcl-c6k-google-tv.txt`](tcl-c6k-google-tv.txt) | TCL C6K series, Google TV, Android 14 |
+| [`benq-qs01-android-tv.txt`](benq-qs01-android-tv.txt) | BenQ QS01 dongle (Amlogic S905Y2), Android TV 12 |
 
 ## Another TV?
 

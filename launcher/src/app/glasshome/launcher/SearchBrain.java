@@ -8,6 +8,7 @@ import org.json.JSONObject;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Calendar;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -15,9 +16,11 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
 
 import app.glasshome.launcher.SearchActivity.Result;
 
@@ -28,18 +31,22 @@ import app.glasshome.launcher.SearchActivity.Result;
  * films"), freshness ("new", "best") and people ("films with Tom Hardy"). What's left is the title.
  *
  * Then it answers in shelves, the way the Apple TV app does: Top Results for the title (matched
- * word by word, forgiving UK/US spelling and typos), More Like This for a clear match, the films
- * and series of an actor or director, or a genre to browse when that's what was asked for.
- * Everything is kept to what UK viewers watch and can watch here.
+ * word by word, forgiving UK/US spelling and typos) followed by titles related to a clear match,
+ * the films and series of an actor or director, or a genre to browse when that's what was asked
+ * for. Everything is kept to what UK viewers watch and can watch here.
  */
 final class SearchBrain {
 
     static final int MAX = 18;
+    /** Top Results holds up to this many: the title asked for, then related ones (Apple's shows 1 to 20). */
+    static final int TOP_MAX = 20;
 
     /** One shelf of answers. */
     static final class Shelf {
         final String heading;
         final List<Result> items;
+        /** For an actor's or director's shelf, their name (a search suggestion). */
+        String person;
 
         Shelf(String heading, List<Result> items) {
             this.heading = heading;
@@ -70,6 +77,10 @@ final class SearchBrain {
         boolean like;
         /** "films about sharks": the subject, and how it was put ("About", "Set in"). */
         String about, aboutWord;
+        /** The subject was only implied ("zombie films"): it may be a title or someone's name too. */
+        boolean implicit;
+        /** A whole request searched as a title just in case ("films about sharks"): not one to retry for typos. */
+        boolean worded;
         /** Nothing left but genres, kind, decade and freshness: browse rather than search. */
         boolean browse() {
             return text.isEmpty() && about == null && !like;
@@ -102,8 +113,8 @@ final class SearchBrain {
 
     /**
      * A genre as people say it, with JustWatch's codes for it. A title fits when it has all of them
-     * (true crime is crime and documentary) or, for an "any" genre, one of them (kids' means family
-     * or animation). Its names go in shelf headings: "True Crime Documentaries", "Kids' Films".
+     * (true crime is crime and documentary) or, for an "any" genre, one of them. Its names go in
+     * shelf headings: "True Crime Documentaries", "Kids' Films".
      */
     static final class Genre {
         final String[] words, codes;
@@ -198,6 +209,9 @@ final class SearchBrain {
             " (?:(?:from|in) )?(?:the )?(?:(19[2-9]0s|20[0-2]0s|[2-9]0s|00s|noughties)|(twenties|thirties|forties|fifties|sixties|seventies|eighties|nineties)) ");
     static final Set<String> OCCASIONS = new HashSet<>(Arrays.asList("christmas", "xmas", "halloween", "easter",
             "valentines", "bonfire night", "new year", "summer", "winter"));
+    /** A plural kind at the end ("zombie films"); not "series" or "show", which name programmes too. */
+    static final java.util.regex.Pattern PLURAL_KIND = java.util.regex.Pattern.compile(
+            " (films|movies|shows|programmes|documentaries) $");
     static final String[] TENS = {"twenties", "thirties", "forties", "fifties", "sixties", "seventies", "eighties", "nineties"};
 
     static Query read(String raw) {
@@ -307,6 +321,24 @@ final class SearchBrain {
             q.aboutWord = "";
             return q;
         }
+        // A few words and a plural kind ("zombie films", "spy shows", "netflix films", "tom hardy
+        // films"): what's on a service, or a subject to browse (or someone's work, work() checks),
+        // not a title called that.
+        if (!rest.isEmpty() && rest.split(" ").length <= 3 && q.genres.size() <= 1 && PLURAL_KIND.matcher(s).find()) {
+            for (String[] sv : SERVICES) {
+                // Matched in the words as said too: "tv" is also a kind, so "apple tv shows" leaves
+                // only "apple", and it's Apple TV's shows, not shows about apples.
+                if (!sv[0].equals(rest) && (!s.contains(" " + sv[0] + " ")
+                        || !describe(new Query(), s.replace(" " + sv[0] + " ", " ")).isEmpty())) continue;
+                q.service = provider(Integer.parseInt(sv[1]));
+                q.text = "";
+                return q;
+            }
+            q.about = rest;
+            q.aboutWord = "";
+            q.implicit = true;
+            return q;
+        }
         if (rest.isEmpty()) {
             q.text = "";  // a browse: "new comedy films on netflix", "80s films", "netflix"
         } else {
@@ -392,46 +424,121 @@ final class SearchBrain {
     // ---------------------------------------------------------------- answering
 
     final Context c;
-    final List<Suggestions.Provider> mine = new ArrayList<>();
-    static final ExecutorService POOL = Executors.newFixedThreadPool(3);
+    /** Your services (the ones installed on this TV): looked up on first use, on a search thread. */
+    private volatile List<Suggestions.Provider> mine;
+    /** The titles in Recently Searched (JustWatch ids): a search ranks them a little ahead. */
+    volatile Set<String> recent = Collections.emptySet();
+    /**
+     * Lookups that run beside a search: people, related titles, typo retries, subjects. Its threads
+     * go after half a minute unused, so Home's process doesn't keep them.
+     */
+    static final ExecutorService POOL;
+
+    static {
+        ThreadPoolExecutor pool = new ThreadPoolExecutor(6, 6, 30, TimeUnit.SECONDS, new LinkedBlockingQueue<>());
+        pool.allowCoreThreadTimeOut(true);
+        POOL = pool;
+    }
 
     SearchBrain(Context c) {
         this.c = c.getApplicationContext();
-        for (Suggestions.Provider p : Suggestions.PROVIDERS) if (Suggestions.installed(c, p.pkg)) mine.add(p);
     }
 
-    /** Answers from the last few minutes, so going back a letter or repeating a search is instant. */
+    /**
+     * Your services: the UK ones whose apps are on this TV. With none of them installed (a new TV,
+     * or one outside the UK), those chosen for the top shelf, else all of them: Popular and Browse
+     * would otherwise have nothing to show, and every offer would be dropped.
+     */
+    List<Suggestions.Provider> mine() {
+        List<Suggestions.Provider> m = mine;
+        if (m != null) return m;
+        synchronized (this) {
+            if (mine == null) {
+                List<Suggestions.Provider> found = new ArrayList<>();
+                for (Suggestions.Provider p : Suggestions.PROVIDERS) if (Suggestions.installed(c, p.pkg)) found.add(p);
+                if (found.isEmpty()) {
+                    java.util.Set<String> chosen = Suggestions.providers(c);
+                    for (Suggestions.Provider p : Suggestions.PROVIDERS) if (chosen.contains(String.valueOf(p.id))) found.add(p);
+                }
+                if (found.isEmpty()) found.addAll(Suggestions.PROVIDERS);
+                mine = found;
+            }
+            return mine;
+        }
+    }
+
+    /**
+     * Answers from the last few minutes, so going back a letter or repeating a search is instant.
+     * Kept by what was asked once the filler's gone: "Slow Horses", "slow horses!" and "search for
+     * slow horses" are one answer.
+     */
     static final android.util.LruCache<String, Object[]> ANSWERS = new android.util.LruCache<>(24);
 
-    /** Hands over the first shelves as soon as they're known (early), then returns them all. */
-    List<Shelf> answer(String raw, java.util.function.Consumer<List<Shelf>> early) throws Exception {
-        String key = raw.trim().toLowerCase(Locale.UK);
-        Object[] hit = ANSWERS.get(key);
-        if (hit != null && System.currentTimeMillis() - (Long) hit[0] < 10 * 60_000L) {
-            @SuppressWarnings("unchecked") List<Shelf> kept = (List<Shelf>) hit[1];
-            return copy(kept);
-        }
-        List<Shelf> out = work(raw, early);
-        if (!out.isEmpty()) ANSWERS.put(key, new Object[]{System.currentTimeMillis(), copy(out)});
+    /** The answer kept for this, while it's fresh; null otherwise. */
+    @SuppressWarnings("unchecked")
+    static List<Shelf> cached(String raw) {
+        Object[] hit = ANSWERS.get(read(raw).full);
+        if (hit == null || System.currentTimeMillis() - (Long) hit[0] >= 10 * 60_000L) return null;
+        return copy((List<Shelf>) hit[1]);
+    }
+
+    /**
+     * Hands over the first shelves as soon as they're known (early), then returns them all. A search
+     * that's been typed past (stale) stops at its next request and is never kept.
+     */
+    List<Shelf> answer(String raw, java.util.function.Consumer<List<Shelf>> early, BooleanSupplier stale) throws Exception {
+        List<Shelf> kept = cached(raw);
+        if (kept != null) return kept;
+        List<Shelf> out = work(raw, early, stale);
+        if (!out.isEmpty() && !stale.getAsBoolean()) ANSWERS.put(read(raw).full, new Object[]{System.currentTimeMillis(), copy(out)});
         return out;
     }
 
-    /** Fresh shelves of the same results (each showing keeps its own picture views). */
+    /** Fresh shelves of the same results, so a shelf shown can't change one that's kept. */
     static List<Shelf> copy(List<Shelf> in) {
         List<Shelf> out = new ArrayList<>();
-        for (Shelf sh : in) out.add(new Shelf(sh.heading, new ArrayList<>(sh.items)));
+        for (Shelf sh : in) {
+            Shelf same = new Shelf(sh.heading, new ArrayList<>(sh.items));
+            same.person = sh.person;
+            out.add(same);
+        }
         return out;
     }
 
-    List<Shelf> work(String raw, java.util.function.Consumer<List<Shelf>> early) throws Exception {
+    List<Shelf> work(String raw, java.util.function.Consumer<List<Shelf>> early, BooleanSupplier stale) throws Exception {
         Query q = read(raw);
         List<Shelf> out = new ArrayList<>();
         if (q.like) {
-            List<Shelf> l = like(q);
+            List<Shelf> l = like(q, stale);
             if (l != null) return l;
             q = plain(q.full);  // no such title: an ordinary search
         }
-        if (q.about != null) return about(q);
+        if (q.implicit && q.about.contains(" ") && Suggestions.hasToken(c)) {
+            // "tom hardy films": someone's films when the words are a well-known name.
+            Query pq = new Query();
+            pq.full = q.full;
+            pq.text = q.about;
+            pq.person = true;
+            pq.type = q.type;
+            pq.genres.addAll(q.genres);
+            pq.fresh = q.fresh;
+            pq.best = q.best;
+            pq.yearMin = q.yearMin;
+            pq.yearMax = q.yearMax;
+            pq.decade = q.decade;
+            Person p = null;
+            try {
+                p = people(pq);
+            } catch (Exception ignored) {
+                // not a name we can look up: the subject, then
+            }
+            if (p != null) {
+                out.add(personShelf(p.heading, p.works, p.name));
+                return out;
+            }
+            if (stale.getAsBoolean()) return out;
+        }
+        if (q.about != null) return about(q, stale);
         if (q.browse()) {
             boolean anything = q.genres.isEmpty() && q.service == null && q.type == null && !q.fresh && !q.best
                     && q.yearMin == 0 && q.yearMax == 0;
@@ -442,9 +549,17 @@ final class SearchBrain {
         Query fq = q;
         Future<Person> people = q.text.length() >= 4 && Suggestions.hasToken(c)
                 && (q.text.contains(" ") || q.text.length() >= 5 || q.person) ? POOL.submit(() -> people(fq)) : null;
-        List<Result> top = titles(q);
+        List<Result> top = titles(q, stale);
+        if (stale.getAsBoolean()) return out;
         Result best = top.isEmpty() ? null : top.get(0);
-        boolean clear = best != null && matchScore(q.text, best.title) >= 85;
+        double bm = best == null ? 0 : matchScore(q.text, best.title);
+        boolean clear = bm >= 85;
+        // Titles related to a clear match are asked for now, beside the people lookup, not after it.
+        Future<List<Result>> related = clear ? POOL.submit(() -> similar(best, stale)) : null;
+        // A title by exactly that name goes up now, without waiting to see whether it's someone's
+        // name too: then it stays first whatever the people lookup finds.
+        boolean sent = early != null && bm >= 100 && !q.person;
+        if (sent) early.accept(copy(Collections.singletonList(new Shelf("Top Results", top))));
         List<Result> cast = null;
         String who = null, name = "";
         if (people != null) {
@@ -462,36 +577,53 @@ final class SearchBrain {
         if (q.person && (cast == null || cast.isEmpty())) {
             // "Gone with the Wind" read as a person: it's a title after all.
             Query t = plain(q.full);
-            return titleShelves(t, titles(t), null, null, early);
+            return titleShelves(t, titles(t, stale), null, null, null, early, null, false, stale);
         }
         boolean personFirst = cast != null && !cast.isEmpty()
-                && (q.person || !clear || matchScore(q.text, name) >= 100 && matchScore(q.text, best.title) < 100);
+                && (q.person || !clear || matchScore(q.text, name) >= 100 && bm < 100);
         if (personFirst) {
             // An actor or director, not a title: their work first, and only titles that really
             // match the name after it.
-            out.add(new Shelf(who, cast));
+            if (related != null) related.cancel(true);
+            out.add(personShelf(who, cast, name));
             top.removeIf(r -> matchScore(fq.text, r.title) < 85);
             if (!top.isEmpty()) out.add(new Shelf("Top Results", top));
             return out;
         }
-        return titleShelves(q, top, cast, who, early);
+        return titleShelves(q, top, cast, who, name, early, related, sent, stale);
     }
 
-    /** Top Results, More Like This for a clear match, then an actor's work if the name was theirs too. */
-    List<Shelf> titleShelves(Query q, List<Result> top, List<Result> cast, String who,
-                             java.util.function.Consumer<List<Shelf>> early) {
+    static Shelf personShelf(String heading, List<Result> works, String name) {
+        Shelf sh = new Shelf(heading, works);
+        sh.person = name;
+        return sh;
+    }
+
+    /**
+     * Top Results: the title asked for, then (for a clear match) titles related to it, as Apple's
+     * search has them, with no separate More Like This. Then an actor's work if the name was theirs
+     * too. The related titles were asked for beside the people lookup (related), or are now.
+     */
+    List<Shelf> titleShelves(Query q, List<Result> top, List<Result> cast, String who, String name,
+                             java.util.function.Consumer<List<Shelf>> early, Future<List<Result>> related,
+                             boolean sent, BooleanSupplier stale) {
         List<Shelf> out = new ArrayList<>();
-        if (!top.isEmpty()) out.add(new Shelf("Top Results", top));
+        List<Result> all = new ArrayList<>(top);
         Result best = top.isEmpty() ? null : top.get(0);
         if (best != null && matchScore(q.text, best.title) >= 85) {
-            if (early != null) early.accept(copy(out));
+            if (early != null && !sent) early.accept(copy(Collections.singletonList(new Shelf("Top Results", top))));
+            List<Result> more;
+            try {
+                more = related != null ? related.get(6, TimeUnit.SECONDS) : similar(best, stale);
+            } catch (Exception e) {
+                more = new ArrayList<>();
+            }
             Set<String> have = new HashSet<>();
             for (Result r : top) have.add(norm(r.title));
-            List<Result> more = new ArrayList<>();
-            for (Result r : similar(best)) if (have.add(norm(r.title))) more.add(r);
-            if (!more.isEmpty()) out.add(new Shelf("More Like This", more));
+            for (Result r : more) if (all.size() < TOP_MAX && have.add(norm(r.title))) all.add(r);
         }
-        if (cast != null && !cast.isEmpty()) out.add(new Shelf(who, cast));
+        if (!all.isEmpty()) out.add(new Shelf("Top Results", all));
+        if (cast != null && !cast.isEmpty()) out.add(personShelf(who, cast, name));
         return out;
     }
 
@@ -506,11 +638,11 @@ final class SearchBrain {
      * "Something like Slow Horses", "films like Inception on Netflix": what people who watch it
      * watch too, of the kind asked for, then the title itself. Null when there's no such title.
      */
-    List<Shelf> like(Query q) throws Exception {
-        List<Result> top = titles(plain(q.text));
+    List<Shelf> like(Query q, BooleanSupplier stale) throws Exception {
+        List<Result> top = titles(plain(q.text), stale);
         if (top.isEmpty() || matchScore(q.text, top.get(0).title) < 65) return null;
         Result to = top.get(0);
-        List<Result> sim = similar(to);
+        List<Result> sim = similar(to, stale);
         sim.removeIf(r -> q.type != null && !q.type.equals(r.type) || !wanted(q, r));
         if (q.service != null) {
             // On that service first.
@@ -539,20 +671,23 @@ final class SearchBrain {
     /**
      * "Films about sharks", "documentaries about space", "series set in Scotland": TMDB's keywords
      * for the subject, then the best-known films and series with them that can be watched in the UK.
-     * A title that happens to be worded that way ("Something About Mary") comes first.
+     * A title that happens to be worded that way ("Something About Mary") comes first; for a subject
+     * that was only implied ("dune films"), titles named by it that closely (Dune, Dune: Part Two).
      */
-    List<Shelf> about(Query q) throws Exception {
+    List<Shelf> about(Query q, BooleanSupplier stale) throws Exception {
         List<Shelf> out = new ArrayList<>();
-        Query named = plain(q.full);
-        Future<List<Result>> titled = POOL.submit(() -> titles(named));
-        List<Result> found = Suggestions.hasToken(c) ? subject(q) : new ArrayList<>();
+        Query named = plain(q.implicit ? q.about : q.full);
+        named.worded = !q.implicit;
+        double need = q.implicit ? 85 : 65;
+        Future<List<Result>> titled = POOL.submit(() -> titles(named, stale));
+        List<Result> found = Suggestions.hasToken(c) ? subject(q, stale) : new ArrayList<>();
         List<Result> top = new ArrayList<>();
         try {
             top = titled.get(8, TimeUnit.SECONDS);
         } catch (Exception ignored) {
             // the subject on its own
         }
-        top.removeIf(r -> matchScore(named.text, r.title) < 65);
+        top.removeIf(r -> matchScore(named.text, r.title) < need);
         if (!top.isEmpty()) out.add(new Shelf("Top Results", top));
         if (!found.isEmpty()) {
             String kind = q.has("doc") ? "Documentaries" : "tv".equals(q.type) ? "Series"
@@ -570,7 +705,8 @@ final class SearchBrain {
     static final Set<String> WEST_LANG = new HashSet<>(Arrays.asList(
             "en", "fr", "de", "es", "it", "nl", "sv", "no", "nb", "da", "fi", "is", "pt", "pl", "cs", "ga", "cy"));
 
-    List<Result> subject(Query q) throws Exception {
+    List<Result> subject(Query q, BooleanSupplier stale) throws Exception {
+        if (stale.getAsBoolean()) return new ArrayList<>();
         String subject = q.about.replace("xmas", "christmas");
         String one = singular(norm(subject));
         JSONArray ks = Suggestions.get(c, "/search/keyword?query=" + enc(subject)).optJSONArray("results");
@@ -582,7 +718,7 @@ final class SearchBrain {
             else if (ids.size() < 3 && (" " + name + " ").contains(" " + one)
                     && name.split(" ").length <= one.split(" ").length + 1) ids.add(k.optString("id"));
         }
-        if (ids.isEmpty()) return new ArrayList<>();
+        if (ids.isEmpty() || stale.getAsBoolean()) return new ArrayList<>();
         int thisYear = Calendar.getInstance().get(Calendar.YEAR);
         List<Future<JSONArray>> parts = new ArrayList<>();
         List<String> kinds = new ArrayList<>();
@@ -637,7 +773,7 @@ final class SearchBrain {
                 * w.optDouble("vote_average", 6) / 7;
     }
 
-    /** TMDB's genre ids for the genres asked for: "80,99" (crime and documentary), "10751|16" (family or animation). */
+    /** TMDB's genre ids for the genres asked for: "80,99" (crime and documentary). */
     static String tmdbGenres(List<Genre> gs, boolean tv) {
         List<String> and = new ArrayList<>();
         for (Genre g : gs) {
@@ -737,7 +873,7 @@ final class SearchBrain {
         JSONArray edges = popular(new JSONObject().put("searchQuery", q.text), 6, "POPULAR");
         double best = 0;
         for (int i = 0; i < edges.length(); i++) {
-            Result r = parse(edges.getJSONObject(i).getJSONObject("node"), mine);
+            Result r = parse(edges.getJSONObject(i).getJSONObject("node"), mine());
             double m = matchScore(q.text, r.title);
             if (m < 85) continue;
             double known = Math.log10(Math.max(10, r.votes)) * 8 + (western(r) ? 5 : 0);
@@ -751,7 +887,8 @@ final class SearchBrain {
     static final String NODE_FIELDS = " id objectType content(country: $country, language: $language) {"
             + " title originalReleaseYear posterUrl backdrops { backdropUrl } scoring { imdbScore imdbVotes tomatoMeter certifiedFresh }"
             + " productionCountries externalIds { tmdbId } genres { shortName } }"
-            + " offers(country: $country, platform: WEB) { monetizationType standardWebURL package { technicalName } }";
+            + " offers(country: $country, platform: WEB) { monetizationType standardWebURL"
+            + " package { technicalName addonParent(country: $country, platform: WEB) { technicalName } } }";
 
     static final String JW_SEARCH = "query S($country: Country!, $language: Language!, $first: Int!, $filter: TitleFilter, $sort: PopularTitlesSorting!) {"
             + " popularTitles(country: $country, filter: $filter, first: $first, sortBy: $sort) {"
@@ -772,7 +909,7 @@ final class SearchBrain {
     JSONArray packages(Suggestions.Provider only) {
         JSONArray a = new JSONArray();
         if (only != null) a.put(only.jwShort);
-        else for (Suggestions.Provider p : mine) a.put(p.jwShort);
+        else for (Suggestions.Provider p : mine()) a.put(p.jwShort);
         return a;
     }
 
@@ -788,14 +925,14 @@ final class SearchBrain {
         List<Result> out = new ArrayList<>();
         JSONArray edges = popular(filter, 40, "TRENDING");
         for (int i = 0; i < edges.length(); i++) {
-            Result r = parse(edges.getJSONObject(i).getJSONObject("node"), mine);
+            Result r = parse(edges.getJSONObject(i).getJSONObject("node"), mine());
             if (!r.offers.isEmpty()) merge(out, r);
         }
         return out;
     }
 
     /** A title search, ranked for a UK viewer. */
-    List<Result> titles(Query q) throws Exception {
+    List<Result> titles(Query q, BooleanSupplier stale) throws Exception {
         JSONObject filter = new JSONObject().put("searchQuery", q.text);
         if (q.type != null) filter.put("objectTypes", new JSONArray().put(q.type.equals("tv") ? "SHOW" : "MOVIE"));
         if (q.service != null) filter.put("packages", packages(q.service));
@@ -805,19 +942,53 @@ final class SearchBrain {
             filter.remove("packages");
             edges = popular(filter, 40, "POPULAR");
         }
-        // Nothing for a misspelling ("bridgerten"): try again with the end of the last word trimmed,
-        // as JustWatch matches the start of words; the word-by-word matching then forgives the typo.
-        for (int cut = 1; edges.length() == 0 && cut <= 3; cut++) {
+        List<Suggestions.Provider> on = mine();
+        List<Result> found = new ArrayList<>();
+        double best = 0;
+        for (int i = 0; i < edges.length(); i++) {
+            Result r = parse(edges.getJSONObject(i).getJSONObject("node"), on);
+            best = Math.max(best, matchScore(q.text, r.title));
+            merge(found, r);
+        }
+        if (best < 60 && !q.person && !q.worded && !stale.getAsBoolean()) {
+            // Nothing that matches what was typed ("bridgerten", "stranger thigns"). JustWatch matches
+            // the start of words, so it's asked again, all at once: with the last word cut short,
+            // and with every long word cut to its first three letters (for a slip early in a word).
+            // The word-by-word matching then forgives the typo; only titles it matches are kept.
             String[] w = q.text.trim().split(" ");
             String last = w[w.length - 1];
-            if (last.length() - cut < 4) break;
-            w[w.length - 1] = last.substring(0, last.length() - cut);
-            filter.put("searchQuery", String.join(" ", w));
-            edges = popular(filter, 40, "POPULAR");
+            List<String> tries = new ArrayList<>();
+            for (int cut = 1; cut <= 2 && last.length() - cut >= 4; cut++) {
+                String[] t = w.clone();
+                t[t.length - 1] = last.substring(0, last.length() - cut);
+                tries.add(String.join(" ", t));
+            }
+            StringBuilder starts = new StringBuilder();
+            boolean longWord = false;
+            for (String word : w) {
+                longWord |= word.length() >= 5;
+                starts.append(starts.length() > 0 ? " " : "").append(word.length() > 3 ? word.substring(0, 3) : word);
+            }
+            if (longWord) tries.add(starts.toString());
+            List<Future<JSONArray>> asks = new ArrayList<>();
+            for (String t : tries) {
+                JSONObject f = new JSONObject(filter.toString()).put("searchQuery", t);
+                asks.add(POOL.submit(() -> stale.getAsBoolean() ? new JSONArray() : popular(f, 40, "POPULAR")));
+            }
+            for (Future<JSONArray> ask : asks) {
+                JSONArray more;
+                try {
+                    more = ask.get(8, TimeUnit.SECONDS);
+                } catch (Exception e) {
+                    continue;
+                }
+                for (int i = 0; i < more.length(); i++) {
+                    Result r = parse(more.getJSONObject(i).getJSONObject("node"), on);
+                    if (matchScore(q.text, r.title) >= 60) merge(found, r);
+                }
+            }
         }
-        List<Result> found = new ArrayList<>();
-        for (int i = 0; i < edges.length(); i++) merge(found, parse(edges.getJSONObject(i).getJSONObject("node"), mine));
-        return rank(q, found);
+        return rank(q, found, recent);
     }
 
     /**
@@ -849,7 +1020,7 @@ final class SearchBrain {
      * how well known it is. Titles from elsewhere appear only when their name is exactly what was
      * asked for, and loose matches only when they're Western and watchable here.
      */
-    static List<Result> rank(Query q, List<Result> found) {
+    static List<Result> rank(Query q, List<Result> found, Set<String> recent) {
         List<Result> kept = new ArrayList<>();
         Map<Result, Double> score = new HashMap<>(), match = new HashMap<>();
         for (int i = 0; i < found.size(); i++) {
@@ -881,6 +1052,8 @@ final class SearchBrain {
             if (q.type != null) sc += q.type.equals(r.type) ? 12 : -12;
             // Well known beats obscure: a little for its audience size.
             sc += Math.min(10, Math.log10(Math.max(1, r.votes)) * 2);
+            // Opened from Search before (Recently Searched): likely what's wanted again.
+            if (r.id != null && recent.contains(r.id)) sc += 6;
             sc -= i * 0.5;                            // JustWatch's popularity order
             score.put(r, sc);
             match.put(r, m);
@@ -888,7 +1061,7 @@ final class SearchBrain {
         }
         kept.sort((a, b) -> Double.compare(score.get(b), score.get(a)));
         // When what was asked for is clearly one title (Slow Horses), titles that merely share a
-        // word with it (Only Fools and Horses) go: More Like This brings related titles instead.
+        // word with it (Only Fools and Horses) go: titles related to it follow it instead.
         if (!kept.isEmpty() && match.get(kept.get(0)) >= 85) {
             kept.removeIf(r -> match.get(r) < 60);
             // An exact title (Dune, The Office): other titles with its words in (Dune Drifter, Office
@@ -906,24 +1079,24 @@ final class SearchBrain {
             out.add(r);
             if (out.size() >= MAX) break;
         }
-        {
-            StringBuilder b = new StringBuilder("\"" + q.text + "\" year=" + q.year + " type=" + q.type + " service="
-                    + (q.service == null ? "" : q.service.name) + ":");
-            for (int i = 0; i < Math.min(10, out.size()); i++) {
-                Result r = out.get(i);
-                b.append(String.format(Locale.UK, "\n  %.0f %s (%s) m=%.0f v=%d %s", score.get(r), r.title, r.year,
-                        match.get(r), r.votes, r.countries));
-            }
-            android.util.Log.i("SearchBrain", b.toString());
-        }
         return out;
     }
 
     /** Browsing: "new comedy films on Netflix", "best thrillers", "80s films", "Netflix". */
     List<Result> browse(Query q) throws Exception {
         int thisYear = Calendar.getInstance().get(Calendar.YEAR);
+        // A service asked for by name counts as yours here even when its app isn't on this TV.
+        List<Suggestions.Provider> on = mine();
+        if (q.service != null && !on.contains(q.service)) {
+            on = new ArrayList<>(on);
+            on.add(q.service);
+        }
+        // A paid service's own titles are what its subscription includes: its free and with-ads
+        // offers are mostly other services' sample episodes, which would fill the shelf.
+        JSONArray money = new JSONArray().put("FLATRATE");
+        if (q.service == null || Suggestions.FREE_TO_WATCH.contains(q.service.id)) money.put("FREE").put("ADS");
         JSONObject filter = new JSONObject().put("packages", packages(q.service))
-                .put("monetizationTypes", new JSONArray().put("FLATRATE").put("FREE").put("ADS"))
+                .put("monetizationTypes", money)
                 .put("productionCountries", new JSONArray(WEST));
         if (!q.genres.isEmpty()) {
             // JustWatch matches any genre given: ask for the rarest (documentary, for true crime) and
@@ -964,8 +1137,8 @@ final class SearchBrain {
             for (int i = 0; i < more.length(); i++) edges.put(more.get(i));
         }
         for (int i = 0; i < edges.length() && out.size() < MAX * 2; i++) {
-            Result r = parse(edges.getJSONObject(i).getJSONObject("node"), mine);
-            if (r.offers.isEmpty()) continue;
+            Result r = parse(edges.getJSONObject(i).getJSONObject("node"), on);
+            if (r.offers.isEmpty() || q.service != null && !r.on(q.service.id)) continue;
             // Every genre asked for, and one of them what it mainly is (no cartoons for "comedy").
             if (!q.genres.isEmpty()) {
                 // (A rating says it's for children; "family" needn't be the first genre listed.)
@@ -993,16 +1166,16 @@ final class SearchBrain {
     }
 
     /** Titles like the one found: what people who watch it also watch, Western and watchable here. */
-    List<Result> similar(Result to) {
+    List<Result> similar(Result to, BooleanSupplier stale) {
         List<Result> out = new ArrayList<>();
-        if (to == null || to.id == null) return out;
+        if (to == null || to.id == null || stale.getAsBoolean()) return out;
         try {
             JSONObject vars = new JSONObject().put("id", to.id).put("country", "GB").put("language", "en");
             JSONObject res = Suggestions.post("https://apis.justwatch.com/graphql",
                     new JSONObject().put("query", JW_SIMILAR).put("variables", vars).toString());
             JSONArray edges = res.getJSONObject("data").getJSONObject("node").getJSONObject("similarTitlesV2").getJSONArray("edges");
             for (int i = 0; i < edges.length() && out.size() < MAX; i++) {
-                Result r = parse(edges.getJSONObject(i).getJSONObject("node"), mine);
+                Result r = parse(edges.getJSONObject(i).getJSONObject("node"), mine());
                 if (!western(r) || (r.offers.isEmpty() && !r.rentBuy)) continue;
                 out.add(r);
             }
@@ -1138,15 +1311,12 @@ final class SearchBrain {
      */
     Result resolve(Result t) {
         try {
-            Query q = new Query();
-            q.text = t.title;
-            q.type = t.type;
             JSONObject filter = new JSONObject().put("searchQuery", t.title)
                     .put("objectTypes", new JSONArray().put("tv".equals(t.type) ? "SHOW" : "MOVIE"));
             JSONArray edges = popular(filter, 10, "POPULAR");
             Result best = null;
             for (int i = 0; i < edges.length(); i++) {
-                Result r = parse(edges.getJSONObject(i).getJSONObject("node"), mine);
+                Result r = parse(edges.getJSONObject(i).getJSONObject("node"), mine());
                 if (r.tmdbId == t.tmdbId) return r;
                 if (best == null && matchScore(t.title, r.title) >= 100) best = r;
             }
@@ -1158,7 +1328,10 @@ final class SearchBrain {
 
     // ---------------------------------------------------------------- one title
 
-    /** One JustWatch title as a result: its art, year, scores, genres, where it's made, and your services' offers. */
+    /**
+     * One JustWatch title as a result: its art, year, scores, genres, where it's made, and the
+     * services of yours (mine) it's on.
+     */
     static Result parse(JSONObject n, List<Suggestions.Provider> mine) throws Exception {
         JSONObject ct = n.getJSONObject("content");
         Result r = new Result();
@@ -1190,12 +1363,27 @@ final class SearchBrain {
         r.poster = poster.isEmpty() ? null
                 : "https://images.justwatch.com" + poster.replace("{profile}", "s332").replace("{format}", "jpg");
         JSONArray offers = n.optJSONArray("offers");
+        // Who streams it by subscription, and the services whose paid add-on channels do (Apple TV
+        // on Prime Video): a free offer from one of those is a sample episode, not the title.
+        Set<String> paid = new HashSet<>();
+        for (int k = 0; offers != null && k < offers.length(); k++) {
+            JSONObject o = offers.getJSONObject(k);
+            JSONObject pk = o.optJSONObject("package");
+            if (pk == null || !"FLATRATE".equals(o.optString("monetizationType"))) continue;
+            paid.add(pk.optString("technicalName"));
+            JSONObject parent = pk.optJSONObject("addonParent");
+            if (parent != null) paid.add(parent.optString("technicalName"));
+        }
         for (Suggestions.Provider p : mine) {
             for (int k = 0; offers != null && k < offers.length(); k++) {
                 JSONObject o = offers.getJSONObject(k);
-                String m = o.optString("monetizationType");
-                if (!p.jwTech.equals(o.getJSONObject("package").optString("technicalName"))) continue;
-                if (!m.equals("FLATRATE") && !m.equals("FREE") && !m.equals("ADS")) continue;
+                String m = o.optString("monetizationType"), tech = o.getJSONObject("package").optString("technicalName");
+                if (!p.jwTech.equals(tech)) continue;
+                // A title is on a paid service when its subscription includes it: Prime Video's free
+                // first episode of an Apple TV series doesn't make the series Prime's. On the free
+                // services (iPlayer, ITVX, Channel 4) free and with-ads titles count too.
+                boolean free = (m.equals("FREE") || m.equals("ADS")) && Suggestions.FREE_TO_WATCH.contains(p.id) && !paid.contains(tech);
+                if (!m.equals("FLATRATE") && !free) continue;
                 Suggestions.Item it = new Suggestions.Item();
                 it.title = r.title;
                 it.type = r.type;
@@ -1258,15 +1446,20 @@ final class SearchBrain {
         return last && a.length() >= 3 && b.startsWith(a) ? 1 : 0;
     }
 
+    /** Letters added, dropped or changed between two words; two neighbours swapped ("thigns") is one slip. */
     static int edits(String a, String b) {
-        int[] prev = new int[b.length() + 1], cur = new int[b.length() + 1];
+        int[] prev2 = new int[b.length() + 1], prev = new int[b.length() + 1], cur = new int[b.length() + 1];
         for (int j = 0; j <= b.length(); j++) prev[j] = j;
         for (int i = 1; i <= a.length(); i++) {
             cur[0] = i;
             for (int j = 1; j <= b.length(); j++) {
                 cur[j] = Math.min(Math.min(cur[j - 1], prev[j]) + 1, prev[j - 1] + (a.charAt(i - 1) == b.charAt(j - 1) ? 0 : 1));
+                if (i > 1 && j > 1 && a.charAt(i - 1) == b.charAt(j - 2) && a.charAt(i - 2) == b.charAt(j - 1)) {
+                    cur[j] = Math.min(cur[j], prev2[j - 2] + 1);
+                }
             }
-            int[] t = prev;
+            int[] t = prev2;
+            prev2 = prev;
             prev = cur;
             cur = t;
         }

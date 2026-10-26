@@ -38,7 +38,7 @@ import java.util.Set;
 final class Suggestions {
 
     static final String PREFS = "suggestions";
-    static final String K_ENABLED = "enabled", K_TOKEN = "tmdb_token", K_TYPES = "types",
+    static final String K_TOKEN = "tmdb_token", K_TYPES = "types",
             K_PROVIDERS = "providers", K_LANGS = "languages", K_ADVANCE = "advance_sec", K_VERSION = "version",
             K_SOURCE = "source", K_SHELF = "shelf";
     /** What the top shelf shows: recommendations or nothing. */
@@ -46,8 +46,11 @@ final class Suggestions {
     /** Recommendation sources: JustWatch needs no key (unofficial API); TMDB needs a token. */
     static final String SRC_JUSTWATCH = "justwatch", SRC_TMDB = "tmdb";
     static final long MAX_AGE_MS = 2L * 60 * 60 * 1000;  // recommendations rotate every 2 hours
-    /** POOL titles are fetched per service; PER_SOURCE of them are picked at random each refresh. */
-    static final int PER_SOURCE = 3, POOL = 20, MAX_ITEMS = 10;
+    /**
+     * POOL titles are fetched per service; PER_SOURCE of them are picked at random each refresh.
+     * The mix holds at most MAX_ITEMS: the Apple TV app's carousel never shows more than 8 dots.
+     */
+    static final int PER_SOURCE = 3, POOL = 20, MAX_ITEMS = 8;
     /** Recommendations must be rated at least this on IMDb, by at least this many people. */
     static final double MIN_SCORE = 6.8;
     static final int MIN_VOTES = 1500, MIN_VOTES_FILM = 10000;
@@ -78,6 +81,13 @@ final class Suggestions {
             new Provider(1899, "HBO Max", "com.wbd.stream", "mxx", "max"),
             new Provider(531, "Paramount+", "com.cbs.ott", "pmp", "paramountplus"));
 
+    /**
+     * The services that are free to watch (iPlayer, ITVX, Channel 4): their shelves take free and
+     * with-ads titles. Every other service's shelf takes only what its subscription includes, so a
+     * paid add-on's free first episode (Slow Horses on Prime Video) never makes it Prime's title.
+     */
+    static final Set<Integer> FREE_TO_WATCH = new HashSet<>(Arrays.asList(38, 41, 103));
+
     /** Original-language filters offered in settings (TMDB ISO 639-1 codes). */
     static final String[] LANG_CODES = {"en", "fr", "es", "de", "it", "da", "sv", "ko", "ja"};
     static final String[] LANG_NAMES = {"English", "French", "Spanish", "German", "Italian", "Danish", "Swedish", "Korean", "Japanese"};
@@ -90,8 +100,6 @@ final class Suggestions {
         /** Exact title page on the service (JustWatch), opened directly in the app when it supports it. */
         String link = "";
         double rating;
-        /** News: when the story was published (ms), for "2 h ago". */
-        long published;
         /** JustWatch's first few backdrops; the sharpest becomes the backdrop (not saved). */
         final List<String> alts = new ArrayList<>();
         /** The title on TMDB, for its full-size artwork (not saved). */
@@ -101,7 +109,7 @@ final class Suggestions {
             return new JSONObject().put("id", id).put("providerId", providerId).put("type", type)
                     .put("title", title).put("overview", overview).put("backdrop", backdrop)
                     .put("logo", logo == null ? "" : logo).put("year", year).put("genres", genres).put("rating", rating)
-                    .put("link", link).put("pub", published);
+                    .put("link", link);
         }
 
         static Item fromJson(JSONObject o) {
@@ -111,15 +119,13 @@ final class Suggestions {
             i.type = o.optString("type");
             i.title = o.optString("title");
             i.overview = o.optString("overview");
-            // Lists saved before the switch to JustWatch's 1920 px backdrops get them too.
-            i.backdrop = o.optString("backdrop").replace("/s1440/", "/s1920/");
+            i.backdrop = o.optString("backdrop");
             i.logo = o.optString("logo");
             if (i.logo.isEmpty()) i.logo = null;
             i.year = o.optString("year");
             i.genres = o.optString("genres");
             i.rating = o.optDouble("rating", 0);
             i.link = o.optString("link");
-            i.published = o.optLong("pub");
             return i;
         }
 
@@ -135,13 +141,9 @@ final class Suggestions {
         return c.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
     }
 
-    /** What this profile's top shelf shows (each profile chooses; older global setting as fallback). */
+    /** What the top shelf shows. */
     static String shelf(Context c) {
-        String own = Profiles.homePrefs(c).getString(K_SHELF, null);
-        if (own != null) return own;
-        SharedPreferences p = prefs(c);
-        if (!p.contains(K_SHELF) && !p.getBoolean(K_ENABLED, true)) return SHELF_NONE;  // older setting
-        return p.getString(K_SHELF, SHELF_RECS);
+        return Profiles.homePrefs(c).getString(K_SHELF, SHELF_RECS);
     }
 
     static void setShelf(Context c, String value) {
@@ -149,15 +151,7 @@ final class Suggestions {
         changed(c);
     }
 
-    static void setShelf(Context c, boolean recs) {
-        setShelf(c, recs ? SHELF_RECS : SHELF_NONE);
-    }
-
     static boolean showRecs(Context c) {
-        return !shelf(c).equals(SHELF_NONE);
-    }
-
-    static boolean enabled(Context c) {
         return !shelf(c).equals(SHELF_NONE);
     }
 
@@ -207,9 +201,9 @@ final class Suggestions {
 
     // ------------------------------------------------------------------ data
 
-    /** One cache per content mix, so profiles with different choices don't overwrite each other. */
+    /** One cache per top-shelf choice (recommendations, or nothing). */
     static File cacheFile(Context c) {
-        return new File(c.getFilesDir(), "suggestions_" + shelf(c) + "_uk9.json");  // bump when the service list or the picking changes
+        return new File(c.getFilesDir(), "suggestions_" + shelf(c) + "_uk10.json");  // bump when the service list or the picking changes
     }
 
     /** Cached list, or null when missing/stale. */
@@ -244,14 +238,13 @@ final class Suggestions {
     static List<Item> fetch(Context c) throws Exception {
         List<Item> out = new ArrayList<>();
         Exception err = null;
-        if (showRecs(c) && (!source(c).equals(SRC_TMDB) || hasToken(c))) {
+        if (showRecs(c) && ready(c)) {
             try {
                 out = fetchRecs(c);
             } catch (Exception e) {
                 err = e;
             }
         }
-        android.util.Log.i("TvHome", "top shelf: " + out.size() + " recommendations");
         if (out.isEmpty() && err != null) throw err;
         JSONArray a = new JSONArray();
         for (Item it : out) a.put(it.toJson());
@@ -315,6 +308,16 @@ final class Suggestions {
                 }
                 o.put(String.valueOf(e.getKey()), a);
             }
+            // A chosen service that brought nothing back this time (its request failed on its
+            // own) keeps the shelf it had, rather than losing it until the next refresh.
+            Set<String> chosen = providers(c);
+            for (Map.Entry<Integer, List<Item>> e : byService(c).entrySet()) {
+                String id = String.valueOf(e.getKey());
+                if (o.has(id) || !chosen.contains(id)) continue;
+                JSONArray a = new JSONArray();
+                for (Item it : e.getValue()) a.put(it.toJson());
+                o.put(id, a);
+            }
             save(serviceFile(c), o.toString());
         } catch (Exception ignored) {
             // the mixed carousel still works without it
@@ -323,7 +326,7 @@ final class Suggestions {
     }
 
     static File serviceFile(Context c) {
-        return new File(c.getFilesDir(), "suggestions_by_service_4.json");
+        return new File(c.getFilesDir(), "suggestions_by_service_5.json");
     }
 
     /** The titles for the app with this package (its own top shelf), or an empty list. */
@@ -363,12 +366,19 @@ final class Suggestions {
         return m;
     }
 
-    /** Artwork older than three days leaves the disk cache, so it can't fill the TV's storage. */
+    /**
+     * Artwork older than three days (and its sharpness score) leaves the disk cache, so it can't
+     * fill the TV's storage. Lists saved under an older cache name go too.
+     */
     static void pruneImages(Context c) {
         File[] files = new File(c.getCacheDir(), "tmdb").listFiles();
         long cut = System.currentTimeMillis() - 3L * 24 * 60 * 60 * 1000;
         for (int i = 0; files != null && i < files.length; i++) {
             if (files[i].lastModified() < cut) files[i].delete();
+        }
+        for (String old : new String[]{"suggestions_" + SHELF_RECS + "_uk9.json", "suggestions_" + SHELF_NONE + "_uk9.json",
+                "suggestions_by_service_4.json"}) {
+            new File(c.getFilesDir(), old).delete();
         }
     }
 
@@ -377,7 +387,7 @@ final class Suggestions {
             + " edges { node { id objectType content(country: $country, language: $language) {"
             + " title originalReleaseYear shortDescription genres { shortName } backdrops { backdropUrl } scoring { imdbScore imdbVotes }"
             + " externalIds { tmdbId } }"
-            + " offers(country: $country, platform: WEB) { standardWebURL package { technicalName } } } } } }";
+            + " offers(country: $country, platform: WEB) { monetizationType standardWebURL package { technicalName } } } } } }";
 
     /** What's popular in the UK per service, from JustWatch's public GraphQL endpoint (no key). */
     static List<List<Item>> fetchJustWatch(Context c) throws Exception {
@@ -385,81 +395,109 @@ final class Suggestions {
         List<String> kinds = t.equals("both") ? Arrays.asList("tv", "movie") : Arrays.asList(t);
         Set<String> provs = providers(c);
         List<List<Item>> sources = new ArrayList<>();
+        Exception err = null;
         for (Provider p : PROVIDERS) {
             if (!provs.contains(String.valueOf(p.id))) continue;
+            boolean free = FREE_TO_WATCH.contains(p.id);
             for (String kind : kinds) {
-                // What's worth watching now: trending this week, from the last two years, rated
-                // 6.8+ on IMDb by enough people to mean it, and nothing made for children.
-                int thisYear = java.util.Calendar.getInstance().get(java.util.Calendar.YEAR);
-                JSONObject filter = new JSONObject()
-                        .put("packages", new JSONArray().put(p.jwShort))
-                        .put("objectTypes", new JSONArray().put(kind.equals("tv") ? "SHOW" : "MOVIE"))
-                        .put("monetizationTypes", new JSONArray().put("FLATRATE").put("FREE").put("ADS"))
-                        .put("releaseYear", new JSONObject().put("min", thisYear - 2))
-                        .put("imdbScore", new JSONObject().put("min", MIN_SCORE))
-                        .put("excludeGenres", new JSONArray().put("fml").put("ani"))
-                        // Popular with UK audiences overall, not with one community: South Asian
-                        // productions trend in the UK charts but aren't what this home wants.
-                        .put("excludeProductionCountries", NOT_UK_AUDIENCE);
-                JSONObject vars = new JSONObject().put("country", "GB").put("language", "en")
-                        .put("first", POOL).put("filter", filter).put("sort", "TRENDING");
-                JSONObject body = new JSONObject().put("query", JW_QUERY).put("variables", vars);
-                JSONObject res = post("https://apis.justwatch.com/graphql", body.toString());
-                JSONArray edges = res.getJSONObject("data").getJSONObject("popularTitles").getJSONArray("edges");
-                List<Item> list = new ArrayList<>();
-                for (int i = 0; i < edges.length() && list.size() < POOL; i++) {
-                    JSONObject n = edges.getJSONObject(i).getJSONObject("node");
-                    JSONObject ct = n.getJSONObject("content");
-                    JSONArray bds = ct.optJSONArray("backdrops");
-                    if (bds == null || bds.length() == 0) continue;
-                    JSONObject score = ct.optJSONObject("scoring");
-                    // Too obscure to judge; films need a wider audience than new British series.
-                    if (score == null || score.optInt("imdbVotes", 0) < (kind.equals("tv") ? MIN_VOTES : MIN_VOTES_FILM)) continue;
-                    Item it = new Item();
-                    it.id = Math.abs(n.optString("id").hashCode());
-                    it.type = kind;
-                    it.providerId = p.id;
-                    it.title = cleanTitle(ct.optString("title"));
-                    it.overview = ct.optString("shortDescription");
-                    for (int b = 0; b < Math.min(3, bds.length()); b++) {
-                        it.alts.add("https://images.justwatch.com" + bds.getJSONObject(b).getString("backdropUrl")
-                                .replace("{profile}", "s1920").replace("{format}", "jpg"));
-                    }
-                    it.backdrop = it.alts.get(0);
-                    JSONObject ext = ct.optJSONObject("externalIds");
-                    it.tmdbId = ext == null ? 0 : parseInt(ext.optString("tmdbId"));
-                    it.logo = "";
-                    int y = ct.optInt("originalReleaseYear", 0);
-                    it.year = y > 0 ? String.valueOf(y) : "";
-                    JSONObject sc = ct.optJSONObject("scoring");
-                    it.rating = sc == null ? 0 : sc.optDouble("imdbScore", 0);
-                    it.genres = jwGenres(ct.optJSONArray("genres"));
-                    JSONArray offers = n.optJSONArray("offers");
-                    for (int k = 0; offers != null && k < offers.length(); k++) {
-                        JSONObject o = offers.getJSONObject(k);
-                        if (p.jwTech.equals(o.getJSONObject("package").optString("technicalName"))) {
-                            it.link = o.optString("standardWebURL");
-                            break;
-                        }
-                    }
-                    list.add(it);
+                // One service failing to answer (a timeout, a bad reply) costs only its own shelf.
+                try {
+                    sources.add(fetchJustWatch(p, kind, free));
+                } catch (Exception e) {
+                    err = e;
                 }
-                sources.add(list);
             }
         }
+        if (sources.isEmpty() && err != null) throw err;
         return sources;
     }
 
-    static String jwGenres(JSONArray g) {
-        Map<String, String> names = new LinkedHashMap<>();
+    /** One service's popular series or films. */
+    static List<Item> fetchJustWatch(Provider p, String kind, boolean free) throws Exception {
+        // What's worth watching now: trending this week, from the last two years, rated
+        // 6.8+ on IMDb by enough people to mean it, and nothing made for children.
+        int thisYear = java.util.Calendar.getInstance().get(java.util.Calendar.YEAR);
+        JSONArray money = new JSONArray().put("FLATRATE");
+        if (free) money.put("FREE").put("ADS");
+        JSONObject filter = new JSONObject()
+                .put("packages", new JSONArray().put(p.jwShort))
+                .put("objectTypes", new JSONArray().put(kind.equals("tv") ? "SHOW" : "MOVIE"))
+                .put("monetizationTypes", money)
+                .put("releaseYear", new JSONObject().put("min", thisYear - 2))
+                .put("imdbScore", new JSONObject().put("min", MIN_SCORE))
+                .put("excludeGenres", new JSONArray().put("fml").put("ani"))
+                // Popular with UK audiences overall, not with one community: South Asian
+                // productions trend in the UK charts but aren't what this home wants.
+                .put("excludeProductionCountries", NOT_UK_AUDIENCE);
+        JSONObject vars = new JSONObject().put("country", "GB").put("language", "en")
+                .put("first", POOL).put("filter", filter).put("sort", "TRENDING");
+        JSONObject body = new JSONObject().put("query", JW_QUERY).put("variables", vars);
+        JSONObject res = post("https://apis.justwatch.com/graphql", body.toString());
+        JSONArray edges = res.getJSONObject("data").getJSONObject("popularTitles").getJSONArray("edges");
+        List<Item> list = new ArrayList<>();
+        for (int i = 0; i < edges.length() && list.size() < POOL; i++) {
+            JSONObject n = edges.getJSONObject(i).getJSONObject("node");
+            JSONObject ct = n.getJSONObject("content");
+            JSONArray bds = ct.optJSONArray("backdrops");
+            if (bds == null || bds.length() == 0) continue;
+            JSONObject score = ct.optJSONObject("scoring");
+            // Too obscure to judge; films need a wider audience than new British series.
+            if (score == null || score.optInt("imdbVotes", 0) < (kind.equals("tv") ? MIN_VOTES : MIN_VOTES_FILM)) continue;
+            // The service's own link to the title: for a subscription, the subscription's, never a
+            // free sample episode's. A title the subscription doesn't include isn't this service's.
+            String link = "";
+            boolean sampleOnly = false;
+            JSONArray offers = n.optJSONArray("offers");
+            for (int k = 0; offers != null && k < offers.length(); k++) {
+                JSONObject o = offers.getJSONObject(k);
+                if (!p.jwTech.equals(o.getJSONObject("package").optString("technicalName"))) continue;
+                sampleOnly = !free && !"FLATRATE".equals(o.optString("monetizationType"));
+                if (!sampleOnly) {
+                    link = o.optString("standardWebURL");
+                    break;
+                }
+            }
+            if (sampleOnly) continue;
+            Item it = new Item();
+            it.id = Math.abs(n.optString("id").hashCode());
+            it.type = kind;
+            it.providerId = p.id;
+            it.title = cleanTitle(ct.optString("title"));
+            it.overview = ct.optString("shortDescription");
+            for (int b = 0; b < Math.min(3, bds.length()); b++) {
+                it.alts.add("https://images.justwatch.com" + bds.getJSONObject(b).getString("backdropUrl")
+                        .replace("{profile}", "s1920").replace("{format}", "jpg"));
+            }
+            it.backdrop = it.alts.get(0);
+            JSONObject ext = ct.optJSONObject("externalIds");
+            it.tmdbId = ext == null ? 0 : parseInt(ext.optString("tmdbId"));
+            it.logo = "";
+            int y = ct.optInt("originalReleaseYear", 0);
+            it.year = y > 0 ? String.valueOf(y) : "";
+            it.rating = score.optDouble("imdbScore", 0);
+            it.genres = jwGenres(ct.optJSONArray("genres"));
+            it.link = link;
+            list.add(it);
+        }
+        return list;
+    }
+
+    /** JustWatch's genre codes, named as Apple's pages name them. */
+    static final Map<String, String> JW_GENRE_NAMES = new LinkedHashMap<>();
+
+    static {
         String[][] table = {{"act", "Action"}, {"ani", "Animation"}, {"cmy", "Comedy"}, {"crm", "Crime"},
                 {"doc", "Documentary"}, {"drm", "Drama"}, {"fml", "Family"}, {"fnt", "Fantasy"}, {"hst", "History"},
                 {"hrr", "Horror"}, {"msc", "Music"}, {"trl", "Thriller"}, {"rma", "Romance"}, {"scf", "Sci-Fi"},
                 {"spt", "Sport"}, {"war", "War"}, {"wsn", "Western"}, {"rly", "Reality"}};
-        for (String[] r : table) names.put(r[0], r[1]);
+        for (String[] r : table) JW_GENRE_NAMES.put(r[0], r[1]);
+    }
+
+    /** The first two genres JustWatch lists: "Crime · Drama". */
+    static String jwGenres(JSONArray g) {
         List<String> out = new ArrayList<>();
         for (int i = 0; g != null && i < g.length() && out.size() < 2; i++) {
-            String n = names.get(g.optJSONObject(i).optString("shortName"));
+            String n = JW_GENRE_NAMES.get(g.optJSONObject(i).optString("shortName"));
             if (n != null) out.add(n);
         }
         return String.join(" \u00b7 ", out);
@@ -532,15 +570,7 @@ final class Suggestions {
         try {
             JSONArray logos = get(c, "/" + it.type + "/" + it.id + "/images?include_image_language=en,null")
                     .optJSONArray("logos");
-            String best = "";
-            for (int i = 0; logos != null && i < logos.length(); i++) {
-                JSONObject l = logos.getJSONObject(i);
-                if (best.isEmpty() || "en".equals(l.optString("iso_639_1"))) {
-                    best = l.optString("file_path");
-                    if ("en".equals(l.optString("iso_639_1"))) break;
-                }
-            }
-            it.logo = best;
+            it.logo = bestLogo(logos);
         } catch (Exception e) {
             it.logo = "";
         }
@@ -591,7 +621,17 @@ final class Suggestions {
      * 1920 px wide. Null without a key, without a match, or offline.
      */
     static String tmdbBackdrop(Context c, String type, int tmdbId) {
-        if (tmdbId <= 0 || !hasToken(c)) return null;
+        return tmdbArt(c, type, tmdbId)[0];
+    }
+
+    /**
+     * A title's artwork on TMDB from one request: {backdrop, logo} as full URLs, either null when
+     * TMDB has none (or there is no key, or no connection). The logo is the title treatment the
+     * title page shows in place of its name.
+     */
+    static String[] tmdbArt(Context c, String type, int tmdbId) {
+        String[] art = new String[2];
+        if (tmdbId <= 0 || !hasToken(c)) return art;
         try {
             JSONObject r = get(c, "/" + ("tv".equals(type) ? "tv" : "movie") + "/" + tmdbId
                     + "/images?include_image_language=null,en");
@@ -611,10 +651,33 @@ final class Suggestions {
                     best = o.optString("file_path");
                 }
             }
-            return best == null || best.isEmpty() ? null : "https://image.tmdb.org/t/p/original" + best;
+            if (best != null && !best.isEmpty()) art[0] = "https://image.tmdb.org/t/p/original" + best;
+            String logo = bestLogo(r.optJSONArray("logos"));
+            if (!logo.isEmpty()) art[1] = "https://image.tmdb.org/t/p/w500" + logo;
         } catch (Exception e) {
-            return null;
+            // no artwork from TMDB this time
         }
+        return art;
+    }
+
+    /**
+     * The English title logo, else the best liked. Only PNGs: TMDB also has SVG logos, which
+     * Android can't open, so they'd leave the title with no logo at all.
+     */
+    static String bestLogo(JSONArray logos) {
+        String best = "";
+        double bestScore = -1;
+        for (int i = 0; logos != null && i < logos.length(); i++) {
+            JSONObject l = logos.optJSONObject(i);
+            String path = l == null ? "" : l.optString("file_path");
+            if (!path.endsWith(".png")) continue;
+            double score = ("en".equals(l.optString("iso_639_1")) ? 100 : 0) + l.optDouble("vote_average", 0);
+            if (score > bestScore) {
+                bestScore = score;
+                best = path;
+            }
+        }
+        return best;
     }
 
     /** TMDB GET. Accepts either a v4 read-access token (eyJ\u2026) or a v3 API key. */
@@ -640,7 +703,7 @@ final class Suggestions {
 
     // ------------------------------------------------------------------ images
 
-    /** TMDB image, cached on disk, decoded no larger than maxWidth (the box has little RAM). */
+    /** TMDB image (or any image URL), cached on disk, decoded no larger than maxWidth. */
     static Bitmap image(Context c, String path, String size, int maxWidth) {
         if (path == null || path.isEmpty()) return null;
         try {
@@ -653,10 +716,19 @@ final class Suggestions {
             while (o.outWidth / (o.inSampleSize * 2) >= maxWidth) o.inSampleSize *= 2;
             o.inJustDecodeBounds = false;
             o.inMutable = true;  // the carousel paints its shades straight onto it, with no copy
-            return BitmapFactory.decodeFile(f.getPath(), o);
+            return decoded(f, BitmapFactory.decodeFile(f.getPath(), o));
         } catch (Exception e) {
             return null;
         }
+    }
+
+    /**
+     * A file that won't open (an error page saved as a picture, a cut-off download) leaves the
+     * cache, so it is fetched again next time rather than failing until it's three days old.
+     */
+    static Bitmap decoded(File f, Bitmap b) {
+        if (b == null) f.delete();
+        return b;
     }
 
     /**
@@ -681,7 +753,7 @@ final class Suggestions {
                 o.inDensity = w;
                 o.inTargetDensity = width;
             }
-            return onGpu(BitmapFactory.decodeFile(f.getPath(), o));
+            return onGpu(decoded(f, BitmapFactory.decodeFile(f.getPath(), o)));
         } catch (Exception e) {
             return null;
         }
@@ -762,7 +834,11 @@ final class Suggestions {
         return best >= 0.55;
     }
 
-    /** The ratio below for one image: 1 when it can't be measured, 0 when it can't be fetched. */
+    /**
+     * The ratio below for one image: 1 when it can't be measured, 0 when it can't be fetched.
+     * Each score is kept beside its picture, so the next refresh (every 2 hours, mostly the same
+     * popular titles) reads a number instead of decoding and measuring the picture again.
+     */
     static double sharpness(Context c, String url) {
         if (url == null || !url.startsWith("http")) return 1;
         // Scored on the 1440 px copy: the threshold was set on that size (1920 px copies of the
@@ -771,7 +847,16 @@ final class Suggestions {
         try {
             File f = download(c, url, "");
             if (f == null) return 0;
-            android.graphics.BitmapRegionDecoder d = android.graphics.BitmapRegionDecoder.newInstance(f.getPath());
+            File known = new File(f.getPath() + ".sharp");
+            if (known.exists()) {
+                try {
+                    return Double.parseDouble(new String(readAll(new FileInputStream(known)), StandardCharsets.UTF_8).trim());
+                } catch (Exception ignored) {
+                    // measured again below
+                }
+            }
+            // The path-and-flag form: the path-only one is Android 12's, and older TVs crash on it.
+            android.graphics.BitmapRegionDecoder d = android.graphics.BitmapRegionDecoder.newInstance(f.getPath(), false);
             int w = d.getWidth(), h = d.getHeight();
             android.graphics.Rect r = new android.graphics.Rect(w / 4, h / 4, w * 3 / 4, h * 3 / 4);
             BitmapFactory.Options o = new BitmapFactory.Options();
@@ -782,6 +867,7 @@ final class Suggestions {
             double ratio = edges(full) / Math.max(1e-6, edges(half));
             full.recycle();
             half.recycle();
+            save(known, String.valueOf(ratio));
             return ratio;
         } catch (Exception e) {
             return 1;  // can't measure: don't drop the title for it
@@ -835,10 +921,10 @@ final class Suggestions {
     }
 
     /**
-     * Opens the title in its streaming app as directly as the app allows: the app's own search
-     * for the title (search intent, then its web-search link), falling back to launching the app,
-     * and to its Play Store page when it isn't installed. TMDB has no per-service title ids, so
-     * search is the most precise link available.
+     * Opens the title in its streaming app as directly as the app allows: JustWatch's link to the
+     * title on that service first, then the app's own search for it (search intent, then its
+     * web-search link), falling back to launching the app, and to its Play Store page when it
+     * isn't installed.
      */
     static void open(Context c, Item it) {
         Provider p = it.provider();
@@ -870,9 +956,15 @@ final class Suggestions {
         for (Intent i : tries) {
             if (i.resolveActivity(pm) != null && start(c, i)) return;
         }
-        Intent launch = pm.getLeanbackLaunchIntentForPackage(p.pkg);
-        if (launch == null) launch = pm.getLaunchIntentForPackage(p.pkg);
+        Intent launch = launchIntent(c, p.pkg);
         if (launch != null) start(c, launch);
+    }
+
+    /** The app's TV launch intent, or its phone one for apps without a TV banner; null if neither. */
+    static Intent launchIntent(Context c, String pkg) {
+        PackageManager pm = c.getPackageManager();
+        Intent i = pm.getLeanbackLaunchIntentForPackage(pkg);
+        return i != null ? i : pm.getLaunchIntentForPackage(pkg);
     }
 
     static Intent view(String url, String pkg) {

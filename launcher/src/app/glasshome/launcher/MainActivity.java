@@ -4,7 +4,6 @@ import android.animation.ObjectAnimator;
 import android.animation.ValueAnimator;
 import android.app.Activity;
 import android.app.ActivityOptions;
-import android.app.AlertDialog;
 import android.content.ActivityNotFoundException;
 import android.content.BroadcastReceiver;
 import android.content.ComponentName;
@@ -35,6 +34,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.provider.Settings;
 import android.text.TextUtils;
 import android.util.DisplayMetrics;
@@ -50,7 +50,6 @@ import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextClock;
 import android.widget.TextView;
-import android.widget.Toast;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -61,7 +60,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-/** tvOS-style home screen: blurred backdrop, top shelf title, rounded app tile grid. */
+/** tvOS 26-style Home: the top-shelf carousel behind a glass dock and the app grid. */
 public class MainActivity extends Activity {
 
     static final int COLS = 6;
@@ -91,6 +90,16 @@ public class MainActivity extends Activity {
             "org.videolan.vlc");
 
     static final PathInterpolator EASE = new PathInterpolator(0.2f, 0f, 0f, 1f);
+    /** The Apple TV app's easeOut and easeIn (quadratic): presses, menus, and focus going out. */
+    static final PathInterpolator EASE_OUT_QUAD = new PathInterpolator(0.333f, 0.667f, 0.667f, 1f),
+            EASE_IN_QUAD = new PathInterpolator(0.333f, 0f, 0.667f, 0.333f);
+    /** A gentle start and a soft landing, for a move nothing was pressed for (the dock leaving when idle). */
+    static final PathInterpolator STANDARD = new PathInterpolator(0.4f, 0f, 0.2f, 1f);
+    /**
+     * The Apple TV app's row and page scroll (its spring, stiffness 150 and damping 30, as a
+     * curve): half way in about a seventh of a second, then a long, soft settle.
+     */
+    static final PathInterpolator SCROLL = new PathInterpolator(0.2f, 0.7f, 0.25f, 1f);
     /** The carousel's motion and the apps' glass: a soft start and a long settle, like the Apple TV Top Shelf. */
     static final PathInterpolator HERO_EASE = new PathInterpolator(0.25f, 0.1f, 0.1f, 1f);
     /**
@@ -104,12 +113,19 @@ public class MainActivity extends Activity {
      * screen. They're drawn this much bigger on each side, so the pan never shows an edge.
      */
     static final float HERO_PAN = 0.02f;
-    /** tvOS focused icon is ~1.2x its resting size (303x183 vs 248x148 px in Apple's reference). */
-    static final float FOCUS_SCALE = 1.2f;
-    /** Focus lift: a damped spring (about 5% overshoot, settled well before the end), like tvOS. */
-    static final Spring LIFT = new Spring(0.68f, 10f);
-    /** The last focused tile, so a new focus can nudge in the direction the remote moved. */
-    int lastTile = -1;
+    /** tvOS 26's focused icon is ~1.22x its resting size (304x182 vs 249x149 px, measured on its Home Screen). */
+    static final float FOCUS_SCALE = 1.22f;
+    /**
+     * Pressed (the Apple TV app's "Acknowledge"): half the focus growth, sunk in 80 ms on OK's
+     * press and back in 80 ms on its release, then the card opens.
+     */
+    static final float PRESS_SCALE = 1f + (FOCUS_SCALE - 1f) * 0.5f;
+    static final long PRESS_MS = 80;
+    /**
+     * Focus lift: a damped spring, like tvOS (over 450 ms: 90% in about 120 ms, a 4% overshoot,
+     * settled by 300 ms). Going down is slower, so the card you left trails the one you reach.
+     */
+    static final Spring LIFT = new Spring(0.72f, 10f);
 
     static class AppEntry {
         String key, pkg, label;
@@ -121,6 +137,11 @@ public class MainActivity extends Activity {
         Intent launch;
         int color;
         boolean system;
+        /**
+         * The app's installed file and its date: a rescan keeps the card (and its drawn art) of an
+         * app whose stamp and name haven't changed.
+         */
+        String stamp;
     }
 
     /** Scroll position is driven by focus changes, not by ScrollView's own key handling. */
@@ -155,14 +176,17 @@ public class MainActivity extends Activity {
     }
     FrameLayout shelfView;
     LinearLayout heroInfo, heroDots;
-    /** The dots themselves, inside heroDots (which moves and fades the whole indicator). */
-    LinearLayout dotRow;
+    /** The dots themselves, inside heroDots (which shows and hides the whole indicator). */
+    PageDots dotRow;
+    /** How many pages the dots show, or are changing to (a row fading out still has the old count). */
+    int dotPages;
+    /** Full screen's chevrons at the left and right edges: Left and Right browse the carousel. */
+    View[] heroArrows;
     ImageView heroLogo;
     TextView heroTitle, heroMeta, heroOverview;
     /** tvOS-style capsule button: glass when idle, solid white with dark text when focused. */
     LinearLayout heroButton;
     TextView heroBtnText;
-    ImageView heroBtnIcon;
     ImageView heroProvider;
     GradientDrawable heroBtnBg;
     List<Suggestions.Item> heroItems = new ArrayList<>();
@@ -181,10 +205,35 @@ public class MainActivity extends Activity {
     ImageView drawerBack;
     final LiquidGlass.Backdrop glassSource = () -> glassBg;
     View dockRow;
-    boolean returningFromSettings;
-    final java.util.concurrent.ExecutorService io = java.util.concurrent.Executors.newSingleThreadExecutor();
-    final java.util.concurrent.ExecutorService preload = java.util.concurrent.Executors.newSingleThreadExecutor();
+    /**
+     * Settings changed what the grid holds (Reset Home Screen Layout, the Inputs card): rebuilt
+     * once Home is back in front.
+     */
+    static volatile boolean layoutChanged;
+
+    /**
+     * Home's background lanes, one thread each, kept for the life of the process (a recreate
+     * reuses them instead of leaving threads behind). io opens the pictures you're about to see;
+     * the others run at background priority, so their work gives way to the UI and drawing.
+     */
+    static final java.util.concurrent.ExecutorService io = lane("io", false);
+    /** The shelf's artwork fetched ahead, onto the disk. */
+    static final java.util.concurrent.ExecutorService preload = lane("preload", true);
+    /** The top shelf's refresh: many requests and picture checks, never in the carousel's way. */
+    static final java.util.concurrent.ExecutorService net = lane("shelf-fetch", true);
+    /** Rescans of the installed apps, after one is added, updated or removed. */
+    static final java.util.concurrent.ExecutorService scans = lane("apps", true);
+
+    static java.util.concurrent.ExecutorService lane(String name, boolean background) {
+        return java.util.concurrent.Executors.newSingleThreadExecutor(r -> new Thread(() -> {
+            if (background) android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
+            r.run();
+        }, name));
+    }
+
     volatile int preloadGen;
+    /** The top shelf is being refreshed (on net). */
+    volatile boolean fetching;
     final Runnable heroAdvance = () -> heroStep(1, false);
     ShelfScrollView scroll;
     LinearLayout content;
@@ -197,13 +246,15 @@ public class MainActivity extends Activity {
         if (clockBox == null) return;
         clockBox.animate().cancel();
         // Hiding is instant: the panel covers that corner, and animating Home behind it costs the
-        // slide-in its frames on this GPU. Coming back fades in once the panel has gone.
+        // slide-in its frames on this GPU. Coming back fades in once the panel has gone, only as far
+        // as the scroll allows (down in the app grid it stays hidden).
         if (!show) clockBox.setAlpha(0f);
-        else clockBox.animate().alpha(1f).setStartDelay(340).setDuration(320).setInterpolator(EASE).start();
+        else clockBox.animate().alpha(statusFocused() ? 1f : clockAlpha()).setStartDelay(200).setDuration(320)
+                .setInterpolator(EASE).start();
     }
     LinearLayout titleBox;
     View chevron;
-    TextView shelfTitle, shelfHint;
+    TextView shelfTitle, shelfHint, swipeHint;
     float unit = 2f;
     int screenW, screenH, tileW, tileH, gap, side, shelfH, labelH, radius, dockPadV, dockInset, dockOuter;
     int focusedIndex = 0;
@@ -212,20 +263,35 @@ public class MainActivity extends Activity {
     boolean resumed;
     ObjectAnimator wiggle;
     BroadcastReceiver pkgReceiver;
+    /** The grid's glide to a row (scrollToY), and the scroll position it's headed for. */
+    ValueAnimator rowScroll;
+    int rowScrollTarget = -1;
+    /**
+     * The last arrow acted on: its event time (held arrows are paced from it), whether it came
+     * quickly after the one before, and when it was handled (a focus change moments after that
+     * one is the arrow's own, not one Home made).
+     */
+    long lastArrowAt, arrowAt;
+    boolean fastMove;
+    /** Focus being put back (a return to Home, a closed menu): the card is simply up, with no lift. */
+    boolean snapFocus;
+    /** When OK last opened something: a second press within 250 ms is ignored, as on Apple TV. */
+    long lastSelectAt;
+    final int[] focusLoc = new int[2];
 
     final Runnable shelfUpdate = () -> {
         if (focusedIndex >= 0 && focusedIndex < shown.size()) {
             shelfFor(shown.get(focusedIndex), hasDock() && focusedIndex < COLS);
         }
     };
-    final Runnable reloadRun = () -> reload(currentKey());
+    final Runnable reloadRun = this::reload;
 
     @Override
     protected void onCreate(Bundle b) {
         live = new java.lang.ref.WeakReference<>(this);
         super.onCreate(b);
         // The wallpaper/artwork always covers the screen: skip the window's own full-screen fill
-        // (this Mali-450 GPU is fill-rate bound, so every hidden full-screen layer costs frames).
+        // (this TV's Mali GPU is fill-rate bound, so every hidden full-screen layer costs frames).
         getWindow().setBackgroundDrawable(null);
         prefs = Profiles.homePrefs(this);
 
@@ -242,90 +308,95 @@ public class MainActivity extends Activity {
         tileW = (screenW - 2 * side - (COLS - 1) * gap) / COLS;
         tileH = tileW * 3 / 5;
         labelH = dp(30);
-        radius = Math.round(tileW * 0.071f);  // Apple's tvOS 26 card corner: ~7% of card width
+        radius = Math.round(tileW * 0.105f);  // tvOS 26 icon corners: ~26-28 px on a 249 px icon
         shelfH = (int) (screenH * 0.73f);    // dock top sits ~73% down the screen
         dockPadV = dp(20);
 
-        Clicks.init(this);
+        // The clicks are made (or read back) on their own thread: the first frame doesn't need them.
+        new Thread(() -> Clicks.init(this), "clicks").start();
         // Startup: the app list (package manager, banners, icon colours) and the wallpaper are
-        // prepared in the background while the window's views are built (~250 ms saved on 1 GHz TVs).
-        java.util.concurrent.Future<?> appsTask = io.submit(this::loadApps);
-        // Once: the calmer Night background replaces Aurora, the old default (still in Settings).
-        if (!prefs.getBoolean("night_default", false)) {
-            if ("aurora".equals(prefs.getString("wallpaper", "aurora"))) prefs.edit().putString("wallpaper", "night").apply();
-            prefs.edit().putBoolean("night_default", true).apply();
-        }
+        // prepared in the background while the window's views are built (about a quarter of a
+        // second saved at start-up).
+        java.util.concurrent.Future<Map<String, AppEntry>> appsTask = io.submit(() -> scan(null));
         String wall = prefs.getString("wallpaper", "night");
         wallPrefetch = new java.util.concurrent.FutureTask<>(() -> makeWallpaper(wall));
         wallPrefetchStyle = wall;
         new Thread((Runnable) wallPrefetch, "wallpaper").start();
-        // After an update that changes what the top shelf holds, start from a fresh carousel.
-        if (Suggestions.prefs(this).getInt("cache_format", 0) != 3) {
-            Suggestions.changed(this);
-            Suggestions.prefs(this).edit().putInt("cache_format", 3).apply();
-        }
         buildChrome();
+        Map<String, AppEntry> found;
         try {
-            appsTask.get();
+            found = appsTask.get();
         } catch (Exception e) {
-            loadApps();
+            found = scan(null);
         }
+        install(found);
         buildGrid();
         focusIndex(0);
         registerPackageReceiver();
+        registerScreenOff();
     }
 
     @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
-        // adb perf probe: --es perf weather|status|hero|dockglass|shadows hides one layer to measure its GPU cost.
-        String perf = intent.getStringExtra("perf");
-        if (perf != null) {
-            switch (perf) {
-                case "weather": weatherCard.setVisibility(View.GONE); break;
-                case "status": clockBox.setVisibility(View.GONE); break;
-                case "hero": for (ImageView v : heroLayers()) v.setVisibility(View.GONE); break;
-                case "dockglass": if (dockRow != null) dockRow.setBackground(null); break;
-                case "shadows": for (View t : tiles) t.setElevation(0); break;
-                default: recreate(); break;
-            }
-            return;
-        }
-        // adb hook for screenshots: am start -n app.glasshome.launcher/.MainActivity --es panel cc|inputs|weather
+        // Home twice (KeysService) opens the App Switcher; adb screenshots use --es panel cc|inputs|weather.
         String panel = intent.getStringExtra("panel");
         if (panel != null) {
             closeMenu();
             if (panel.equals("cc")) openControlCentre();
             else if (panel.equals("inputs")) openInputs();
             else if (panel.equals("weather")) showWeather();
-            else if (panel.equals("switcher") && switcher == null) AppSwitcher.open(this);  // Home twice (KeysService)
+            else if (panel.equals("switcher") && switcher == null) AppSwitcher.open(this);
+            return;
+        }
+        if (settingsNext) {
+            // Control Centre's Home Screen settings, routed through Home (see settingsNext): not a
+            // press of Home, so focus stays where it was for when Settings closes.
+            if (idle) exitIdle();
+            closeMenu();
+            return;
+        }
+        // The TV woke with Home on screen (its power key starts Home with a wake reason): that
+        // isn't a press of Home either, so focus stays where it was, as tvOS resumes where you
+        // were. A wake over an app still falls through, so focus returns to that app's card.
+        String why = intent.getStringExtra("android.intent.extra.EXTRA_START_REASON");
+        if (why != null && why.startsWith("WAKE_REASON") && !intent.getBooleanExtra("android.intent.extra.FROM_HOME_KEY", false)
+                && !(away && appOpened)) {
+            resetIdle();
             return;
         }
         if (idle) exitIdle();
         resetIdle();
         // Home lands on the card of the app you just left, as on Apple TV (in the dock, the grid
         // or the folder), else on the first app in the dock. Close any overlay first (Control
-        // Center, Inputs, weather forecast, menus, move mode, folder).
+        // Centre, Inputs, weather forecast, menus, move mode, folder).
         int back = away && appOpened && openedKey != null ? indexOfKey(openedKey) : -1;
         if (switcher != null) switcher.close();
-        if (pickerLayer != null) {
+        handler.removeCallbacks(pressAction);  // an OK on its way to opening something is dropped
+        pressAction = null;
+        if (forecastLayer != null) {
             popoverReturn = null;
-            FrameLayout l = pickerLayer;
-            pickerLayer = null;
+            FrameLayout l = forecastLayer;
+            forecastLayer = null;
             weatherOpen = false;
             root.removeView(l);
             weatherCard.setAlpha(weatherAlpha());
+            scanAfter(250);  // a rescan it held back
         }
         closeMenu();
         // Home pressed while already on the home screen: jump back to the top of the home grid.
         if (moveIndex >= 0) endMove();
         if (back >= 0) {
-            focusIndex(back);
+            // Put back, not moved to: the card is simply up when the app has gone, with its row
+            // already in view, as the Apple TV app restores focus to an uncovered page.
+            snapFocus = true;
+            focusIndex(back, false);
+            snapFocus = false;
         } else if (folderMode) {
             folderMode = false;
             weatherCard.setAlpha(weatherAlpha());
             buildGrid();
-            scroll.scrollTo(0, 0);
+            scrollToY(0, false);
             focusIndex(0);
         } else {
             goTop();
@@ -355,6 +426,31 @@ public class MainActivity extends Activity {
         onScreen = false;
         away = true;
         if (switcher != null) switcher.dismissNow();
+        // Leaving Home (an app's button on the remote, the screen saver, sleep) ends move mode and
+        // closes a context menu, as tvOS does: nothing is still wiggling when you come back, and
+        // the arrows move focus again. Out of sight, so at once rather than animated.
+        if (moveIndex >= 0) endMove();
+        if (menuLayer != null) {
+            FrameLayout m = menuLayer;
+            View card = menuReturnFocus;
+            menuLayer = null;
+            menuReturnFocus = null;
+            snapFocus = true;
+            if (card != null && card.isAttachedToWindow()) card.requestFocus();
+            snapFocus = false;
+            root.removeView(m);
+        }
+        // A card still sunk from a press (Home or an app's button came before OK's release): up again.
+        View f = getCurrentFocus();
+        if (moveIndex < 0 && f != null && tiles.contains(f)) {
+            f.animate().cancel();
+            f.setScaleX(FOCUS_SCALE);
+            f.setScaleY(FOCUS_SCALE);
+            f.setTranslationX(0);
+            f.setTranslationY(0);
+            f.setTranslationZ(dp(18));
+            f.setRotation(0);
+        }
     }
 
     /** The App Switcher while it's up (Home pressed twice). */
@@ -369,13 +465,17 @@ public class MainActivity extends Activity {
         resumed = true;
         away = false;
         KeysService.ensureOn(this);
-        String ws = Profiles.homePrefs(this).getString("wallpaper", "night");
+        String ws = prefs.getString("wallpaper", "night");
         if (!ws.equals(wallStyle)) {
             wallStyle = ws;
             setWallpaper(ws);
         }
-        if (returningFromSettings && !folderMode && moveIndex < 0) reload(currentKey());
-        returningFromSettings = false;
+        if (layoutChanged) {
+            // After Settings' closing animation, which the rebuild would otherwise cost frames.
+            layoutChanged = false;
+            handler.removeCallbacks(reloadRun);
+            handler.postDelayed(reloadRun, 450);
+        }
         // Back from an app: Android animates the app's window away over Home first, and any work
         // Home does meanwhile costs that animation frames. So the refresh waits until it's done.
         if (appOpened) {
@@ -389,8 +489,6 @@ public class MainActivity extends Activity {
             startActivity(new Intent(this, SetupActivity.class));
             return;
         }
-        // Home never holds the screen on: the TV's screen saver starts when it's idle.
-        getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         resetIdle();
         if (settingsNext) {
             // Control Centre's Home Screen settings: opened from here, once Home is back in front.
@@ -399,14 +497,17 @@ public class MainActivity extends Activity {
                 if (resumed) startActivity(new Intent(this, SettingsActivity.class));
             });
         }
-        // Opened from the app list while another launcher is the home screen: offer once to take over.
-        if (SetupActivity.done(this) && !Perms.isDefaultHome(this) && !prefs.getBoolean("asked_default_home", false)) {
+        // Opened from the app list while another launcher is the home screen: offer once to take
+        // over. Whether it was asked comes first, so Android isn't asked for the home screen on
+        // every return once it has been.
+        if (SetupActivity.done(this) && !prefs.getBoolean("asked_default_home", false) && !Perms.isDefaultHome(this)) {
             prefs.edit().putBoolean("asked_default_home", true).apply();
-            new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-                    .setTitle("Use " + getString(R.string.app_name) + " as Your Home Screen?")
-                    .setMessage("Your remote\u2019s Home button will open " + getString(R.string.app_name) + ".")
-                    .setPositiveButton("Use " + getString(R.string.app_name), (d, w) -> Perms.requestDefaultHome(this))
-                    .setNegativeButton("Not Now", null).show();
+            // A tvOS alert, as every other question in the app (its keys: see dispatchKeyEvent).
+            String app = getString(R.string.app_name);
+            Perms.alert(this, "Use " + app + " as Your Home Screen?", "Your remote\u2019s Home button will open " + app + ".",
+                    new String[]{"Use " + app, "Not Now"}, -1, w -> {
+                        if (w == 0) Perms.requestDefaultHome(this);
+                    });
         }
     }
 
@@ -443,12 +544,39 @@ public class MainActivity extends Activity {
             handler.postDelayed(this.resumeWork, 500);
             return;
         }
-        loadHero();
-        updateWeather();
+        // The network as it is now. Just after a wake it is usually still coming back: what needs
+        // the internet waits for it, and updateNet refreshes everything the moment it's back.
+        readNet();
+        loadHero(online(true));
+        // The carousel moves on by itself again (leaving Home stopped it), unless you're browsing it.
+        if (!shelfView.hasFocus()) scheduleAdvance();
+        // The focused dock app's own shelf, held back while its app was opening (launchAnimated).
+        if (tiles.contains(getCurrentFocus())) {
+            handler.removeCallbacks(shelfUpdate);
+            handler.postDelayed(shelfUpdate, 260);
+        }
         resetIdle();  // the return clears pending callbacks, the idle timer among them
+        // Apps added, updated or removed while Home was out of sight: rescanned now, after the return.
+        if (this.appsDirty) reload();
+        else applyPendingScan();
+        // The weather and the sleep timer's glyph at once, then every minute.
+        firstTick = true;
         handler.removeCallbacks(this.weatherTick);
         handler.post(this.weatherTick);
     };
+
+    /** The next weather check is the first since Home came back. */
+    boolean firstTick;
+
+    /**
+     * Whether to reach for the internet now. Straight after a return or a wake (fresh) only a
+     * working connection counts: the link is usually still coming back, and updateNet refreshes
+     * everything once it is. Later any network does, so one whose internet check never passes
+     * (a blocked connectivity check) still refreshes.
+     */
+    boolean online(boolean fresh) {
+        return netState == 2 || (!fresh && netState == 1);
+    }
 
     @Override
     protected void onPause() {
@@ -464,7 +592,9 @@ public class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        stopWiggle(false);  // an endless animator would keep this (destroyed) Home alive
         if (pkgReceiver != null) unregisterReceiver(pkgReceiver);
+        if (screenOffReceiver != null) unregisterReceiver(screenOffReceiver);
         if (netCallback != null) {
             try {
                 getSystemService(android.net.ConnectivityManager.class).unregisterNetworkCallback(netCallback);
@@ -482,10 +612,10 @@ public class MainActivity extends Activity {
         root.setBackground(null);
 
         // One ambient wallpaper for every app. It is drawn tiny and upscaled, so it is already
-        // soft; a slow drift keeps it alive without a per-frame blur on this weak GPU.
+        // soft, with no per-frame blur on this weak GPU.
         wallView = new ImageView(this);
         wallView.setScaleType(ImageView.ScaleType.CENTER_CROP);
-        wallStyle = Profiles.homePrefs(this).getString("wallpaper", "night");
+        wallStyle = prefs.getString("wallpaper", "night");
         setWallpaper(wallStyle);
         root.addView(wallView, match());
 
@@ -539,32 +669,45 @@ public class MainActivity extends Activity {
         titleBox.addView(shelfHint);
         shelf.addView(titleBox, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM));
-        // Wide, thin chevron above the dock, as on tvOS.
-        int cw = dp(30), ch = dp(9);
+        // tvOS 26's docked Top Shelf: a wide, thin chevron over "Swipe up for full screen", just
+        // above the dock (Up here: the remote has no touch surface). The chevron rises to make room
+        // for the hint (setHeroShown); in the app grid it sits alone at the top, pointing back up.
+        int cw = dp(27), ch = dp(6);
+        float stroke = dp(1.5f);
         Bitmap cb = Bitmap.createBitmap(cw, ch, Bitmap.Config.ARGB_8888);
         Paint cp = new Paint(Paint.ANTI_ALIAS_FLAG);
         cp.setColor(0xCCFFFFFF);
         cp.setStyle(Paint.Style.STROKE);
-        cp.setStrokeWidth(dp(2));
+        cp.setStrokeWidth(stroke);
         cp.setStrokeCap(Paint.Cap.ROUND);
         cp.setStrokeJoin(Paint.Join.ROUND);
         android.graphics.Path cpath = new android.graphics.Path();
-        float pad = dp(2);
+        float pad = stroke / 2f;  // the stroke spans the whole box, as Apple's 54x12 does
         cpath.moveTo(pad, ch - pad);
         cpath.lineTo(cw / 2f, pad);
         cpath.lineTo(cw - pad, ch - pad);
         new Canvas(cb).drawPath(cpath, cp);
         ImageView chevronView = new ImageView(this);
         chevronView.setImageBitmap(cb);
+        chevronView.setAlpha(0f);  // until there's a carousel (heroChrome)
         chevron = chevronView;
         FrameLayout.LayoutParams chp = new FrameLayout.LayoutParams(cw, ch,
                 Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
         chp.bottomMargin = dp(14);
         shelf.addView(chevron, chp);
+        swipeHint = text(12, Ui.font(this, "regular"), 0f);
+        // 70% white in the colour, not the view's alpha: text with a shadow at part alpha is drawn
+        // through an off-screen layer every frame, and this one rests over the carousel.
+        swipeHint.setTextColor(0xB3FFFFFF);
+        swipeHint.setText("Press up for full screen");
+        FrameLayout.LayoutParams shp = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
+        shp.bottomMargin = dp(10);
+        shelf.addView(swipeHint, shp);
         content.addView(shelf, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, shelfH));
 
-        // tvOS 26 status row (per Apple's Control Center reference): plain time, then a glass
-        // Control Center button that turns white and lifts when focused.
+        // tvOS 26 status row (per Apple's Control Centre reference): plain time, then a glass
+        // Control Centre button that turns white and lifts when focused.
         int btn = dp(34);
         clockBox = new LinearLayout(this);
         clockBox.setOrientation(LinearLayout.HORIZONTAL);
@@ -577,20 +720,28 @@ public class MainActivity extends Activity {
         time.setFormat12Hour("h:mm a");
         time.setFormat24Hour("H:mm");
         time.setAllCaps(true);
-        // Internet status, left of the time, drawn at its exact size (no scaling, so it stays crisp).
+        // Status glyphs left of the time, as tvOS shows them: only while they have something to
+        // say (a sleep timer running, no internet), each drawn at its exact size so it stays crisp.
+        timerIcon = new ImageView(this);
+        timerIcon.setScaleType(ImageView.ScaleType.CENTER);
+        timerIcon.setVisibility(View.GONE);
+        LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        tlp.rightMargin = dp(7);
         netIcon = new ImageView(this);
         netIcon.setScaleType(ImageView.ScaleType.CENTER);
+        netIcon.setVisibility(View.GONE);
         LinearLayout.LayoutParams nlp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         nlp.rightMargin = dp(7);
-        // The network icon and time on the same glass as the gear beside it and the weather
-        // opposite: one material across the top of the screen. Just to read, never focused.
-        LinearLayout timeChip = new LinearLayout(this);
+        // The glyphs and time on the same glass as the gear beside it and the weather opposite:
+        // one material across the top of the screen. Just to read, never focused.
+        timeChip = new LinearLayout(this);
         timeChip.setOrientation(LinearLayout.HORIZONTAL);
         timeChip.setGravity(Gravity.CENTER_VERTICAL);
-        timeChip.setPadding(dp(13), 0, dp(15), 0);
+        timeChip.setPadding(dp(15), 0, dp(15), 0);
         timeChip.setBackground(pillGlass(btn / 2f));
         // No text shadow: the pill gives the contrast, and a blurred shadow is cut off at the
         // text's own edges, which showed as a faint dark box around the numbers.
+        timeChip.addView(timerIcon, tlp);
         timeChip.addView(netIcon, nlp);
         timeChip.addView(time);
         clockBox.addView(timeChip, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, btn));
@@ -615,7 +766,7 @@ public class MainActivity extends Activity {
             // The white plate fades over the glass and the gear darkens with it, frame by frame
             // (one gear image, tinted, rather than a new one drawn and uploaded each time).
             ValueAnimator fade = ValueAnimator.ofFloat(ccLit.getAlpha() / 255f, has ? 1f : 0f);
-            fade.setDuration(has ? 200 : 260);
+            fade.setDuration(has ? 170 : 180);  // Glass.focus's timing, as every other plate
             fade.setInterpolator(EASE);
             fade.addUpdateListener(an -> {
                 float t = (float) an.getAnimatedValue();
@@ -673,21 +824,37 @@ public class MainActivity extends Activity {
         root.addView(weatherCard, wlp);
         updateWeather();
 
+        // Home's focus tick, as tvOS plays it: only for a move an arrow made (none for focus Home
+        // puts somewhere itself, nor for a press into a wall), panned to where focus landed.
+        root.getViewTreeObserver().addOnGlobalFocusChangeListener((was, now) -> {
+            if (now == null || SystemClock.uptimeMillis() - arrowAt > 150) return;
+            float x = 0.5f;
+            if (now.isLaidOut()) {
+                now.getLocationOnScreen(focusLoc);
+                x = (focusLoc[0] + now.getWidth() * now.getScaleX() / 2f) / screenW;
+            } else if (tiles.contains(now)) {
+                // A card in a grid rebuilt this moment (move mode): not placed yet, so from its column.
+                x = (side + tiles.indexOf(now) % COLS * (tileW + gap) + tileW / 2f) / screenW;
+            }
+            Clicks.move(this, x, fastMove);
+        });
+
         setContentView(root);
     }
 
     void buildGrid() {
-        stopWiggle();
+        stopWiggle(false);
         shown.clear();
         if (folderMode) {
             shown.addAll(hiddenApps);
         } else {
             shown.addAll(apps);
-            if (!hiddenApps.isEmpty()) shown.add(folderEntry());
+            if (folder != null) shown.add(folder);
         }
         // Like tvOS, the home grid has no big title; only the folder gets a header.
         titleBox.setVisibility(folderMode ? View.VISIBLE : View.GONE);
         chevron.setVisibility(folderMode ? View.GONE : View.VISIBLE);
+        swipeHint.setVisibility(folderMode ? View.GONE : View.VISIBLE);
         shelfTitle.setText("More Apps");
         shelfHint.setText("Hold OK for options.");
 
@@ -706,7 +873,7 @@ public class MainActivity extends Activity {
                 row.setPadding(side, 0, side, 0);
                 LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(
                         ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-                rlp.bottomMargin = gap / 2;
+                rlp.bottomMargin = rowGap();
                 View add = row;
                 if (i == 0 && hasDock()) {
                     // tvOS 26 dock: the top row sits on one frosted glass panel. The glass is its own
@@ -752,9 +919,16 @@ public class MainActivity extends Activity {
         bg.setCornerRadius(radius);
         bg.setColor(a.banner != null ? 0xFF1C1C1E : a.color);
         tile.setBackground(bg);
-        tile.setOutlineProvider(roundedOutline(new float[]{radius}));
+        tile.setOutlineProvider(roundedOutline(radius));
         tile.setClipToOutline(true);
         tile.setElevation(0);  // only the focused tile casts a shadow (its lift); resting ones are flat
+        // tvOS's resting edge: a 1 px hairline of 5% white over the art, so dark icons (Apple TV,
+        // Channel 4) keep their shape on the dark dock and drawer.
+        GradientDrawable edge = new GradientDrawable();
+        edge.setCornerRadius(radius);
+        edge.setColor(Color.TRANSPARENT);
+        edge.setStroke(Math.max(1, Math.round(unit / 2f)), 0x0DFFFFFF);
+        tile.setForeground(edge);
 
         ImageView iv = new ImageView(this);
         if (a.banner != null) {
@@ -769,63 +943,90 @@ public class MainActivity extends Activity {
             tile.addView(iv, new FrameLayout.LayoutParams(s, s, Gravity.CENTER));
         }
 
-        // tvOS focus has no outline ring: a soft top sheen plus a one-shot glare sweep instead.
-        View topSheen = new View(this);
-        topSheen.setBackground(new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
-                new int[]{0x1AFFFFFF, 0x00FFFFFF}));
-        topSheen.setAlpha(0f);
-        tile.addView(topSheen, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, tileH / 2, Gravity.TOP));
+        // tvOS focus has no outline ring: the icon is lit instead (its specular glow and bright
+        // rim, faded in with the lift), plus a one-shot glare sweep. One view over the art, so its
+        // fades need no off-screen pass.
+        View shine = new View(this);
+        shine.setBackground(new Shine(radius, 1.25f * unit));  // a 2.5 px rim, 3 px once lifted
+        shine.forceHasOverlappingRendering(false);
+        shine.setAlpha(0f);
+        tile.addView(shine, match());
         View glare = new View(this);
         glare.setBackground(new GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT,
-                new int[]{0x00FFFFFF, 0x1AFFFFFF, 0x00FFFFFF}));
+                new int[]{0x00FFFFFF, 0x24FFFFFF, 0x00FFFFFF}));  // a 14% peak (tvOS: 10 to 15%)
         glare.setRotation(18f);
+        glare.forceHasOverlappingRendering(false);  // one gradient: its fade needs no off-screen pass
         glare.setAlpha(0f);
         tile.addView(glare, new FrameLayout.LayoutParams(tileW * 45 / 100, tileH * 2, Gravity.CENTER_VERTICAL));
 
-        TextView label = text(15, Ui.font(this, "medium"), 0f);
-        label.setText(a.label);
-        label.setSingleLine(true);
-        label.setEllipsize(TextUtils.TruncateAt.END);
-        label.setGravity(Gravity.CENTER);
-
+        // Only the grid's cards have a name under them: the dock's don't.
+        Name label = inDock ? null : new Name(this, unit, Ui.font(this, "medium"));
         cell.addView(tile, new LinearLayout.LayoutParams(tileW, tileH));
-        if (!inDock) cell.addView(label, new LinearLayout.LayoutParams(tileW, labelH));
+        if (label != null) {
+            label.setText(a.label);
+            label.setAlpha(0f);
+            // As wide as the icon's pitch: only the focused icon shows its name, and it's wider then.
+            LinearLayout.LayoutParams llp = new LinearLayout.LayoutParams(tileW + gap, labelH);
+            llp.leftMargin = -gap / 2;
+            cell.addView(label, llp);
+        }
 
         tile.setOnFocusChangeListener((v, has) -> {
+            // Moved here (or away) by the arrow just pressed, rather than put here by Home itself;
+            // and quickly after the last move, when tvOS shortens the focus animations.
+            boolean byArrow = SystemClock.uptimeMillis() - arrowAt < 60;
+            boolean fast = byArrow && fastMove;
             if (has) {
                 cell.setTranslationZ(dp(10));
-                if (moveIndex >= 0) {
-                    // Rebuilt while moving: appear already lifted, or every step would "pop".
+                if (moveIndex >= 0 || snapFocus) {
+                    // Rebuilt while moving, or focus put back (a return, a menu closed): already
+                    // lifted, or every step would "pop" and every return replay the lift.
+                    v.animate().cancel();
                     v.setScaleX(FOCUS_SCALE);
                     v.setScaleY(FOCUS_SCALE);
+                    v.setTranslationX(0);
+                    v.setTranslationY(0);
                     v.setTranslationZ(dp(18));
-                    label.setAlpha(1f);
-                    label.setTranslationY(tileH * (FOCUS_SCALE - 1f) / 2f);
+                    if (label != null) {
+                        label.animate().cancel();
+                        label.setAlpha(1f);
+                        label.setTranslationY(tileH * (FOCUS_SCALE - 1f) / 2f);
+                    }
+                    shine.animate().cancel();
+                    shine.setAlpha(1f);
+                    glare.animate().cancel();
+                    glare.setAlpha(0f);
                 } else {
                     // Apple TV's jiggle: the card arrives with a small push in the direction the
-                    // remote moved, then the spring settles it as it lifts.
-                    int from = lastTile;
-                    if (from >= 0 && from != index) {
-                        boolean sameRow = from / COLS == index / COLS;
-                        float push = dp(5);
-                        v.setTranslationX(sameRow ? -Math.signum(index - from) * push : 0);
-                        v.setTranslationY(sameRow ? 0 : -Math.signum(index - from) * push);
+                    // remote moved, then the spring settles it as it lifts. None on a quick move,
+                    // nor for focus no arrow sent (Home, Back).
+                    if (byArrow && !fast) {
+                        v.setTranslationX(-Glass.dirX * dp(5));
+                        v.setTranslationY(-Glass.dirY * dp(5));
                     }
-                    // No GPU layer: the glare and sheen move inside the card, so one would be
-                    // re-rendered every frame anyway, at the cost of an extra pass.
+                    // No GPU layer: the glare and the shine animate inside the card, so one would
+                    // be re-rendered every frame anyway, at the cost of an extra pass.
                     v.animate().scaleX(FOCUS_SCALE).scaleY(FOCUS_SCALE).translationX(0).translationY(0)
-                            .translationZ(dp(18)).setDuration(560).setInterpolator(LIFT).start();
-                    label.animate().alpha(1f).translationY(tileH * (FOCUS_SCALE - 1f) / 2f).setDuration(320)
-                            .setInterpolator(EASE).start();
-                    // Liquid-glass illumination: a glare sweeps across once, then rests on the card.
+                            .translationZ(dp(18)).setStartDelay(0).setDuration(fast ? 250 : 450).setInterpolator(LIFT).start();
+                    if (label != null) {
+                        label.animate().alpha(1f).translationY(tileH * (FOCUS_SCALE - 1f) / 2f).setDuration(fast ? 120 : 240)
+                                .setInterpolator(EASE).start();
+                    }
+                    // Liquid-glass illumination: a glare sweeps across once, entering from the side
+                    // focus came from. Skipped on quick moves, where it would only flicker.
                     glare.animate().cancel();
-                    glare.setTranslationX(-tileW * 0.7f);
-                    glare.setAlpha(1f);
-                    glare.animate().translationX(tileW * 1.1f).alpha(0f).setStartDelay(60).setDuration(700)
-                            .setInterpolator(EASE).start();
+                    if (fast) {
+                        glare.setAlpha(0f);
+                    } else {
+                        boolean leftwards = byArrow && Glass.dirX < 0;
+                        glare.setTranslationX(leftwards ? tileW * 1.2f : -tileW * 0.7f);
+                        glare.setAlpha(1f);
+                        glare.animate().translationX(leftwards ? -tileW * 0.7f : tileW * 1.1f).alpha(0f).setStartDelay(60)
+                                .setDuration(700).setInterpolator(EASE).start();
+                    }
+                    shine.animate().alpha(1f).setDuration(260).setInterpolator(EASE).start();
                 }
-                topSheen.animate().alpha(1f).setDuration(260).setInterpolator(EASE).start();
-                lastTile = index;
+                if (label != null) label.marquee(true);
                 onTileFocused(index);
             } else if (menuLayer != null && menuReturnFocus == v) {
                 // Its menu is open beside it: the card stays up, as on tvOS, until focus moves on.
@@ -833,27 +1034,47 @@ public class MainActivity extends Activity {
                 glare.setAlpha(0f);
             } else {
                 cell.setTranslationZ(0);
-                v.animate().scaleX(1f).scaleY(1f).translationX(0).translationY(0).translationZ(0)
-                        .setDuration(300).setInterpolator(EASE).start();
-                label.animate().alpha(0f).translationY(0).setDuration(160).setInterpolator(EASE).start();
-                topSheen.animate().alpha(0f).setDuration(220).setInterpolator(EASE).start();
                 glare.animate().cancel();
                 glare.setAlpha(0f);
+                if (label != null) label.marquee(false);
+                if (snapFocus) {
+                    // Focus put back elsewhere while Home is covered: down at once.
+                    v.animate().cancel();
+                    v.setScaleX(1f);
+                    v.setScaleY(1f);
+                    v.setTranslationX(0);
+                    v.setTranslationY(0);
+                    v.setTranslationZ(0);
+                    if (label != null) {
+                        label.animate().cancel();
+                        label.setAlpha(0f);
+                        label.setTranslationY(0);
+                    }
+                    shine.animate().cancel();
+                    shine.setAlpha(0f);
+                } else {
+                    // Down more slowly than the next card rises (tvOS's trail): on Apple's easeOut,
+                    // with no overshoot.
+                    v.animate().scaleX(1f).scaleY(1f).translationX(0).translationY(0).translationZ(0)
+                            .setStartDelay(0).setDuration(fast ? 220 : 420).setInterpolator(EASE_OUT_QUAD).start();
+                    if (label != null) label.animate().alpha(0f).translationY(0).setDuration(160).setInterpolator(EASE).start();
+                    shine.animate().alpha(0f).setDuration(220).setInterpolator(EASE).start();
+                }
             }
             v.invalidate();
         });
-        tile.setCameraDistance(9000 * unit);
         tile.setOnClickListener(v -> {
             if (moveIndex >= 0) return;
-            // Pressed state (HIG): the card dips instantly, then the action runs.
-            v.animate().scaleX(FOCUS_SCALE * 0.92f).scaleY(FOCUS_SCALE * 0.92f).setDuration(90)
-                    .setInterpolator(EASE).withEndAction(() -> {
-                        v.animate().scaleX(FOCUS_SCALE).scaleY(FOCUS_SCALE).setDuration(420).setInterpolator(LIFT).start();
-                        if (FOLDER_KEY.equals(a.key)) enterFolder();
-                        else launchAnimated(v, a);
-                    }).start();
+            // Released (it sank as OK went down): back up, then the app or folder opens.
+            rise(v);
+            afterPress(() -> {
+                if (FOLDER_KEY.equals(a.key)) enterFolder();
+                else launchAnimated(v, a);
+            });
         });
         tile.setOnLongClickListener(v -> {
+            // Held: back up beside its menu (the folder has none: just back up).
+            rise(v);
             if (moveIndex < 0 && !FOLDER_KEY.equals(a.key)) showOptions(index);
             return true;
         });
@@ -861,7 +1082,167 @@ public class MainActivity extends Activity {
         return cell;
     }
 
-    /** tvOS-style ambient colour field: soft glows of indigo, teal, magenta and amber on navy. */
+    /** OK went down on a card: it sinks to half its focus growth (Apple TV's press, easeOut 80 ms). */
+    void press(View t) {
+        t.animate().scaleX(PRESS_SCALE).scaleY(PRESS_SCALE).setStartDelay(0).setDuration(PRESS_MS)
+                .setInterpolator(EASE_OUT_QUAD).start();
+    }
+
+    /** OK came up (or the press was held, or cancelled): back to its focused size, easeIn 80 ms. */
+    void rise(View t) {
+        t.animate().scaleX(FOCUS_SCALE).scaleY(FOCUS_SCALE).setStartDelay(0).setDuration(PRESS_MS)
+                .setInterpolator(EASE_IN_QUAD).start();
+    }
+
+    /** What OK's release opens, waiting for the card to come back up. */
+    Runnable pressAction;
+
+    /**
+     * Opens what was pressed once the card is back up, 50 ms after its 80 ms return as in the
+     * Apple TV app: the app then grows out of the card at its focused size, with nothing on Home
+     * still moving underneath. A second OK within 250 ms is the same press, not a second launch.
+     */
+    void afterPress(Runnable open) {
+        long now = SystemClock.uptimeMillis();
+        if (now - lastSelectAt < 250) return;
+        lastSelectAt = now;
+        handler.removeCallbacks(pressAction);
+        Runnable r = () -> {
+            pressAction = null;
+            if (resumed) open.run();
+        };
+        pressAction = r;
+        handler.postDelayed(r, PRESS_MS + 50);
+    }
+
+    /**
+     * An app's name under its focused card, as tvOS shows it: centred when it fits; a longer one is
+     * cut with a fade (never "…") and, only while its card is focused, scrolls after a 2.7 s wait
+     * at 30 px a second, coming round again after a 150 px gap and waiting 2.7 s after each pass
+     * (the Apple TV app's marquee). TextView's own waits 1.2 s, moves at 30 dp a second rather than
+     * px, and stops after one pass. Most names fit, so they never scroll and are drawn once.
+     */
+    static final class Name extends View {
+        final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.SUBPIXEL_TEXT_FLAG);
+        final float gap, speed, base;
+        String text = "";
+        float textW, offset;
+        ValueAnimator run;
+        final Runnable go = this::scroll;
+        /** Its card is focused, so a long name may scroll. */
+        boolean on;
+
+        Name(Context c, float unit, Typeface tf) {
+            super(c);
+            p.setTypeface(tf);
+            p.setTextSize(15 * unit);
+            p.setColor(Color.WHITE);
+            p.setShadowLayer(10, 0, 2, 0x99000000);
+            Paint.FontMetrics fm = p.getFontMetrics();
+            base = -(fm.ascent + fm.descent) / 2f;
+            gap = 75 * unit;     // 150 px at 1080p
+            speed = 15 * unit;   // 30 px a second at 1080p
+            setHorizontalFadingEdgeEnabled(true);
+            setFadingEdgeLength(Math.round(16 * unit));
+        }
+
+        void setText(String t) {
+            text = t == null ? "" : t;
+            textW = p.measureText(text);
+            invalidate();
+        }
+
+        /**
+         * Its card focused: from its start, a long name scrolls after the wait. Or not: it stops
+         * where it is as it fades out.
+         */
+        void marquee(boolean on) {
+            this.on = on;
+            halt();
+            if (!on) return;
+            if (offset != 0f) {
+                offset = 0f;
+                invalidate();
+            }
+            postDelayed(go, 2700);
+        }
+
+        /** Stops the scroll where it is, and any wait before the next pass. */
+        void halt() {
+            removeCallbacks(go);
+            ValueAnimator r = run;
+            run = null;  // first, so the cancelled pass doesn't take itself for a finished one
+            if (r != null) r.cancel();
+        }
+
+        /**
+         * Home covered (an app, a page over it, the screen off): the name stops where it is, so
+         * nothing scrolls unseen, waking the processor every frame under the app. Back in front, it
+         * carries on from there (or waits again, if it was waiting).
+         */
+        @Override public void onWindowFocusChanged(boolean has) {
+            super.onWindowFocusChanged(has);
+            if (!on) return;
+            halt();
+            if (has) postDelayed(go, offset > 0f ? 0 : 2700);
+        }
+
+        /** A pass from where the name is now (its start, unless it was stopped part way). */
+        void scroll() {
+            float w = getWidth();
+            if (w <= 0 || textW <= w) return;
+            float lap = textW + gap;
+            ValueAnimator a = ValueAnimator.ofFloat(offset, lap);
+            a.setDuration(Math.round((lap - offset) / speed * 1000));
+            a.setInterpolator(new android.view.animation.LinearInterpolator());
+            a.addUpdateListener(v -> {
+                offset = (float) v.getAnimatedValue();
+                invalidate();
+            });
+            a.addListener(new android.animation.AnimatorListenerAdapter() {
+                @Override public void onAnimationEnd(android.animation.Animator an) {
+                    if (run != a) return;  // stopped (marquee), not finished
+                    run = null;
+                    offset = 0f;  // the copy that came round is where the name began
+                    invalidate();
+                    postDelayed(go, 2700);
+                }
+            });
+            run = a;
+            a.start();
+        }
+
+        @Override protected void onDetachedFromWindow() {
+            super.onDetachedFromWindow();
+            marquee(false);  // a rebuilt grid: nothing keeps running for a card that's gone
+        }
+
+        /** The scrolling name fades in at the left as it sets off and out as it comes round (0.3 s each). */
+        @Override protected float getLeftFadingEdgeStrength() {
+            if (offset <= 0f || textW <= getWidth()) return 0f;
+            return Math.min(1f, Math.min(offset, textW + gap - offset) / (speed * 0.3f));
+        }
+
+        @Override protected float getRightFadingEdgeStrength() {
+            return textW > getWidth() ? 1f : 0f;
+        }
+
+        @Override protected void onDraw(Canvas c) {
+            float w = getWidth(), y = getHeight() / 2f + base;
+            if (textW <= w) {
+                c.drawText(text, (w - textW) / 2f, y, p);
+                return;
+            }
+            // Cut at its own edges: the card's row doesn't clip what hangs over.
+            c.save();
+            c.clipRect(0, 0, w, getHeight());
+            c.drawText(text, -offset, y, p);
+            if (offset > 0f) c.drawText(text, textW + gap - offset, y, p);
+            c.restore();
+        }
+    }
+
+    /** The wallpaper, made on its own thread while the window is built. */
     java.util.concurrent.FutureTask<Bitmap> wallPrefetch;
     String wallPrefetchStyle;
 
@@ -909,6 +1290,7 @@ public class MainActivity extends Activity {
         invalidateTree(clockBox);
         invalidateTree(weatherCard);
         if (menuLayer != null && menuLayer.getChildCount() > 1) menuLayer.getChildAt(1).invalidate();
+        if (hintView != null && hintView.getParent() != null) hintView.invalidate();
     }
 
     static void invalidateTree(View v) {
@@ -936,6 +1318,7 @@ public class MainActivity extends Activity {
         return b;
     }
 
+    /** tvOS-style ambient colour field: soft glows of colour on a dark base, one palette per style. */
     static Bitmap makeWallpaperBase(String style) {
         int w = 192, h = 108;
         Bitmap b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
@@ -1157,7 +1540,8 @@ public class MainActivity extends Activity {
     static Bitmap colourIcon(AppEntry e, int size) {
         if (e.icon == null) return null;
         // Adaptive icons: just the foreground (the logo itself), not the coloured square behind it.
-        Drawable d = e.icon instanceof android.graphics.drawable.AdaptiveIconDrawable
+        // They came with Android 8; asking about the class before then fails.
+        Drawable d = Build.VERSION.SDK_INT >= 26 && e.icon instanceof android.graphics.drawable.AdaptiveIconDrawable
                 ? ((android.graphics.drawable.AdaptiveIconDrawable) e.icon).getForeground() : e.icon;
         if (d == null) d = e.icon;
         Bitmap b = Bitmap.createBitmap(size * 2, size * 2, Bitmap.Config.ARGB_8888);
@@ -1425,7 +1809,7 @@ public class MainActivity extends Activity {
         if (e.icon == null) return null;
         Drawable d = e.icon;
         float zoom = 1f;
-        if (d instanceof android.graphics.drawable.AdaptiveIconDrawable) {
+        if (Build.VERSION.SDK_INT >= 26 && d instanceof android.graphics.drawable.AdaptiveIconDrawable) {  // Android 8+
             Drawable fg = ((android.graphics.drawable.AdaptiveIconDrawable) d).getForeground();
             if (fg != null) {
                 d = fg;
@@ -1509,26 +1893,6 @@ public class MainActivity extends Activity {
         return g;
     }
 
-    static void drawGear(Canvas c, float cx, float cy, float r, int color, int holeColor) {
-        Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
-        p.setColor(color);
-        int teeth = 12;
-        float tw = r * 0.30f, th = r * 0.30f;
-        for (int i = 0; i < teeth; i++) {
-            c.save();
-            c.rotate(i * 360f / teeth, cx, cy);
-            c.drawRoundRect(cx - tw / 2, cy - r - th * 0.55f, cx + tw / 2, cy - r + th, tw * 0.25f, tw * 0.25f, p);
-            c.restore();
-        }
-        c.drawCircle(cx, cy, r, p);
-        p.setColor(holeColor);
-        c.drawCircle(cx, cy, r * 0.42f, p);
-        p.setColor(color);
-        p.setStyle(Paint.Style.STROKE);
-        p.setStrokeWidth(r * 0.08f);
-        c.drawCircle(cx, cy, r * 0.62f, p);
-    }
-
     boolean hasDock() {
         return !folderMode;
     }
@@ -1537,19 +1901,78 @@ public class MainActivity extends Activity {
         return dp(20);
     }
 
+    /** Space under each grid row's label: tvOS 26's rows are about 260 px apart. */
+    int rowGap() {
+        return dp(26);
+    }
+
     /** The dock (tvOS 26): clear glass with a big radius, the picture showing through, a crisp rim. */
     Drawable dockBackground() {
-        // Apple's dock corner is ~2x the card corner (36 px vs ~18 px at 1080p).
-        LiquidGlass g = new LiquidGlass(radius * 2f, 0x0AFFFFFF, glassSource, screenW, screenH, unit).clear();
+        // 36 px corners: Apple's dock measures 25-30 px in one study and 50-60 in another.
+        LiquidGlass g = new LiquidGlass(dp(18), 0x0AFFFFFF, glassSource, screenW, screenH, unit).clear();
         g.rimStrength = 0.5f;
         return g;
+    }
+
+    /**
+     * A light along a shape's true diagonal, whatever its proportions: the top-left corner at the
+     * first stop, the top-right and bottom-left corners halfway, the bottom-right at the last. A
+     * plain corner-to-corner gradient on a wide shape (the dock, a pill) runs almost left to right,
+     * lighting its top and bottom edges alike. The box must not be empty.
+     */
+    static LinearGradient diagonal(RectF b, int[] colors, float[] stops) {
+        float w = b.width(), h = b.height(), k = 2 * w * h / (w * w + h * h);
+        return new LinearGradient(b.left, b.top, b.left + k * h, b.top + k * w, colors, stops, Shader.TileMode.CLAMP);
+    }
+
+    /**
+     * A focused icon's light (tvOS 26): the specular highlight, a soft round glow centred a fifth of
+     * the icon's height above its top edge at 10% white (tvOS's own values), and a bright rim round
+     * the edge, strongest top-left with a second peak bottom-right, as the light falls on it. Its
+     * view is invisible at rest, so resting icons don't draw it at all.
+     */
+    static final class Shine extends Drawable {
+        final float r, w;
+        final Paint glow = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.DITHER_FLAG);
+        final Paint rim = new Paint(Paint.ANTI_ALIAS_FLAG);
+        final RectF box = new RectF();
+
+        /** r: the icon's corner radius; w: the rim's width (it grows with the lift). */
+        Shine(float r, float w) {
+            this.r = r;
+            this.w = w;
+            rim.setStyle(Paint.Style.STROKE);
+            rim.setStrokeWidth(w);
+        }
+
+        @Override protected void onBoundsChange(Rect b) {
+            box.set(b);
+            float bw = box.width(), bh = box.height();
+            if (bw <= 0 || bh <= 0) return;
+            glow.setShader(new RadialGradient(box.centerX(), box.top - bh * 0.2f, bw * 0.75f,
+                    new int[]{0x1AFFFFFF, 0x0DFFFFFF, 0x00FFFFFF}, new float[]{0f, 0.45f, 1f}, Shader.TileMode.CLAMP));
+            rim.setShader(diagonal(box, new int[]{0xB3FFFFFF, 0x47FFFFFF, 0x1FFFFFFF, 0x38FFFFFF, 0x8CFFFFFF},
+                    new float[]{0f, 0.22f, 0.5f, 0.78f, 1f}));
+        }
+
+        @Override public void draw(Canvas c) {
+            if (box.isEmpty()) return;
+            c.drawRect(box, glow);
+            // Inset by half its width, so the tile's rounded clip doesn't cut it.
+            float in = w / 2f;
+            c.drawRoundRect(box.left + in, box.top + in, box.right - in, box.bottom - in, r - in, r - in, rim);
+        }
+
+        @Override public void setAlpha(int a) { }
+        @Override public void setColorFilter(android.graphics.ColorFilter cf) { }
+        @Override public int getOpacity() { return android.graphics.PixelFormat.TRANSLUCENT; }
     }
 
     /**
      * Liquid Glass (iOS/tvOS 26), drawn from what is actually behind the surface: a blurred,
      * colour-boosted copy of the backdrop aligned to the surface's screen position; a band along
      * the edges that magnifies it (lensing, like thick glass); a light tint; and a specular rim
-     * that is bright top-left and softer bottom-right. No grain.
+     * along the light's diagonal, brightest top-left with a second peak bottom-right. No grain.
      */
     static class LiquidGlass extends Drawable {
         interface Backdrop {
@@ -1576,7 +1999,7 @@ public class MainActivity extends Activity {
         Bitmap shaderFor;
         android.graphics.BitmapShader shader1, shader2, shader3;
 
-        LiquidGlass(float r, int tint, Backdrop backdrop, int screenW, int screenH, float density) {
+        LiquidGlass(float r, int tint, Backdrop backdrop, int screenW, int screenH, float unit) {
             this.r = r;
             this.baseTint = tint;
             this.backdrop = backdrop;
@@ -1588,7 +2011,7 @@ public class MainActivity extends Activity {
             lens1.setAlpha(150);
             lens2.setAlpha(150);
             rim.setStyle(Paint.Style.STROKE);
-            rim.setStrokeWidth(1.1f * density);
+            rim.setStrokeWidth(1.1f * unit);
         }
 
         boolean adaptive;
@@ -1600,6 +2023,18 @@ public class MainActivity extends Activity {
 
         /** The view this glass sits on, when it is drawn inside another drawable (for its position). */
         View owner;
+        /**
+         * Where the surface is on screen when that's known and fixed (a menu): it opens as a scaled
+         * GPU layer, and the scaled position would have it show the wrong part of the picture, then
+         * jump once the layer was dropped.
+         */
+        int[] fixedLoc;
+        /**
+         * The picture through the glass: its saturation against the backdrop's (which is already
+         * boosted 1.6x, tvOS's regular material), and how much of its light comes through (the
+         * screen dimmed behind Control Centre or a menu, so the glass is dimmed with it).
+         */
+        float sat = 1f, dim = 1f;
 
         /**
          * Clear glass, as tvOS 26's dock and status pills: the picture behind shows through,
@@ -1618,20 +2053,42 @@ public class MainActivity extends Activity {
         boolean clear;
 
         /**
-         * Glass for small controls (Liquid Glass "regular"): the backdrop is desaturated so the
-         * control reads as clear glass rather than a coloured blob, and the tint follows the
+         * Glass for small controls (tvOS's ultra-thin material): the picture's colour comes through
+         * at 1.3x, as the status capsule takes on a poster's tone, and the tint follows the
          * brightness behind it \u2014 darker over bright artwork so white text stays legible, a light
          * frost over dark artwork so the control stays visible.
          */
         LiquidGlass adaptive() {
             adaptive = true;
-            android.graphics.ColorMatrix cm = new android.graphics.ColorMatrix();
-            cm.setSaturation(0.4f);
-            android.graphics.ColorMatrixColorFilter f = new android.graphics.ColorMatrixColorFilter(cm);
+            sat = 0.8f;  // 1.3x the picture's own saturation: 0.8 of the backdrop's 1.6x
+            filter();
+            return this;
+        }
+
+        /**
+         * Glass over a screen dimmed to k (Control Centre, menus): it shows the picture as dimmed
+         * as everything around it, not as a bright sheet, and picks its tint for that brightness.
+         */
+        LiquidGlass dimmed(float k) {
+            dim = k;
+            filter();
+            return this;
+        }
+
+        /** The picture's saturation and dimming, set once (a colour filter costs nothing per frame). */
+        void filter() {
+            android.graphics.ColorMatrixColorFilter f = null;
+            if (sat != 1f || dim != 1f) {
+                android.graphics.ColorMatrix cm = new android.graphics.ColorMatrix();
+                cm.setSaturation(sat);
+                cm.postConcat(new android.graphics.ColorMatrix(new float[]{
+                        dim, 0, 0, 0, 0, 0, dim, 0, 0, 0, 0, 0, dim, 0, 0, 0, 0, 0, 1, 0}));
+                f = new android.graphics.ColorMatrixColorFilter(cm);
+            }
             body.setColorFilter(f);
             lens1.setColorFilter(f);
             lens2.setColorFilter(f);
-            return this;
+            invalidateSelf();
         }
 
         static final android.animation.ArgbEvaluator ARGB = new android.animation.ArgbEvaluator();
@@ -1651,7 +2108,7 @@ public class MainActivity extends Activity {
         void lightUp(boolean on) {
             if (litAnim != null) litAnim.cancel();
             litAnim = ValueAnimator.ofFloat(lit, on ? 1f : 0f);
-            litAnim.setDuration(on ? 200 : 260);
+            litAnim.setDuration(on ? 170 : 180);  // Glass.focus's
             litAnim.setInterpolator(EASE);
             litAnim.addUpdateListener(a -> setLit((float) a.getAnimatedValue()));
             litAnim.start();
@@ -1693,11 +2150,13 @@ public class MainActivity extends Activity {
         @Override protected void onBoundsChange(Rect b) {
             box.set(b);
             float h = box.height();
+            if (box.isEmpty()) return;
             glow.setShader(new LinearGradient(0, box.top, 0, box.top + h * 0.5f,
                     0x1FFFFFFF, 0x00FFFFFF, Shader.TileMode.CLAMP));
-            rim.setShader(new LinearGradient(box.left, box.top, box.right, box.bottom,
-                    new int[]{rimA(0xD9), rimA(0x40), rimA(0x14), rimA(0x26), rimA(0x8C)},
-                    new float[]{0f, 0.22f, 0.5f, 0.78f, 1f}, Shader.TileMode.CLAMP));
+            // Lit along the true diagonal, as measured on tvOS 26: the top-left corner brightest,
+            // the top edge brighter than the bottom, a second peak on the bottom-right corner.
+            rim.setShader(diagonal(box, new int[]{rimA(0xD9), rimA(0x60), rimA(0x18), rimA(0x30), rimA(0x8C)},
+                    new float[]{0f, 0.25f, 0.5f, 0.75f, 1f}));
             float l = Math.min(lens, Math.min(box.width(), box.height()) / 3f);
             lens1.setStrokeWidth(l);
             lens2.setStrokeWidth(l / 2f);
@@ -1715,7 +2174,12 @@ public class MainActivity extends Activity {
         @Override public void draw(Canvas c) {
             Bitmap b = backdrop.get();
             Object cb = owner != null ? owner : getCallback();
-            if (cb instanceof View) ((View) cb).getLocationOnScreen(loc);
+            if (fixedLoc != null) {
+                loc[0] = fixedLoc[0];
+                loc[1] = fixedLoc[1];
+            } else if (cb instanceof View) {
+                ((View) cb).getLocationOnScreen(loc);
+            }
             if (b != null) {
                 if (b != shaderFor) {
                     shader1 = new android.graphics.BitmapShader(b, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP);
@@ -1733,7 +2197,7 @@ public class MainActivity extends Activity {
                     lumGen = b.getGenerationId();
                     lumX = loc[0];
                     lumY = loc[1];
-                    int t = tintFor(luminanceBehind(b));
+                    int t = tintFor(luminanceBehind(b) * dim);
                     // Clear glass keeps just enough shade for white text over a bright picture.
                     if (clear) t = (Math.round((t >>> 24) * 0.7f) << 24) | (t & 0xFFFFFF);
                     if (t != adaptiveTint) {
@@ -1765,11 +2229,11 @@ public class MainActivity extends Activity {
         @Override public int getOpacity() { return android.graphics.PixelFormat.TRANSLUCENT; }
     }
 
-    /** Outline whose corner radius can be changed while animating (radius[0]). */
-    ViewOutlineProvider roundedOutline(float[] r) {
+    /** A rounded-rectangle outline with corners of radius r, for clipping and the lift's shadow. */
+    ViewOutlineProvider roundedOutline(float r) {
         return new ViewOutlineProvider() {
             @Override public void getOutline(View v, Outline o) {
-                o.setRoundRect(0, 0, v.getWidth(), v.getHeight(), r[0]);
+                o.setRoundRect(0, 0, v.getWidth(), v.getHeight(), r);
             }
         };
     }
@@ -1785,7 +2249,10 @@ public class MainActivity extends Activity {
         return v;
     }
 
-    /** Title logo (or title), meta line, overview, "Open in \u2026" capsule and page dots, bottom-left of the shelf. */
+    /**
+     * Title logo (or title), meta line, overview and "Open in \u2026" capsule, bottom-left of the
+     * shelf; the page dots (bottom centre) and side chevrons for full screen.
+     */
     void buildHeroInfo(FrameLayout shelf) {
         heroInfo = new LinearLayout(this);
         heroInfo.setOrientation(LinearLayout.VERTICAL);
@@ -1794,7 +2261,7 @@ public class MainActivity extends Activity {
         heroInfo.setAlpha(0f);
         heroProvider = new ImageView(this);
         heroProvider.setScaleType(ImageView.ScaleType.CENTER_CROP);
-        heroProvider.setOutlineProvider(roundedOutline(new float[]{dp(7)}));
+        heroProvider.setOutlineProvider(roundedOutline(dp(7)));
         heroProvider.setClipToOutline(true);
         heroProvider.setElevation(dp(2));
         LinearLayout.LayoutParams pvlp = new LinearLayout.LayoutParams(dp(30), dp(30));
@@ -1812,7 +2279,10 @@ public class MainActivity extends Activity {
         heroTitle.setMaxLines(2);
         heroTitle.setEllipsize(TextUtils.TruncateAt.END);
         heroInfo.addView(heroTitle, new LinearLayout.LayoutParams(dp(420), ViewGroup.LayoutParams.WRAP_CONTENT));
-        heroMeta = text(12.5f, Ui.font(this, "medium"), 0.8f);
+        // Year, genre and rating show only in full screen: docked, tvOS shows the title alone. 80%
+        // white in its colour, so at rest it needs no off-screen layer (see swipeHint).
+        heroMeta = text(12.5f, Ui.font(this, "medium"), 0f);
+        heroMeta.setTextColor(0xCCFFFFFF);
         LinearLayout.LayoutParams mlp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         mlp.topMargin = dp(10);
         heroInfo.addView(heroMeta, mlp);
@@ -1834,13 +2304,6 @@ public class MainActivity extends Activity {
         heroBtnText = text(13, Ui.font(this, "semibold"), 1f);
         heroBtnText.setShadowLayer(0, 0, 0, 0);
         heroButton.addView(heroBtnText);
-        heroBtnIcon = new ImageView(this);
-        heroBtnIcon.setScaleType(ImageView.ScaleType.CENTER_CROP);
-        heroBtnIcon.setOutlineProvider(roundedOutline(new float[]{dp(5)}));
-        heroBtnIcon.setClipToOutline(true);
-        LinearLayout.LayoutParams iclp = new LinearLayout.LayoutParams(dp(22), dp(22));
-        iclp.leftMargin = dp(9);
-        heroButton.addView(heroBtnIcon, iclp);
         // The Open capsule's row: it keeps its height while the capsule itself is hidden.
         LinearLayout btnRow = new LinearLayout(this);
         btnRow.setOrientation(LinearLayout.HORIZONTAL);
@@ -1864,23 +2327,56 @@ public class MainActivity extends Activity {
         heroInfoY = heroInfoRestY();
         heroInfo.setTranslationY(heroInfoY);
 
+        // Page dots, low and centred, only in full screen (tvOS shows none while the dock is up).
         heroDots = new LinearLayout(this);
         heroDots.setOrientation(LinearLayout.HORIZONTAL);
-        dotRow = new LinearLayout(this);
-        dotRow.setOrientation(LinearLayout.HORIZONTAL);
-        dotRow.setGravity(Gravity.CENTER_VERTICAL);
+        dotRow = new PageDots(this, unit);
         heroDots.addView(dotRow);
         heroDots.setAlpha(0f);
         FrameLayout.LayoutParams dlp = new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
         dlp.bottomMargin = dp(22);
         root.addView(heroDots, dlp);
-        heroDotsY = heroDotsRestY();
-        heroDots.setTranslationY(heroDotsY);
+        heroArrows = new View[]{heroArrow(-1), heroArrow(1)};
 
         // The shelf itself is the carousel's focus target (UP from the dock).
         shelf.setFocusable(false);
         shelf.setOnFocusChangeListener((v, has) -> heroFocused(has));
+    }
+
+    /**
+     * One of full screen's side chevrons (dir -1 left, 1 right), saying Left and Right browse, as
+     * tvOS's carousels do: the Apple TV app's 80 px platter of 50% black with a thin chevron. One
+     * picture, drawn once; shown only while the carousel has focus.
+     */
+    View heroArrow(int dir) {
+        int s = dp(40);
+        Bitmap b = Bitmap.createBitmap(s, s, Bitmap.Config.ARGB_8888);
+        Canvas c = new Canvas(b);
+        Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+        p.setColor(0x80000000);
+        c.drawCircle(s / 2f, s / 2f, s / 2f, p);
+        p.setColor(Color.WHITE);
+        p.setStyle(Paint.Style.STROKE);
+        p.setStrokeWidth(1.75f * unit);
+        p.setStrokeCap(Paint.Cap.ROUND);
+        p.setStrokeJoin(Paint.Join.ROUND);
+        // About 24 px tall and half as wide, its point towards the side it browses to.
+        float half = dp(6), cx = s / 2f, cy = s / 2f, reach = dp(3);
+        android.graphics.Path path = new android.graphics.Path();
+        path.moveTo(cx - dir * reach, cy - half);
+        path.lineTo(cx + dir * reach, cy);
+        path.lineTo(cx - dir * reach, cy + half);
+        c.drawPath(path, p);
+        ImageView v = new ImageView(this);
+        v.setImageBitmap(b);
+        v.setAlpha(0f);
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(s, s,
+                Gravity.CENTER_VERTICAL | (dir < 0 ? Gravity.START : Gravity.END));
+        lp.leftMargin = dockOuter;
+        lp.rightMargin = dockOuter;
+        root.addView(v, lp);
+        return v;
     }
 
     /**
@@ -1892,10 +2388,11 @@ public class MainActivity extends Activity {
         Bitmap b = src.isMutable() ? src : src.copy(Bitmap.Config.ARGB_8888, true);
         if (b != src) src.recycle();
         // Three shades: from the left for the title (80% fading out three quarters across), from
-        // the bottom for the dock (8% to 70%), along the top for the clock and weather (40% fading
-        // out a fifth of the way down). Each darkens by a factor that depends on x or on y alone,
-        // so they're applied together in one pass of integer sums over the pixels rather than as
-        // three full-size gradients, which kept the processor busy through the dissolve.
+        // the bottom for the dock (8% to 86%, steepest across the dock and near-black below it, as
+        // on tvOS), along the top for the clock and weather (40% fading out a fifth of the way
+        // down). Each darkens by a factor that depends on x or on y alone, so they're applied
+        // together in one pass of integer sums over the pixels rather than as three full-size
+        // gradients, which kept the processor busy through the dissolve.
         int w = b.getWidth(), h = b.getHeight();
         int[] keepX = new int[w], row = new int[w];
         for (int x = 0; x < w; x++) {
@@ -1905,7 +2402,9 @@ public class MainActivity extends Activity {
         }
         for (int y = 0; y < h; y++) {
             float fy = (y + 0.5f) / h;
-            float bottom = fy < 0.5f ? 0.078f + 0.173f * fy / 0.5f : 0.251f + 0.451f * (fy - 0.5f) / 0.5f;
+            float bottom = fy < 0.5f ? 0.078f + 0.173f * fy / 0.5f
+                    : fy < 0.73f ? 0.251f + 0.2f * (fy - 0.5f) / 0.23f
+                    : 0.451f + 0.409f * (fy - 0.73f) / 0.27f;
             float top = fy < 0.2f ? 0.4f * (1f - fy / 0.2f) : 0f;
             int keepY = Math.round((1f - bottom) * (1f - top) * 256);
             b.getPixels(row, 0, w, 0, y, w, 1);
@@ -1918,24 +2417,56 @@ public class MainActivity extends Activity {
         return b;
     }
 
-    /** Info block sits just above the dock while a dock app is focused... */
+    /** Info block sits just above the dock while a dock app is focused. */
     float heroInfoRestY() {
         return -(screenH - shelfH) + dp(40) - dp(36);
     }
 
-    /** ...and the page dots sit centred between the info and the dock. */
-    float heroDotsRestY() {
-        return -(screenH - shelfH) + dp(22) - dp(12);
+    /** Where the info block is headed: a slide change cancels its animator, so it puts it back on course. */
+    float heroInfoY;
+
+    void moveHeroInfo(float infoY, long ms, android.animation.TimeInterpolator curve) {
+        heroInfoY = infoY;
+        // No GPU layer: a slide alone needs none, and the button, overview and meta animating
+        // inside would have it re-rendered every frame. No delay: an animator keeps its last one
+        // (160 ms from setHeroShown, 30 from a title gliding in), which left the title behind the dock.
+        heroInfo.animate().setStartDelay(0).translationY(infoY).setDuration(ms).setInterpolator(curve).start();
     }
 
-    /** Where the info block and page dots are headed: a slide change cancels their animators, so it puts them back on course. */
-    float heroInfoY, heroDotsY;
+    /**
+     * The shelf's extras for where Home is now. Full screen (the carousel focused, or idle): the
+     * meta line and page dots, and the side chevrons while it has focus. Docked: the chevron and
+     * "Press up" hint above the dock, nothing else, as tvOS 26. What leaves goes at once; what
+     * comes in waits delay, then fades in over ms.
+     */
+    void heroChrome(long delay, long ms) {
+        boolean full = heroShown && (idle || shelfView.hasFocus());
+        boolean docked = heroShown && !full;
+        boolean arrows = full && !idle && heroItems.size() > 1;
+        fadeTo(heroDots, full ? 1f : 0f, delay, ms);
+        fadeTo(heroMeta, full ? 1f : 0f, delay, ms);
+        // The chevron and hint ride with the apps as they slide away: gone in full screen, or
+        // they'd peek in at the bottom edge. In the app grid the chevron stays, at the top. With
+        // no carousel at all there's nothing up there to point at.
+        fadeTo(chevron, full || heroItems.isEmpty() ? 0f : 1f, delay, ms);
+        fadeTo(swipeHint, docked ? 1f : 0f, delay, ms);
+        for (View v : heroArrows) fadeTo(v, arrows ? 1f : 0f, delay, Math.min(ms, 200));
+    }
 
-    void moveHeroInfo(float infoY, float dotsY, long ms) {
-        heroInfoY = infoY;
-        heroDotsY = dotsY;
-        heroInfo.animate().withLayer().translationY(infoY).setDuration(ms).setInterpolator(EASE).start();
-        heroDots.animate().withLayer().translationY(dotsY).setDuration(ms).setInterpolator(EASE).start();
+    /** Where each of heroChrome's fades is headed. */
+    final Map<View, Float> fadeTargets = new java.util.HashMap<>();
+
+    /**
+     * Fades in after delay over ms, or out at once (over at most 160 ms). One already there or on
+     * its way isn't started again: even a fade to where it is redraws, and the meta line sits in
+     * the title's block, which is a GPU layer while a title glides in.
+     */
+    void fadeTo(View v, float to, long delay, long ms) {
+        Float was = fadeTargets.put(v, to);
+        if (was != null ? was == to : v.getAlpha() == to) return;
+        boolean out = to < v.getAlpha();
+        v.animate().alpha(to).setStartDelay(out ? 0 : delay).setDuration(out ? Math.min(ms, 160) : ms)
+                .setInterpolator(EASE).start();
     }
 
     /** Down from the status row: the carousel, or the dock when there is no carousel. */
@@ -1953,13 +2484,18 @@ public class MainActivity extends Activity {
         ccButton.requestFocus();
     }
 
-    /** Loads cached suggestions at once and refreshes them in the background when stale or reconfigured. */
-    void loadHero() {
-        boolean shelf = Suggestions.enabled(this) && Suggestions.ready(this);
+    /**
+     * Loads cached suggestions at once and, when they're stale or reconfigured and the internet is
+     * there (online), refreshes them in the background.
+     */
+    void loadHero(boolean online) {
+        boolean shelf = Suggestions.showRecs(this) && Suggestions.ready(this);
         if (!shelf) {
             heroItems = new ArrayList<>();
+            shelfPkg = null;  // no app's own shelf left for a refresh to bring back
             shelfView.setFocusable(false);
             setHeroShown(false);
+            reportDrawn();  // no carousel: Home is complete with its dock
             return;
         }
         int v = Suggestions.version(this);
@@ -1971,17 +2507,44 @@ public class MainActivity extends Activity {
             if (base != null && (reconfigured || heroItems.isEmpty())) {
                 handler.post(() -> setHeroBase(base));
             }
-            // Nothing saved yet: fetched below. What's showing is never cleared for a list that
-            // couldn't be read this time, so the carousel can't go blank.
-            if (Suggestions.cached(this, false) == null) {
-                try {
-                    List<Suggestions.Item> fresh = Suggestions.fetch(this);
-                    handler.post(() -> setHeroBase(fresh));
-                } catch (Exception e) {
-                    android.util.Log.w("TvHome", "suggestions: " + e);
-                }
+            // Nothing saved yet, or out of date: fetched on the refresh's own lane. It's many
+            // requests and picture checks, and here it held up every carousel picture meanwhile.
+            // What's showing is never cleared for a list that couldn't be read this time, so the
+            // carousel can't go blank. Out of date is told from the file's age, not a second read.
+            boolean stale = base == null || System.currentTimeMillis()
+                    - Suggestions.cacheFile(this).lastModified() > Suggestions.MAX_AGE_MS;
+            if (online && !fetching && stale) {
+                fetching = true;
+                net.execute(() -> {
+                    try {
+                        // Queued behind another Home's refresh (after a recreate): just its result.
+                        List<Suggestions.Item> fresh = Suggestions.cached(this, false);
+                        if (fresh == null) fresh = Suggestions.fetch(this);
+                        Suggestions.byService(this);  // the new shelves read here, not when a dock app is next focused
+                        List<Suggestions.Item> items = fresh;
+                        handler.post(() -> setHeroBase(items));
+                    } catch (Exception e) {
+                        // Its kind only: a failed request's message carries its URL, and with it a TMDB key.
+                        android.util.Log.w("GlassHome", "suggestions: " + e.getClass().getSimpleName());
+                    } finally {
+                        fetching = false;
+                    }
+                });
             }
         });
+    }
+
+    /** Home has reported itself fully drawn: the dock and the first picture are up. */
+    boolean drawnReported;
+
+    /**
+     * Tells Android that start-up is over: logcat shows the real time to a complete Home ("Fully
+     * drawn"), and ART's profile marks what ran until now as start-up code.
+     */
+    void reportDrawn() {
+        if (drawnReported) return;
+        drawnReported = true;
+        reportFullyDrawn();
     }
 
     /** A new full carousel: kept as the mix, shown unless an app's own shelf is up. */
@@ -1995,6 +2558,8 @@ public class MainActivity extends Activity {
      * titles; anything else (or an app with no titles, like YouTube) shows the full mix.
      */
     void shelfFor(AppEntry a, boolean dock) {
+        // Top Shelf turned off: no app's titles either (their saved shelves are still on disk).
+        if (!Suggestions.showRecs(this) || !Suggestions.ready(this)) return;
         String pkg = dock && a != null ? a.pkg : null;
         List<Suggestions.Item> own = pkg == null ? null : Suggestions.forService(this, pkg);
         if (own == null || own.size() < 2) pkg = null;
@@ -2014,25 +2579,34 @@ public class MainActivity extends Activity {
         // Keep the carousel where it was when the list is refreshed (same title -> same position).
         String curTitle = heroItems.isEmpty() ? null : heroItems.get(Math.min(heroIndex, heroItems.size() - 1)).title;
         boolean same = curTitle != null && heroFront.getDrawable() != null;
-        if (items.size() > 24) items = new ArrayList<>(items.subList(0, 24));
+        // Apple's carousels hold at most 8 titles (and so 8 dots): every shelf, the mix's limit.
+        if (items.size() > Suggestions.MAX_ITEMS) items = new ArrayList<>(items.subList(0, Suggestions.MAX_ITEMS));
         heroItems = items;
         int keep = 0;
         for (int i = 0; curTitle != null && i < items.size(); i++) if (items.get(i).title.equals(curTitle)) keep = i;
         heroIndex = keep;
         shelfView.setFocusable(!items.isEmpty());
         int dots = items.size() > 1 ? items.size() : 0;
-        if (dots != dotRow.getChildCount()) {
+        if (dots != dotPages) {
             // A different number of pages (another app's shelf): the old row fades out and the new
-            // one fades in, instead of the dots jumping as the row re-centres.
+            // one fades in, instead of the dots jumping as the row re-centres. Hidden (docked, where
+            // most shelf changes happen) it's simply swapped. The count is read when the fade ends,
+            // so a shelf switched away from and back meanwhile still gets its own.
+            dotPages = dots;
             dotRow.animate().cancel();
-            if (dotRow.getChildCount() == 0) buildDots(dots, keep);
-            else dotRow.animate().alpha(0f).setDuration(140).setInterpolator(EASE).withEndAction(() -> {
-                buildDots(dots, heroIndex);
-                dotRow.animate().alpha(1f).setDuration(260).setInterpolator(EASE).start();
-            }).start();
+            if (dotRow.pages() == 0 || heroDots.getAlpha() == 0f) {
+                dotRow.setPages(dots, keep);
+                dotRow.setAlpha(1f);
+            } else {
+                dotRow.animate().alpha(0f).setStartDelay(0).setDuration(140).setInterpolator(EASE).withEndAction(() -> {
+                    dotRow.setPages(dotPages, heroIndex);
+                    dotRow.animate().alpha(1f).setDuration(260).setInterpolator(EASE).start();
+                }).start();
+            }
         }
         if (items.isEmpty()) {
             setHeroShown(false);
+            if (!idle) heroChrome(0, 200);
             return;
         }
         // The carousel shows unless focus is down in the app grid: a list refreshed while the
@@ -2041,8 +2615,11 @@ public class MainActivity extends Activity {
         int i = tiles.indexOf(f);
         boolean inGrid = i >= 0 && !(hasDock() && i < COLS);
         setHeroShown(f == null ? heroShown || tiles.isEmpty() || focusedIndex < COLS : !inGrid);
+        // The side chevrons, for a shelf refreshed to one title or to more. Not going idle, which
+        // switches to the mix on its way and brings the extras up on its own, slower timing.
+        if (!idle) heroChrome(0, 200);
         if (!(same && items.get(keep).title.equals(curTitle))) showHero(keep, heroDissolve && heroShown ? 2 : 0);
-        else selectDot(keep, false);
+        else dotRow.select(keep, false);
         // Fetching the rest of the shelf's artwork ahead happens in its own lane, so the picture
         // you're about to see never waits behind it; a newer shelf stops an older one's fetching.
         List<Suggestions.Item> pre = items;
@@ -2078,8 +2655,13 @@ public class MainActivity extends Activity {
             drawerBack.setImageBitmap(heroDrawer);
             drawerBack.animate().alpha(1f).setDuration(560).setInterpolator(HERO_EASE).withEndAction(() -> {
                 if (heroShown || drawerBack.getAlpha() < 1f) return;
-                // Fully covered: the pictures and the wallpaper needn't be drawn underneath.
-                for (ImageView v : heroLayers()) hideHeroLayer(v);
+                // Fully covered: the pictures and the wallpaper needn't be drawn underneath. Only
+                // the newest picture is kept, for the way back; a dissolve cut short here would
+                // otherwise leave the older ones held behind every app.
+                for (ImageView v : heroLayers()) {
+                    if (v == heroFront) hideHeroLayer(v);
+                    else releaseHeroLayer(v);
+                }
                 wallView.setVisibility(View.INVISIBLE);
             }).start();
         } else if (show && drawerBack.getAlpha() > 0f) {
@@ -2103,15 +2685,17 @@ public class MainActivity extends Activity {
             }
         }
 
-        // Leaving for the apps: the title and dots go at once, before the rows slide over them;
-        // coming back: they return after the artwork has settled.
+        // Leaving for the apps: the title and its extras go at once, before the rows slide over
+        // them; coming back: they return after the artwork has settled. Back in line too, should
+        // a title change's glide have been cut short.
         flushHeroInfo();
         heroInfo.animate().cancel();
-        heroDots.animate().cancel();
-        heroInfo.animate().withLayer().alpha(a).translationY(heroInfoY).setStartDelay(show ? 160 : 0).setDuration(show ? 420 : 140)
+        heroInfo.animate().withLayer().alpha(a).translationX(0).translationY(heroInfoY).setStartDelay(show ? 160 : 0)
+                .setDuration(show ? 420 : 140).setInterpolator(EASE).start();
+        // Over the carousel the chevron rises to make room for its hint; in the grid it's alone.
+        chevron.animate().translationY(show ? -dp(16) : 0).setStartDelay(show ? 160 : 0).setDuration(show ? 420 : 140)
                 .setInterpolator(EASE).start();
-        heroDots.animate().alpha(a).translationY(heroDotsY).setStartDelay(show ? 160 : 0).setDuration(show ? 420 : 140).setInterpolator(EASE).start();
-        chevron.animate().alpha(1f - a).setDuration(show ? 140 : 420).setInterpolator(EASE).start();
+        heroChrome(show ? 160 : 0, show ? 420 : 140);
         handler.removeCallbacks(heroAdvance);
         if (show) scheduleAdvance();
     }
@@ -2206,93 +2790,181 @@ public class MainActivity extends Activity {
     void scheduleAdvance() {
         handler.removeCallbacks(heroAdvance);
         int sec = Suggestions.advanceSeconds(this);
-        if (sec > 0 && heroShown && resumed && switcher == null) handler.postDelayed(heroAdvance, sec * 1000L);
+        // Not while a card is being moved: the picture holds still, as tvOS's top shelf does in edit
+        // mode, and each step's grid rebuild doesn't share its frames with a dissolve.
+        if (sec > 0 && heroShown && resumed && switcher == null && moveIndex < 0) handler.postDelayed(heroAdvance, sec * 1000L);
     }
 
     void heroStep(int dir, boolean user) {
         if (heroItems.size() < 2) return;
+        // Browsing moves no focus, so the focus tick is played here for a press of Left or Right.
+        if (user) Clicks.move(this, 0.5f, fastMove);
         showHero((heroIndex + dir + heroItems.size()) % heroItems.size(), dir);
         if (!user || !shelfView.hasFocus()) scheduleAdvance();
     }
 
-    void buildDots(int n, int active) {
-        dotRow.removeAllViews();
-        for (int i = 0; i < n; i++) {
-            Dot d = new Dot(this);
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(dp(6.5f), dp(6.5f));
-            lp.leftMargin = lp.rightMargin = dp(1.75f);
-            dotRow.addView(d, lp);
-        }
-        selectDot(active, false);
-    }
+    /**
+     * tvOS's page control, as the Apple TV app draws it: 10 px dots 12 px apart in white at 25%,
+     * the current page a 30 px white capsule, on a capsule of 40% black. A page change narrows the
+     * old capsule as the new one widens, together over 280 ms, so the row keeps its width. One
+     * view, drawn as true anti-aliased shapes (a scaled bitmap came out as rough diamonds on this
+     * TV), and redrawn only during a change: no timer fill, so nothing moves while a slide is up.
+     */
+    static final class PageDots extends View {
+        final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG), back = new Paint(Paint.ANTI_ALIAS_FLAG);
+        final RectF r = new RectF();
+        final float dot, gap, wide, padX, padY;
+        /** How far each page's dot is widened into the capsule: 0 a dot, 1 the current page. */
+        float[] open = new float[0];
+        int current = -1;
+        ValueAnimator anim;
 
-    /** The current page's dot brightens and grows a touch; the others dim, all on one easing. */
-    void selectDot(int index, boolean animate) {
-        for (int i = 0; i < dotRow.getChildCount(); i++) {
-            ((Dot) dotRow.getChildAt(i)).set(i == index, animate);
+        PageDots(Context c, float unit) {
+            super(c);
+            dot = 5 * unit;
+            gap = 6 * unit;
+            wide = 15 * unit;
+            padX = 7.5f * unit;
+            padY = 4 * unit;
+            p.setColor(Color.WHITE);
+            back.setColor(0x66000000);
+        }
+
+        int pages() {
+            return open.length;
+        }
+
+        /** n pages (fewer than two show nothing), the current one at once. */
+        void setPages(int n, int index) {
+            if (anim != null) anim.cancel();
+            open = new float[n];
+            current = index >= 0 && index < n ? index : -1;
+            if (current >= 0) open[current] = 1f;
+            requestLayout();
+            invalidate();
+        }
+
+        void select(int index, boolean animate) {
+            if (index < 0 || index >= open.length || index == current) return;
+            current = index;
+            if (anim != null) anim.cancel();
+            if (!animate) {
+                java.util.Arrays.fill(open, 0f);
+                open[index] = 1f;
+                invalidate();
+                return;
+            }
+            // From wherever a change cut short left them, so a quick press never jumps.
+            float[] from = open.clone();
+            anim = ValueAnimator.ofFloat(0f, 1f);
+            anim.setDuration(280);
+            anim.setInterpolator(new android.view.animation.LinearInterpolator());
+            anim.addUpdateListener(v -> {
+                if (open.length != from.length) return;
+                float t = v.getAnimatedFraction();
+                for (int i = 0; i < open.length; i++) open[i] = from[i] + ((i == index ? 1f : 0f) - from[i]) * t;
+                invalidate();
+            });
+            anim.start();
+        }
+
+        @Override protected void onMeasure(int ws, int hs) {
+            int n = open.length;
+            if (n < 2) {
+                setMeasuredDimension(0, 0);
+                return;
+            }
+            setMeasuredDimension(Math.round(n * dot + (n - 1) * gap + wide - dot + 2 * padX), Math.round(dot + 2 * padY));
+        }
+
+        @Override protected void onDraw(Canvas c) {
+            if (open.length < 2) return;
+            float h = getHeight();
+            r.set(0, 0, getWidth(), h);
+            c.drawRoundRect(r, h / 2f, h / 2f, back);
+            float x = padX;
+            for (float o : open) {
+                float w = dot + (wide - dot) * o;
+                p.setAlpha(Math.round((0.25f + 0.75f * o) * 255));
+                r.set(x, padY, x + w, padY + dot);
+                c.drawRoundRect(r, dot / 2f, dot / 2f, p);
+                x += w + gap;
+            }
         }
     }
 
     /**
-     * A page dot drawn as a true anti-aliased circle at its exact size every frame (scaling a
-     * tiny bitmap drew it as a rough diamond on this TV). The current one is bigger and brighter.
+     * Counts showHero's requests: a picture asked for before a newer one is dropped (a slide you
+     * pressed past, or the shelf of the app you were on a moment ago), not decoded or shown.
      */
-    static final class Dot extends View {
-        final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
-        float f;  // 0 = other page, 1 = current
-        ValueAnimator a;
+    volatile int heroReq;
+    /** The title the carousel shows, for going back to it when the next picture can't be had. */
+    String heroOnScreen;
 
-        Dot(Context c) {
-            super(c);
-            p.setColor(Color.WHITE);
-        }
-
-        void set(boolean on, boolean animate) {
-            float to = on ? 1f : 0f;
-            if (a != null) a.cancel();
-            if (!animate) {
-                f = to;
-                invalidate();
-                return;
-            }
-            a = ValueAnimator.ofFloat(f, to);
-            a.setDuration(420);
-            a.setInterpolator(HERO_EASE);
-            a.addUpdateListener(v -> {
-                f = (float) v.getAnimatedValue();
-                invalidate();
-            });
-            a.start();
-        }
-
-        @Override protected void onDraw(Canvas c) {
-            float max = Math.min(getWidth(), getHeight()) / 2f;
-            p.setAlpha(Math.round((0.35f + 0.65f * f) * 255));
-            c.drawCircle(getWidth() / 2f, getHeight() / 2f, max * (0.77f + 0.23f * f), p);
-        }
+    /** dir: +1 next, -1 previous, 0 first show (no slide), 2 another shelf (dissolve in place). */
+    void showHero(int index, int dir) {
+        showHero(index, dir, 0);
     }
 
-    /** dir: +1 next, -1 previous, 0 first show (no slide). */
-    void showHero(int index, int dir) {
+    /** misses: titles this step has already passed over, their pictures not to be had. */
+    void showHero(int index, int dir, int misses) {
+        int req = ++heroReq;
         heroIndex = index;
         Suggestions.Item it = heroItems.get(index);
-        selectDot(index, true);
-        int want = index;
+        dotRow.select(index, true);
         io.execute(() -> {
+            if (req != heroReq) return;
+            // Asked again between each step: a picture pressed past mid-way stops there, rather
+            // than its shading, blurs and upload holding up the one now wanted (and taking the
+            // processor from the dissolve under way).
             Bitmap raw = Suggestions.image(this, it.backdrop, "w1280", screenW);
+            if (req != heroReq) return;
             Bitmap bd = bakeScrims(raw);
+            if (req != heroReq) return;
             Bitmap drawer = drawerGlass(bd);
             Bitmap bdBlur = Ui.glassBackdrop(bd, 160, 90);
+            if (req != heroReq) return;
             // On the GPU now, in the background, so the dissolve doesn't stall on the upload.
             Bitmap shown = Suggestions.onGpu(bd);
             if (bdBlur != null) bdBlur.prepareToDraw();
             if (drawer != null) drawer.prepareToDraw();
-            String logoPath = Suggestions.logoFor(this, it);
+            // A title passed over for want of a picture needn't have its logo fetched either.
+            String logoPath = shown == null && dir != 0 ? "" : Suggestions.logoFor(this, it);
             Bitmap logo = Suggestions.onGpu(logoPath.isEmpty() ? null : Suggestions.image(this, logoPath, "w500", 500));
             handler.post(() -> {
-                if (heroIndex != want || heroItems.isEmpty()) return;
+                if (req != heroReq || heroItems.isEmpty()) return;
+                if (shown == null && dir != 0) {
+                    // No picture (offline, or a bad file): never one show's title over another's
+                    // picture. The step goes on to the next title, as if this one weren't there,
+                    // so one bad picture can't hold the carousel up; when none will load (offline)
+                    // the slide on screen stays, and the next step tries again.
+                    int n = heroItems.size(), step = dir == -1 ? -1 : 1;
+                    if (misses + 2 < n) {
+                        showHero(((index + step) % n + n) % n, dir, misses + 1);
+                        return;
+                    }
+                    for (int i = 0; i < n; i++) {
+                        if (heroItems.get(i).title.equals(heroOnScreen)) {
+                            heroIndex = i;
+                            dotRow.select(i, true);
+                            return;
+                        }
+                    }
+                    // A shelf just switched to has none of its titles on screen: its first goes up
+                    // over the picture there, so OK still opens the title you can see.
+                    int first = ((index - misses * step) % n + n) % n;
+                    heroIndex = first;
+                    dotRow.select(first, true);
+                    heroOnScreen = heroItems.get(first).title;
+                    applyHeroInfo(heroItems.get(first), null, dir);
+                    return;
+                }
+                heroOnScreen = it.title;
                 applyHeroInfo(it, logo, dir);
-                if (shown != null) crossfadeHero(shown, dir);
+                if (shown != null) {
+                    crossfadeHero(shown, dir);
+                    reportDrawn();
+                }
                 if (drawer != null) heroDrawer = drawer;
                 if (bdBlur != null) {
                     heroBlur = bdBlur;
@@ -2336,15 +3008,12 @@ public class MainActivity extends Activity {
     }
 
     void fillHeroInfo(Suggestions.Item it, Bitmap logo) {
-        if (shelfView.isFocused()) {
+        // Full screen keeps its own: no capsule, and every title's summary (see enterIdle).
+        if (shelfView.isFocused() && !idle) {
             heroButton.setVisibility(View.VISIBLE);
             heroButton.setAlpha(1f);
         }
-        Ui.textSize(heroTitle, 36);
-        heroTitle.setMaxLines(2);
-        heroOverview.setMaxLines(2);
-        Ui.textSize(heroOverview, 12.5f);
-        if (!shelfView.isFocused()) {  // tvOS: the overview shows only when the shelf is focused
+        if (!shelfView.isFocused() && !idle) {  // tvOS: the overview shows only when the shelf is focused
             heroOverview.animate().cancel();
             heroOverview.setAlpha(0f);
             heroOverview.setVisibility(View.GONE);
@@ -2355,20 +3024,25 @@ public class MainActivity extends Activity {
         heroLogo.setVisibility(View.GONE);
         List<String> meta = new ArrayList<>();
         if (!it.year.isEmpty()) meta.add(it.year);
-        meta.add(it.type.equals("tv") ? "Series" : "Movie");
+        meta.add(it.type.equals("tv") ? "Series" : "Film");
         if (!it.genres.isEmpty()) meta.add(it.genres);
         if (it.rating > 0) meta.add(String.format(java.util.Locale.US, "\u2605 %.1f", it.rating));
         heroMeta.setText(String.join("  \u00B7  ", meta));
         heroOverview.setText(it.overview);
+        if (idle) {
+            // After the text, so it follows the new title's (some have no summary).
+            heroOverview.setVisibility(heroOverview.getText().length() > 0 ? View.VISIBLE : View.GONE);
+            heroOverview.setAlpha(0.85f);
+        }
         Suggestions.Provider p = it.provider();
-        heroBtnText.setText(p != null && !installed(p.pkg) ? "Get" : "\u25B6  Open");
+        // Not installed: Get and the app's name, as Apple's offers say (no badge names it then).
+        heroBtnText.setText(p != null && !installed(p.pkg) ? "Get " + p.name : "\u25B6  Open");
         // The service's own app icon as its badge.
         Drawable appIcon = null;
         String badge = p != null ? p.pkg : null;
         if (badge != null && installed(badge)) appIcon = badgeIcon(badge);
         heroProvider.setImageDrawable(appIcon);
         heroProvider.setVisibility(appIcon == null ? View.GONE : View.VISIBLE);
-        heroBtnIcon.setVisibility(View.GONE);
         if (logo != null) {
             heroLogo.setImageBitmap(logo);
             heroLogo.setVisibility(View.VISIBLE);
@@ -2422,8 +3096,8 @@ public class MainActivity extends Activity {
             // Behind the apps' glass while it's still fading in, the pictures stay as they are
             // (the glass hides them once it covers them).
             if (heroShown || drawerBack.getAlpha() >= 1f) {
-                hideHeroLayer(old);
-                hideHeroLayer(heroUnder);
+                releaseHeroLayer(old);
+                releaseHeroLayer(heroUnder);
             }
             return;
         }
@@ -2446,8 +3120,8 @@ public class MainActivity extends Activity {
         next.setAlpha(0f);
         next.animate().translationX(0).alpha(1f).setStartDelay(0).setDuration(DISSOLVE_MS).setInterpolator(DISSOLVE)
                 .withEndAction(() -> {
-                    // Fully over: what's underneath needn't be drawn.
-                    for (ImageView v : heroLayers()) if (v != next) hideHeroLayer(v);
+                    // Fully over: what's underneath needn't be drawn, nor kept.
+                    for (ImageView v : heroLayers()) if (v != next) releaseHeroLayer(v);
                     if (heroShown) wallView.setVisibility(View.INVISIBLE);
                 }).start();
         old.animate().cancel();
@@ -2461,15 +3135,32 @@ public class MainActivity extends Activity {
         v.setTranslationX(0);
     }
 
-    /** Carousel focused: the dock slides away and the artwork takes the whole screen (tvOS Top Shelf). */
+    /**
+     * Hidden, and its picture let go: a hidden layer's picture is never shown again (the next
+     * dissolve brings a new one), and each holds a full-screen picture's graphics memory, behind
+     * every app too. Not recycled, as the render thread may still be drawing it for a frame.
+     */
+    void releaseHeroLayer(ImageView v) {
+        hideHeroLayer(v);
+        v.setImageDrawable(null);
+    }
+
+    /**
+     * Home itself moved focus to the carousel (Up from the dock, Down from the status row or
+     * weather): focus Android parks there on its own is handed back to the dock.
+     */
     boolean heroRequested;
 
-    ImageView ccButton, netIcon;
+    ImageView ccButton, netIcon, timerIcon;
+    /** The clock pill: the time, with any status glyphs before it. */
+    LinearLayout timeChip;
     android.net.ConnectivityManager.NetworkCallback netCallback;
     WeatherView weatherCard;
     LiquidGlass weatherGlass;
-    FrameLayout pickerLayer;
+    /** The full forecast while it's open over Home. */
+    FrameLayout forecastLayer;
 
+    /** Carousel focused: the dock slides away and the artwork takes the whole screen (tvOS Top Shelf). */
     void heroFocused(boolean has) {
         if (has && !heroRequested) {
             // Android parked focus here on its own (startup/rebuild): hand it back to the dock.
@@ -2480,29 +3171,32 @@ public class MainActivity extends Activity {
         heroButtonLit(has);
         if (has) {
             setHeroShown(true);
-            heroButton.animate().scaleX(1.08f).scaleY(1.08f).setDuration(420).setInterpolator(LIFT).start();
+            // No delay: the animator still holds the last fade's.
+            heroButton.animate().scaleX(1.08f).scaleY(1.08f).setStartDelay(0).setDuration(420).setInterpolator(LIFT).start();
             heroButton.setElevation(dp(10));
-            scroll.smoothScrollTo(0, 0);
+            scrollToY(0, true);
             // Slid as it is, not as a GPU layer: the dock card settling inside it would have the
             // whole grid re-rendered into the layer every frame (the dock's glass has its own).
             scroll.animate().translationY(screenH - shelfH + dp(30)).setDuration(500).setInterpolator(EASE)
                     .setUpdateListener(null).withEndAction(this::invalidateGlass).start();
-            moveHeroInfo(0, 0, 500);
+            moveHeroInfo(0, 500, EASE);
             heroOverview.setVisibility(View.VISIBLE);
             heroButton.setVisibility(View.VISIBLE);
             heroOverview.animate().alpha(0.85f).setDuration(400).setStartDelay(120).setInterpolator(EASE).start();
             heroButton.animate().alpha(1f).setDuration(400).setStartDelay(120).setInterpolator(EASE).start();
+            heroChrome(120, 400);
             handler.removeCallbacks(heroAdvance);
         } else {
-            heroButton.animate().scaleX(1f).scaleY(1f).setDuration(240).setInterpolator(EASE).start();
+            heroButton.animate().scaleX(1f).scaleY(1f).setStartDelay(0).setDuration(240).setInterpolator(EASE).start();
             heroButton.setElevation(0);
             scroll.animate().translationY(0).setDuration(450).setInterpolator(EASE)
                     .setUpdateListener(null).withEndAction(this::invalidateGlass).start();
-            moveHeroInfo(heroInfoRestY(), heroDotsRestY(), 450);
+            moveHeroInfo(heroInfoRestY(), 450, EASE);
             heroOverview.animate().alpha(0f).setDuration(160).setStartDelay(0).setInterpolator(EASE)
                     .withEndAction(() -> heroOverview.setVisibility(View.GONE)).start();
             heroButton.animate().alpha(0f).setDuration(160).setStartDelay(0).setInterpolator(EASE)
                     .withEndAction(() -> heroButton.setVisibility(View.GONE)).start();
+            heroChrome(120, 400);  // the chevron and hint come back up with the dock
             scheduleAdvance();
         }
     }
@@ -2515,7 +3209,7 @@ public class MainActivity extends Activity {
         if (heroBtnAnim != null) heroBtnAnim.cancel();
         android.animation.ArgbEvaluator ev = new android.animation.ArgbEvaluator();
         heroBtnAnim = ValueAnimator.ofFloat(heroBtnT, on ? 1f : 0f);
-        heroBtnAnim.setDuration(on ? 200 : 260);
+        heroBtnAnim.setDuration(on ? 170 : 180);
         heroBtnAnim.setInterpolator(EASE);
         heroBtnAnim.addUpdateListener(a -> {
             heroBtnT = (float) a.getAnimatedValue();
@@ -2525,20 +3219,51 @@ public class MainActivity extends Activity {
         heroBtnAnim.start();
     }
 
-    /** Carousel and capsule navigation: LEFT/RIGHT browse, OK opens, UP/DOWN move between capsule, carousel and dock. */
+    /**
+     * Home's own arrows: on the carousel Left/Right browse, OK opens, Up goes to the status row,
+     * Down/Back to the dock; the status row and weather card; and a bump at every wall.
+     */
     boolean heroKeys(KeyEvent ev) {
         if (moveIndex >= 0) return false;
         int k = ev.getKeyCode();
         boolean down = ev.getAction() == KeyEvent.ACTION_DOWN;
         View f = getCurrentFocus();
         boolean heroActive = shelfView.isFocusable() && !folderMode;
+        // A first press into a wall (held arrows don't keep bumping).
+        boolean wall = down && ev.getRepeatCount() == 0;
         if (f == shelfView) {
             switch (k) {
                 case KeyEvent.KEYCODE_DPAD_LEFT: if (down) heroStep(-1, true); return true;
                 case KeyEvent.KEYCODE_DPAD_RIGHT: if (down) heroStep(1, true); return true;
                 case KeyEvent.KEYCODE_DPAD_CENTER:
                 case KeyEvent.KEYCODE_ENTER:
-                    if (!down && !heroItems.isEmpty()) openHeroItem(heroItems.get(heroIndex));
+                    // Only a press that started here: the release of an OK that woke the screen
+                    // saver isn't one (it would open the title). The capsule sinks to half its
+                    // focus growth as OK goes down and comes back up on release, then the title
+                    // opens, as a card does.
+                    if (down && ev.getRepeatCount() == 0) {
+                        okDownAt = ev.getDownTime();
+                        heroButton.animate().scaleX(1.04f).scaleY(1.04f).setStartDelay(0).setDuration(PRESS_MS)
+                                .setInterpolator(EASE_OUT_QUAD).start();
+                    }
+                    if (!down && ev.getDownTime() == okDownAt) {
+                        okDownAt = 0;
+                        heroButton.animate().scaleX(1.08f).scaleY(1.08f).setStartDelay(0).setDuration(PRESS_MS)
+                                .setInterpolator(EASE_IN_QUAD).start();
+                        if (!ev.isCanceled() && !heroItems.isEmpty()) {
+                            // The title on screen: heroIndex moves on as soon as the next picture
+                            // is asked for, while that picture may still be loading.
+                            Suggestions.Item it = heroItems.get(Math.min(heroIndex, heroItems.size() - 1));
+                            for (Suggestions.Item c : heroItems) {
+                                if (c.title.equals(heroOnScreen)) {
+                                    it = c;
+                                    break;
+                                }
+                            }
+                            Suggestions.Item open = it;
+                            afterPress(() -> openHeroItem(open));
+                        }
+                    }
                     return true;
                 case KeyEvent.KEYCODE_MENU: return true;  // no options for the carousel
                 case KeyEvent.KEYCODE_DPAD_UP: if (down) focusTop(); return true;
@@ -2553,13 +3278,18 @@ public class MainActivity extends Activity {
             // Status row: the Control Centre button alone; Left goes to the weather.
             if (k == KeyEvent.KEYCODE_DPAD_LEFT) {
                 if (down && weatherShown()) weatherCard.requestFocus();
+                else if (wall) bump(ccButton, -1, 0);
                 return true;
             }
             if (k == KeyEvent.KEYCODE_DPAD_DOWN || k == KeyEvent.KEYCODE_BACK) {
                 if (down) focusBelowStatus();
                 return true;
             }
-            return k == KeyEvent.KEYCODE_DPAD_UP || k == KeyEvent.KEYCODE_DPAD_RIGHT;
+            if (k == KeyEvent.KEYCODE_DPAD_UP || k == KeyEvent.KEYCODE_DPAD_RIGHT) {
+                if (wall) bump(ccButton, k == KeyEvent.KEYCODE_DPAD_RIGHT ? 1 : 0, k == KeyEvent.KEYCODE_DPAD_UP ? -1 : 0);
+                return true;
+            }
+            return false;
         }
         if (f == weatherCard) {
             switch (k) {
@@ -2577,6 +3307,7 @@ public class MainActivity extends Activity {
                     return true;
                 case KeyEvent.KEYCODE_DPAD_UP:
                 case KeyEvent.KEYCODE_DPAD_LEFT:
+                    if (wall) bump(weatherCard, k == KeyEvent.KEYCODE_DPAD_LEFT ? -1 : 0, k == KeyEvent.KEYCODE_DPAD_UP ? -1 : 0);
                     return true;
                 default: return false;
             }
@@ -2584,9 +3315,14 @@ public class MainActivity extends Activity {
         int i = tiles.indexOf(f);
         if (i >= 0 && ((k == KeyEvent.KEYCODE_DPAD_RIGHT && (i % COLS == COLS - 1 || i == tiles.size() - 1))
                 || (k == KeyEvent.KEYCODE_DPAD_LEFT && i % COLS == 0))) {
+            if (wall) bump(f, k == KeyEvent.KEYCODE_DPAD_RIGHT ? 1 : -1, 0);
             return true;
         }
-        if (k == KeyEvent.KEYCODE_DPAD_UP && i >= 0 && i < COLS && (hasDock() || i < COLS)) {
+        if (k == KeyEvent.KEYCODE_DPAD_DOWN && i >= 0 && i / COLS == (tiles.size() - 1) / COLS) {
+            if (wall) bump(f, 0, 1);  // the last row: nothing below
+            return true;
+        }
+        if (k == KeyEvent.KEYCODE_DPAD_UP && i >= 0 && i < COLS) {
             if (down) {
                 if (heroActive) {
                     heroRequested = true;
@@ -2600,8 +3336,43 @@ public class MainActivity extends Activity {
         return false;
     }
 
+    /**
+     * A first press into a wall on Home (a row's end, the last row, the status row's edges): the
+     * focused control leans 12 px that way and springs back, as the App Switcher does at its ends,
+     * with no tick (nothing moved). Only its position moves, so a lift under way carries on.
+     */
+    void bump(View v, int dx, int dy) {
+        v.animate().translationX(dx * dp(6)).translationY(dy * dp(6)).setStartDelay(0).setDuration(110)
+                .setInterpolator(EASE)
+                .withEndAction(() -> v.animate().translationX(0).translationY(0).setDuration(420)
+                        .setInterpolator(Glass.SNAP).start())
+                .start();
+    }
+
+    /** When the OK pressed on the carousel went down: only that press's release opens the title. */
+    long okDownAt;
+
     void openHeroItem(Suggestions.Item it) {
+        Suggestions.Provider p = it.provider();
+        String pkg = p != null && installed(p.pkg) ? p.pkg : null;
         Suggestions.open(this, it);
+        if (pkg == null) return;  // its Play Store page (or nothing): not an app to come back from
+        // Like an app opened from its card: Home's refresh waits for the return animation, and
+        // pressing Home in the app comes back to that app's card (the one that played the title),
+        // else to the dock app whose shelf it was on. A return's fallback still waiting would
+        // clear that before the new app is left.
+        appOpened = true;
+        handler.removeCallbacks(returnRun);
+        openedKey = null;
+        for (AppEntry e : shown) {
+            if (e.key.startsWith(pkg + "/")) {
+                openedKey = e.key;
+                break;
+            }
+        }
+        if (openedKey == null && shelfPkg != null && focusedIndex >= 0 && focusedIndex < shown.size()) {
+            openedKey = shown.get(focusedIndex).key;
+        }
     }
 
     // ---------------------------------------------------------------- launch animation
@@ -2623,8 +3394,13 @@ public class MainActivity extends Activity {
             startActivity(a.launch, opts);
             appOpened = true;
             openedKey = a.key;
+            handler.removeCallbacks(returnRun);  // the last return's fallback would clear appOpened
+            // Nothing new on Home under the app as it grows: a shelf change or the next slide
+            // would start a dissolve (and its picture's decode) in the launch's frames.
+            handler.removeCallbacks(shelfUpdate);
+            handler.removeCallbacks(heroAdvance);
         } catch (ActivityNotFoundException | SecurityException e) {
-            toast("Can't open " + a.label);
+            hint("Can\u2019t open " + a.label, false);
         }
     }
 
@@ -2643,7 +3419,7 @@ public class MainActivity extends Activity {
         focusedIndex = index;
         boolean dock = hasDock() && index < COLS;
         setHeroShown(dock && !heroItems.isEmpty());
-        scrollToRow(index / COLS);
+        scrollToRow(index / COLS, !snapFocus);
         handler.removeCallbacks(shelfUpdate);
         handler.postDelayed(shelfUpdate, 260);
     }
@@ -2652,26 +3428,58 @@ public class MainActivity extends Activity {
      * Row tops come from the fixed grid geometry rather than getTop(), so this also works right
      * after buildGrid() (e.g. while moving a card), before the new rows have been laid out.
      */
-    void scrollToRow(int row) {
-        int rowH = tileH + labelH + gap / 2;
+    void scrollToRow(int row, boolean animate) {
+        int rowH = tileH + labelH + rowGap();
         int rowTop = !hasDock() ? shelfH + row * rowH
                 : row == 0 ? shelfH
                 : shelfH + tileH + 2 * dockPadV + dockGapBelow() + (row - 1) * rowH;
-        int target = row == 0 ? 0 : rowTop - (int) (screenH * 0.30f);
-        scroll.smoothScrollTo(0, Math.max(0, target));
+        scrollToY(row == 0 ? 0 : rowTop - (int) (screenH * 0.30f), animate);
+    }
+
+    /**
+     * The grid glides to y on the Apple TV app's scroll curve (or jumps there). A new row asked for
+     * on the way carries on from where the glide has got to, and the same one asked again (focusIndex
+     * asks twice) leaves it running. ScrollView's own smooth scroll can't: a second call within
+     * 250 ms jumps straight to the end, which made every return to the top a cut.
+     */
+    void scrollToY(int y, boolean animate) {
+        // Just after a rebuild the content's height is stale until the next layout: then only the
+        // top is certain. scrollTo keeps every frame in range, and the call after layout corrects it.
+        int max = content.isLayoutRequested() ? Integer.MAX_VALUE : Math.max(0, content.getHeight() - scroll.getHeight());
+        y = Math.max(0, Math.min(y, max));
+        if (animate && rowScroll != null && rowScroll.isRunning() && y == rowScrollTarget) return;
+        if (rowScroll != null) rowScroll.cancel();
+        rowScroll = null;
+        rowScrollTarget = y;
+        int from = scroll.getScrollY();
+        if (!animate || y == from) {
+            scroll.scrollTo(0, y);
+            return;
+        }
+        ValueAnimator a = ValueAnimator.ofInt(from, y);
+        a.setDuration(700);
+        a.setInterpolator(SCROLL);
+        a.addUpdateListener(v -> scroll.scrollTo(0, (int) v.getAnimatedValue()));
+        rowScroll = a;
+        a.start();
     }
 
     void focusIndex(int i) {
+        focusIndex(i, true);
+    }
+
+    /** Focus on card i, with its row brought into view: gliding there, or at once. */
+    void focusIndex(int i, boolean animate) {
         if (tiles.isEmpty()) return;
         i = Math.max(0, Math.min(i, tiles.size() - 1));
         tiles.get(i).requestFocus();
         focusedIndex = i;
         int row = i / COLS;
-        scroll.post(() -> scrollToRow(row));
+        scroll.post(() -> scrollToRow(row, animate));
     }
 
     void goTop() {
-        scroll.smoothScrollTo(0, 0);
+        scrollToY(0, true);
         focusIndex(0);
     }
 
@@ -2686,6 +3494,15 @@ public class MainActivity extends Activity {
 
     // ---------------------------------------------------------------- folder of hidden apps
 
+    /**
+     * The More Apps card while there are hidden apps (null when there are none), and the apps it
+     * shows. It's drawn in partition, when they change, never on a rebuild of the grid: move mode
+     * rebuilds it at every step.
+     */
+    AppEntry folder;
+    List<AppEntry> folderShows = new ArrayList<>();
+    static final int FOLDER_SHOWS = 6;
+
     AppEntry folderEntry() {
         AppEntry f = new AppEntry();
         f.key = FOLDER_KEY;
@@ -2693,30 +3510,43 @@ public class MainActivity extends Activity {
         f.color = 0xFF3A3A3C;
         f.banner = new BitmapDrawable(getResources(), folderArt());
         f.icon = f.banner;
+        f.tileArt = tileArt(f.banner);
         return f;
     }
 
-    /** Folder card: dark glass gradient, 3x3 app-grid glyph, title and hidden-app count. */
+    /**
+     * tvOS 26's folder card: light frosted glass, an icon's size, showing the apps inside as small
+     * cards from its top-left, three across (up to six here), no words.
+     */
     Bitmap folderArt() {
         int w = 640, h = 360;
         Bitmap b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
         Canvas c = new Canvas(b);
-        Paint p = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.DITHER_FLAG);
-        // tvOS system-icon style: a vivid vertical gradient, white glyph, no words.
-        p.setShader(new LinearGradient(0, 0, 0, h, 0xFF6E7BF2, 0xFF3A3FC8, Shader.TileMode.CLAMP));
+        Paint p = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.DITHER_FLAG | Paint.FILTER_BITMAP_FLAG);
+        p.setShader(new LinearGradient(0, 0, 0, h, 0xFF6A6C74, 0xFF44464E, Shader.TileMode.CLAMP));
         c.drawRect(0, 0, w, h, p);
-        p.setShader(null);
-
-        int cell = 46, gapPx = 18, grid = cell * 3 + gapPx * 2;
-        float gx = (w - grid) / 2f, gy = (h - grid) / 2f;
-        Paint sh = new Paint(Paint.ANTI_ALIAS_FLAG);
-        sh.setColor(0x33000000);
-        sh.setMaskFilter(new android.graphics.BlurMaskFilter(10, android.graphics.BlurMaskFilter.Blur.NORMAL));
-        p.setColor(Color.WHITE);
-        for (int i = 0; i < 9; i++) {
-            float x = gx + (i % 3) * (cell + gapPx), y = gy + (i / 3) * (cell + gapPx);
-            c.drawRoundRect(x, y + 5, x + cell, y + cell + 5, 13, 13, sh);
-            c.drawRoundRect(x, y, x + cell, y + cell, 13, 13, p);
+        p.setShader(new LinearGradient(0, 0, 0, h / 2f, 0x1FFFFFFF, 0x00FFFFFF, Shader.TileMode.CLAMP));
+        c.drawRect(0, 0, w, h / 2f, p);
+        // 168x101 (the cards' 5:3, with their corner), 28 apart: 40 in from the sides, 65 from the top.
+        int mw = 168, mh = 101, gapPx = 28;
+        RectF r = new RectF();
+        android.graphics.Matrix m = new android.graphics.Matrix();
+        for (int i = 0; i < folderShows.size(); i++) {
+            AppEntry a = folderShows.get(i);
+            float x = 40 + (i % 3) * (mw + gapPx), y = 65 + (i / 3) * (mh + gapPx);
+            r.set(x, y, x + mw, y + mh);
+            if (a.tileArt != null) {
+                android.graphics.BitmapShader art = new android.graphics.BitmapShader(a.tileArt,
+                        Shader.TileMode.CLAMP, Shader.TileMode.CLAMP);
+                m.setRectToRect(new RectF(0, 0, a.tileArt.getWidth(), a.tileArt.getHeight()), r,
+                        android.graphics.Matrix.ScaleToFit.FILL);
+                art.setLocalMatrix(m);
+                p.setShader(art);
+            } else {
+                p.setShader(null);
+                p.setColor(a.color);
+            }
+            c.drawRoundRect(r, 18, 18, p);
         }
         return b;
     }
@@ -2728,7 +3558,7 @@ public class MainActivity extends Activity {
             setHeroShown(false);
             weatherCard.setAlpha(0f);
             buildGrid();
-            scroll.scrollTo(0, 0);
+            scrollToY(0, false);
             focusIndex(0);
         });
     }
@@ -2738,8 +3568,11 @@ public class MainActivity extends Activity {
             folderMode = false;
             weatherCard.animate().alpha(weatherAlpha()).setDuration(250).setInterpolator(EASE).start();
             buildGrid();
+            // Under the zoom back in: the folder's card is already up and its row in view.
             int i = indexOfKey(FOLDER_KEY);
-            focusIndex(i >= 0 ? i : 0);
+            snapFocus = true;
+            focusIndex(i >= 0 ? i : 0, false);
+            snapFocus = false;
         });
     }
 
@@ -2772,9 +3605,31 @@ public class MainActivity extends Activity {
             return true;
         }
         resetIdle();
-        navSound(this, ev);
-        if (switcher != null) return switcher.key(ev) || super.dispatchKeyEvent(ev);
-        if (pickerLayer != null && menuLayer == null) {
+        int k = ev.getKeyCode();
+        boolean down = ev.getAction() == KeyEvent.ACTION_DOWN;
+        if (down && k >= KeyEvent.KEYCODE_DPAD_UP && k <= KeyEvent.KEYCODE_DPAD_RIGHT) {
+            // Held arrows, paced: Android repeats every 50 ms, faster than tvOS moves and than this
+            // TV can draw a lift and a scroll. A hold repeats from 0.3 s in (tvOS's repeat start),
+            // then one move per 100 ms; on the carousel one picture per 450 ms (each is a decode
+            // and a dissolve), and one step per 250 ms when moving a card (each rebuilds the grid).
+            // A single press is never held back.
+            long t = ev.getEventTime();
+            long pace = moveIndex >= 0 ? 250 : getCurrentFocus() == shelfView ? 450 : 90;
+            if (ev.getRepeatCount() > 0 && (t - ev.getDownTime() < 300 || t - lastArrowAt < pace)) return true;
+            fastMove = ev.getRepeatCount() > 0 || t - lastArrowAt < 180;
+            lastArrowAt = t;
+            arrowAt = SystemClock.uptimeMillis();
+        }
+        // No tick here for arrows: Home's comes from the focus change itself (see buildChrome).
+        navSound(this, ev, false);
+        if (switcher != null) {
+            int was = switcher.sel;
+            boolean used = switcher.key(ev);
+            // The App Switcher moves no focus, so its tick is played here, when its row moved.
+            if (switcher != null && switcher.sel != was) Clicks.move(this, 0.5f, fastMove);
+            return used || super.dispatchKeyEvent(ev);
+        }
+        if (forecastLayer != null && menuLayer == null) {
             int pk = ev.getKeyCode();
             boolean pd = ev.getAction() == KeyEvent.ACTION_DOWN;
             if (pk == KeyEvent.KEYCODE_BACK) {
@@ -2783,7 +3638,10 @@ public class MainActivity extends Activity {
             }
             if (pk == KeyEvent.KEYCODE_DPAD_UP || pk == KeyEvent.KEYCODE_DPAD_DOWN
                     || pk == KeyEvent.KEYCODE_DPAD_LEFT || pk == KeyEvent.KEYCODE_DPAD_RIGHT) {
-                if (pd) pickerMove(pk);
+                // The forecast keeps focus while it's open; should focus have slipped off it, an
+                // arrow puts it back rather than moving something hidden behind it.
+                View panel = forecastLayer.getChildCount() > 1 ? forecastLayer.getChildAt(1) : null;
+                if (pd && panel != null && !panel.isFocused()) panel.requestFocus();
                 return true;
             }
             return super.dispatchKeyEvent(ev);
@@ -2796,16 +3654,18 @@ public class MainActivity extends Activity {
             }
             return super.dispatchKeyEvent(ev);
         }
+        // An alert over Home (Perms.alert, outside root) has focus: its buttons and its Back.
+        View cf = getCurrentFocus();
+        if (cf != null && !inside(cf, root)) return super.dispatchKeyEvent(ev);
         if (heroKeys(ev)) return true;
-        int k = ev.getKeyCode();
-        boolean down = ev.getAction() == KeyEvent.ACTION_DOWN;
 
         if (moveIndex >= 0) {
+            boolean first = ev.getRepeatCount() == 0;
             switch (k) {
-                case KeyEvent.KEYCODE_DPAD_LEFT:   if (down) moveTo(moveIndex - 1); return true;
-                case KeyEvent.KEYCODE_DPAD_RIGHT:  if (down) moveTo(moveIndex + 1); return true;
-                case KeyEvent.KEYCODE_DPAD_UP:     if (down) moveTo(moveIndex - COLS); return true;
-                case KeyEvent.KEYCODE_DPAD_DOWN:   if (down) moveTo(moveIndex + COLS); return true;
+                case KeyEvent.KEYCODE_DPAD_LEFT:   if (down) moveTo(moveIndex - 1, first); return true;
+                case KeyEvent.KEYCODE_DPAD_RIGHT:  if (down) moveTo(moveIndex + 1, first); return true;
+                case KeyEvent.KEYCODE_DPAD_UP:     if (down) moveTo(moveIndex - COLS, first); return true;
+                case KeyEvent.KEYCODE_DPAD_DOWN:   if (down) moveTo(moveIndex + COLS, first); return true;
                 case KeyEvent.KEYCODE_DPAD_CENTER:
                 case KeyEvent.KEYCODE_ENTER:
                 case KeyEvent.KEYCODE_BACK:
@@ -2814,7 +3674,10 @@ public class MainActivity extends Activity {
             }
         }
         if (k == KeyEvent.KEYCODE_MENU) {
-            if (!down) {
+            // Only a press that started here, as with Back: the release of a Menu that woke the
+            // screen saver isn't one.
+            if (down && ev.getRepeatCount() == 0) menuDownAt = ev.getDownTime();
+            if (!down && ev.getDownTime() == menuDownAt) {
                 int i = tiles.indexOf(getCurrentFocus());
                 if (i >= 0 && !FOLDER_KEY.equals(shown.get(i).key)) showOptions(i);
             }
@@ -2832,26 +3695,44 @@ public class MainActivity extends Activity {
             }
             return true;
         }
+        if (k == KeyEvent.KEYCODE_DPAD_CENTER || k == KeyEvent.KEYCODE_ENTER) {
+            // OK on a card: it sinks as the key goes down, and comes back up on release (the
+            // click, which then opens it) or when the press is called off.
+            View f = getCurrentFocus();
+            if (f != null && tiles.contains(f)) {
+                if (down && ev.getRepeatCount() == 0) press(f);
+                else if (!down && ev.isCanceled()) rise(f);
+            }
+        }
         return super.dispatchKeyEvent(ev);
     }
 
-    /** When the Back being pressed went down. */
-    long backDownAt;
+    /** When the Back (or Menu) being pressed went down. */
+    long backDownAt, menuDownAt;
+
+    /** Whether v is group or somewhere inside it. */
+    static boolean inside(View v, View group) {
+        for (Object p = v; p instanceof View; p = ((View) p).getParent()) if (p == group) return true;
+        return false;
+    }
 
     // ---------------------------------------------------------------- apps
 
-    void loadApps() {
-        all.clear();
-        apps.clear();
-        hiddenApps.clear();
+    /**
+     * Finds every app and draws its card. It touches nothing of Home's but its own result, so it
+     * runs off the main thread. A card in prev whose app hasn't changed (same file, same name) is
+     * kept as it is: an app's update redraws its own card, not every card on Home.
+     */
+    Map<String, AppEntry> scan(Map<String, AppEntry> prev) {
+        Map<String, AppEntry> found = new LinkedHashMap<>();
         PackageManager pm = getPackageManager();
         Set<String> pkgs = new HashSet<>();
-        addResolved(pm, Intent.CATEGORY_LEANBACK_LAUNCHER, pkgs, true);
-        addResolved(pm, Intent.CATEGORY_LAUNCHER, pkgs, false);
-        if (!pkgs.contains(TV_SETTINGS)) addSettingsEntry(pm);
-        inputs = Inputs.list(this);
-        if (Inputs.showCard(this) && !inputs.isEmpty()) addInputsEntry();
-        for (AppEntry e : all.values()) {
+        List<AppEntry> fresh = new ArrayList<>();
+        addResolved(pm, Intent.CATEGORY_LEANBACK_LAUNCHER, pkgs, true, found, prev, fresh);
+        addResolved(pm, Intent.CATEGORY_LAUNCHER, pkgs, false, found, prev, fresh);
+        if (!pkgs.contains(TV_SETTINGS)) addSettingsEntry(pm, found, prev, fresh);
+        if (Inputs.showCard(this) && !Inputs.list(this).isEmpty()) addInputsEntry(found, prev, fresh);
+        for (AppEntry e : fresh) {
             boolean zoom = e.banner != null && ZOOM_BANNER_PKGS.contains(e.pkg);
             boolean card = !zoom && (e.banner == null || TVOS_CARD_PKGS.contains(e.pkg));
             if (zoom || card) {
@@ -2869,7 +3750,24 @@ public class MainActivity extends Activity {
             Drawable big = own ? hiRes(pm, e.pkg, e.bannerRes, e.banner) : e.banner;
             e.tileArt = tileArt(big != e.banner && sameArt(big, e.banner) ? big : e.banner);
         }
+        return found;
+    }
 
+    /** Takes a scan's apps as Home's own (main thread). A card is the same object while its app is unchanged. */
+    void install(Map<String, AppEntry> found) {
+        all.clear();
+        all.putAll(found);
+        partition();
+    }
+
+    /**
+     * Home's apps and the hidden ones, from every app found, in the saved order: no rescan, and
+     * nothing drawn but the More Apps card when the apps it shows change, so hiding an app or
+     * resetting the layout is immediate.
+     */
+    void partition() {
+        apps.clear();
+        hiddenApps.clear();
         Set<String> hidden = prefs.getStringSet(PREF_HIDDEN, Collections.emptySet());
         Map<String, AppEntry> pool = new LinkedHashMap<>();
         for (AppEntry e : all.values()) {
@@ -2888,10 +3786,22 @@ public class MainActivity extends Activity {
             return px != py ? Integer.compare(px, py) : x.label.compareToIgnoreCase(y.label);
         });
         apps.addAll(rest);
+        // The More Apps card shows the first apps inside it: drawn again only when they change.
+        List<AppEntry> first = new ArrayList<>(hiddenApps.subList(0, Math.min(FOLDER_SHOWS, hiddenApps.size())));
+        if (!first.equals(folderShows)) {
+            folderShows = first;
+            folder = first.isEmpty() ? null : folderEntry();
+        }
     }
 
     /** Fallback Settings tile for TVs whose settings app has no launcher entry. */
-    void addSettingsEntry(PackageManager pm) {
+    void addSettingsEntry(PackageManager pm, Map<String, AppEntry> out, Map<String, AppEntry> prev, List<AppEntry> fresh) {
+        // Home draws this card itself (the silver gear), the same every time.
+        AppEntry old = prev == null ? null : prev.get(SETTINGS_KEY);
+        if (old != null) {
+            out.put(SETTINGS_KEY, old);
+            return;
+        }
         AppEntry s = new AppEntry();
         s.key = SETTINGS_KEY;
         s.pkg = TV_SETTINGS;
@@ -2905,7 +3815,8 @@ public class MainActivity extends Activity {
             s.icon = getDrawable(android.R.drawable.ic_menu_preferences);
         }
         s.color = 0xFF3A3A3C;
-        all.put(s.key, s);
+        out.put(s.key, s);
+        fresh.add(s);
     }
 
     int priority(AppEntry e) {
@@ -2920,10 +3831,13 @@ public class MainActivity extends Activity {
         return SETTINGS_KEY.equals(e.key) || TV_SETTINGS.equals(e.pkg);
     }
 
-    List<Inputs.Input> inputs = new ArrayList<>();
-
-    /** Inputs card: a graphite tvOS-style card with the input glyph; OK opens the input picker. */
-    void addInputsEntry() {
+    /** Inputs card: a graphite tvOS-style card with the input glyph; OK opens Control Centre on its Inputs page. */
+    void addInputsEntry(Map<String, AppEntry> out, Map<String, AppEntry> prev, List<AppEntry> fresh) {
+        AppEntry old = prev == null ? null : prev.get(INPUTS_KEY);
+        if (old != null) {  // drawn by Home, the same every time
+            out.put(INPUTS_KEY, old);
+            return;
+        }
         AppEntry e = new AppEntry();
         e.key = INPUTS_KEY;
         e.pkg = getPackageName();
@@ -2940,20 +3854,32 @@ public class MainActivity extends Activity {
         c.drawBitmap(g, (w - g.getWidth()) / 2f, (h - g.getHeight()) / 2f, null);
         e.banner = new BitmapDrawable(getResources(), b);
         e.icon = e.banner;
-        all.put(e.key, e);
+        out.put(e.key, e);
+        fresh.add(e);
     }
 
-
-    void addResolved(PackageManager pm, String category, Set<String> pkgs, boolean leanback) {
+    void addResolved(PackageManager pm, String category, Set<String> pkgs, boolean leanback,
+                     Map<String, AppEntry> out, Map<String, AppEntry> prev, List<AppEntry> fresh) {
         Intent q = new Intent(Intent.ACTION_MAIN).addCategory(category);
         for (ResolveInfo ri : pm.queryIntentActivities(q, 0)) {
             ActivityInfo ai = ri.activityInfo;
             if (ai.packageName.equals(getPackageName()) || pkgs.contains(ai.packageName) || NOT_APPS.contains(ai.packageName)) continue;
-            AppEntry e = new AppEntry();
             ComponentName cn = new ComponentName(ai.packageName, ai.name);
+            String key = cn.flattenToShortString(), label = ri.loadLabel(pm).toString();
+            // An update installs a new file (a new path, a new date): unchanged, the card is kept.
+            String dir = ai.applicationInfo.sourceDir;
+            String stamp = (leanback ? "tv " : "") + (dir == null ? "" : dir + " " + new java.io.File(dir).lastModified());
+            pkgs.add(ai.packageName);
+            AppEntry old = prev == null ? null : prev.get(key);
+            if (old != null && stamp.equals(old.stamp) && label.equals(old.label)) {
+                out.put(key, old);
+                continue;
+            }
+            AppEntry e = new AppEntry();
             e.pkg = ai.packageName;
-            e.key = cn.flattenToShortString();
-            e.label = ri.loadLabel(pm).toString();
+            e.key = key;
+            e.label = label;
+            e.stamp = stamp;
             e.banner = leanback ? ai.loadBanner(pm) : null;
             e.icon = ri.loadIcon(pm);
             e.iconRes = ri.getIconResource();
@@ -2962,8 +3888,8 @@ public class MainActivity extends Activity {
             e.system = (ai.applicationInfo.flags & ApplicationInfo.FLAG_SYSTEM) != 0;
             e.launch = new Intent(Intent.ACTION_MAIN).addCategory(category).setComponent(cn)
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
-            all.put(e.key, e);
-            pkgs.add(e.pkg);
+            out.put(e.key, e);
+            fresh.add(e);
         }
     }
 
@@ -2995,12 +3921,84 @@ public class MainActivity extends Activity {
         return Color.HSVToColor(hsv);
     }
 
-    void reload(String focusKey) {
-        loadApps();
-        if (folderMode && hiddenApps.isEmpty()) folderMode = false;
+    /** A rescan that finished while Home couldn't take it (see applyPendingScan). */
+    Map<String, AppEntry> pendingScan;
+    /** Apps changed while Home was out of sight: rescanned once it's back. */
+    boolean appsDirty;
+    final Runnable applyScanRun = this::applyPendingScan;
+
+    /**
+     * Rescans the installed apps on a background lane, then shows the result. Out of sight, it
+     * waits until Home is back rather than take the processor from the app in front.
+     */
+    void reload() {
+        if (!resumed) {
+            appsDirty = true;
+            return;
+        }
+        appsDirty = false;
+        // From the newest cards there are, including a rescan still held back, so none is drawn twice.
+        Map<String, AppEntry> prev = new LinkedHashMap<>(pendingScan != null ? pendingScan : all);
+        scans.execute(() -> {
+            Map<String, AppEntry> found = scan(prev);
+            handler.post(() -> {
+                pendingScan = found;
+                applyPendingScan();
+            });
+        });
+    }
+
+    /**
+     * Puts the latest rescan on screen, focus staying on the card it was on. Not under a card
+     * being moved, a menu, the forecast, the full-screen carousel or the App Switcher, which hold
+     * on to where cards are: each puts it on screen once it has gone (scanAfter), and the switcher,
+     * which can't tell Home, is looked at again shortly.
+     */
+    void applyPendingScan() {
+        Map<String, AppEntry> found = pendingScan;
+        if (found == null || !resumed) return;  // resumeWork picks it up when Home is back
+        handler.removeCallbacks(applyScanRun);
+        if (switcher != null) {
+            handler.postDelayed(applyScanRun, 500);
+            return;
+        }
+        if (moveIndex >= 0 || menuLayer != null || forecastLayer != null || idle) return;
+        pendingScan = null;
+        String key = currentKey();
+        View f = getCurrentFocus();
+        boolean inGrid = f == null || tiles.contains(f);
+        List<AppEntry> was = new ArrayList<>(apps), wasHidden = new ArrayList<>(hiddenApps);
+        install(found);
+        // The same cards in the same places (an update to an app Home doesn't show, which Google's
+        // services send often): the grid stays as it is, its focused card not lifted afresh.
+        if (apps.equals(was) && hiddenApps.equals(wasHidden)) return;
+        leaveEmptyFolder();
         buildGrid();
-        int i = focusKey == null ? -1 : indexOfKey(focusKey);
-        focusIndex(i >= 0 ? i : Math.min(focusedIndex, shown.size() - 1));
+        int i = key == null ? -1 : indexOfKey(key);
+        if (i < 0) i = Math.min(focusedIndex, shown.size() - 1);
+        // Focus up on the carousel or the status row stays there; only a card in the grid is put back,
+        // simply up (it was already), with no second lift and glare.
+        if (inGrid) {
+            snapFocus = true;
+            focusIndex(i);
+            snapFocus = false;
+        } else {
+            focusedIndex = Math.max(0, i);
+        }
+    }
+
+    /** Something that held a rescan back has closed: the rescan goes on screen ms later, once it's gone. */
+    void scanAfter(long ms) {
+        if (pendingScan == null) return;
+        handler.removeCallbacks(applyScanRun);
+        handler.postDelayed(applyScanRun, ms);
+    }
+
+    /** The folder has emptied (its last app shown again or removed): back to Home's own grid. */
+    void leaveEmptyFolder() {
+        if (!folderMode || !hiddenApps.isEmpty()) return;
+        folderMode = false;
+        weatherCard.setAlpha(weatherAlpha());
     }
 
     void saveOrder() {
@@ -3018,20 +4016,33 @@ public class MainActivity extends Activity {
         else hidden.remove(a.key);
         prefs.edit().putStringSet(PREF_HIDDEN, hidden).apply();
         int i = focusedIndex;
-        loadApps();
-        if (folderMode && hiddenApps.isEmpty()) folderMode = false;
+        partition();  // the same apps, only regrouped: nothing to scan, only the folder's card to draw
+        leaveEmptyFolder();
         buildGrid();
         focusIndex(Math.min(i, shown.size() - 1));
-        toast(hide ? a.label + " moved to More Apps" : a.label + " is back on Home");
+        hint(hide ? a.label + " moved to More Apps" : a.label + " moved to the Home Screen", false);
     }
 
+    /**
+     * Apps added, removed or updated: rescanned shortly after (an update sends several of these at
+     * once). Part of an app switched on or off only counts for an app Home shows or could show:
+     * Google's services do that all the time.
+     */
     void registerPackageReceiver() {
         pkgReceiver = new BroadcastReceiver() {
             @Override public void onReceive(Context c, Intent i) {
-                badges.clear();
-                installedApps.clear();
-                handler.removeCallbacks(reloadRun);
-                handler.postDelayed(reloadRun, 600);
+                String action = i.getAction();
+                // An update removes the app and adds it back: the "replaced" that follows counts.
+                if (Intent.ACTION_PACKAGE_REMOVED.equals(action) && i.getBooleanExtra(Intent.EXTRA_REPLACING, false)) return;
+                String pkg = i.getData() == null ? null : i.getData().getSchemeSpecificPart();
+                if (Intent.ACTION_PACKAGE_CHANGED.equals(action) && pkg != null && !onHome(pkg)) {
+                    if (NOT_APPS.contains(pkg) || pkg.equals(getPackageName())) return;
+                    scans.execute(() -> {
+                        if (launchable(pkg)) handler.post(MainActivity.this::rescanSoon);
+                    });
+                    return;
+                }
+                rescanSoon();
             }
         };
         IntentFilter f = new IntentFilter();
@@ -3047,6 +4058,51 @@ public class MainActivity extends Activity {
         }
     }
 
+    /** An app that matters to Home changed: its badge and whether it's installed are asked afresh too. */
+    void rescanSoon() {
+        badges.clear();
+        installedApps.clear();
+        handler.removeCallbacks(reloadRun);
+        handler.postDelayed(reloadRun, 600);
+    }
+
+    /** Whether Home has a card for the package. */
+    boolean onHome(String pkg) {
+        for (AppEntry e : all.values()) if (pkg.equals(e.pkg)) return true;
+        return false;
+    }
+
+    /** Whether the package has something Home would show (a TV or phone launcher entry). */
+    boolean launchable(String pkg) {
+        PackageManager pm = getPackageManager();
+        for (String category : new String[]{Intent.CATEGORY_LEANBACK_LAUNCHER, Intent.CATEGORY_LAUNCHER}) {
+            Intent q = new Intent(Intent.ACTION_MAIN).addCategory(category).setPackage(pkg);
+            if (!pm.queryIntentActivities(q, 0).isEmpty()) return true;
+        }
+        return false;
+    }
+
+    /**
+     * The TV switched off: a sleep timer ends with it, as TV sleep timers do, so it can't turn the
+     * TV off mid-programme after it's switched back on. Only Home's own (running) receiver gets
+     * this; the screen saver doesn't send it, so the timer runs on through that.
+     */
+    BroadcastReceiver screenOffReceiver;
+
+    void registerScreenOff() {
+        screenOffReceiver = new BroadcastReceiver() {
+            @Override public void onReceive(Context c, Intent i) {
+                if (SleepReceiver.timerLeft(c) > 0) SleepReceiver.setTimer(c, 0);
+            }
+        };
+        IntentFilter f = new IntentFilter(Intent.ACTION_SCREEN_OFF);
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(screenOffReceiver, f, Context.RECEIVER_EXPORTED);
+        } else {
+            registerReceiver(screenOffReceiver, f);
+        }
+    }
+
     // ---------------------------------------------------------------- options
 
     void showOptions(int index) {
@@ -3055,15 +4111,17 @@ public class MainActivity extends Activity {
         List<String> labels = new ArrayList<>();
         List<Runnable> actions = new ArrayList<>();
         labels.add("Open");
-        actions.add(() -> launchAnimated(tile, a));
+        // Through OK's guard, so a second OK landing on the card as the menu goes isn't a second launch.
+        actions.add(() -> afterPress(() -> launchAnimated(tile, a)));
+        // tvOS 26's own words: Edit Home Screen, and Move to (a folder, or the Home Screen).
         if (folderMode) {
-            labels.add("Show on Home Screen");
+            labels.add("Move to Home Screen");
             actions.add(() -> setHidden(a, false));
         } else {
-            labels.add("Move");
+            labels.add("Edit Home Screen");
             actions.add(() -> startMove(index));
             if (!isSettings(a)) {
-                labels.add("Hide");
+                labels.add("Move to More Apps");
                 actions.add(() -> setHidden(a, true));
             }
         }
@@ -3080,13 +4138,16 @@ public class MainActivity extends Activity {
             labels.add("Reset Layout");
             actions.add(() -> {
                 prefs.edit().remove(PREF_ORDER).apply();
-                reload(a.key);
+                partition();  // the same apps in their first order: nothing to scan or draw again
+                buildGrid();
+                int i = indexOfKey(a.key);
+                focusIndex(i >= 0 ? i : 0);
             });
         }
         showMenu(tile, a.label, labels, actions, labels.indexOf("Uninstall"));
     }
 
-    // ---------------------------------------------------------------- Control Center
+    // ---------------------------------------------------------------- Control Centre
 
     /** Control Centre: one screen for Home and for the remote's button inside apps. */
     void openControlCentre() {
@@ -3118,46 +4179,70 @@ public class MainActivity extends Activity {
         }
     }
 
-    int netState = -1, netBars = -1;
+    int netState = -1;
     boolean netEthernet;
+    /** The status icon's pictures, each drawn once: a wake usually passes through two or three. */
+    final Map<String, Bitmap> netGlyphs = new java.util.HashMap<>();
 
+    /**
+     * The network changed. Back online while Home is in front, what needs the internet is
+     * refreshed; out of sight (an app in front, the screen off), the next return refreshes
+     * whatever is stale instead.
+     */
     void updateNet() {
-        if (netIcon == null) return;
+        if (readNet() && resumed) {
+            Weather.refresh(this, true, this::updateWeather);
+            loadHero(true);
+        }
+    }
+
+    /** Reads the network's state into the status icon; true when it has just come back online. */
+    boolean readNet() {
+        if (netIcon == null) return false;
         android.net.ConnectivityManager cm = getSystemService(android.net.ConnectivityManager.class);
         android.net.NetworkCapabilities nc = cm.getNetworkCapabilities(cm.getActiveNetwork());
         int state = nc == null ? 0
                 : nc.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED) ? 2 : 1;
         boolean eth = nc != null && nc.hasTransport(android.net.NetworkCapabilities.TRANSPORT_ETHERNET);
-        int bars = 3;
-        if (nc != null && !eth) {
-            try {
-                android.net.wifi.WifiManager wm = getApplicationContext().getSystemService(android.net.wifi.WifiManager.class);
-                int level = android.net.wifi.WifiManager.calculateSignalLevel(wm.getConnectionInfo().getRssi(), 4);
-                bars = level <= 1 ? 1 : level == 2 ? 2 : 3;
-            } catch (Exception ignored) {
-                // keep full bars
-            }
-        }
         boolean back = netState == 0 || netState == 1;
-        if (state == netState && eth == netEthernet && bars == netBars) return;
+        if (state == netState && eth == netEthernet) return false;
         netState = state;
         netEthernet = eth;
-        netBars = bars;
-        netIcon.setImageBitmap(netGlyph(state, eth, bars, dp(15)));
-        netIcon.setContentDescription(state == 2 ? "Online" : state == 1 ? "No internet" : "Offline");
-        // Back online: refresh what needs the internet.
-        if (state == 2 && back) {
-            Weather.refresh(this, true, this::updateWeather);
-            loadHero();
+        // As tvOS: a working connection shows nothing; only one that isn't gets a glyph.
+        if (state != 2) {
+            String key = state + (eth ? "e" : "w");
+            Bitmap glyph = netGlyphs.get(key);
+            if (glyph == null) netGlyphs.put(key, glyph = netGlyph(state, eth, dp(15)));
+            netIcon.setImageBitmap(glyph);
+            netIcon.setContentDescription(state == 1 ? "No internet" : "Offline");
         }
+        netIcon.setVisibility(state == 2 ? View.GONE : View.VISIBLE);
+        statusPadding();
+        return state == 2 && back;
+    }
+
+    /** The sleep timer's glyph, cyan as in Control Centre, while the timer runs (tvOS's status area). */
+    void timerGlyph() {
+        boolean timer = SleepReceiver.timerLeft(this) > 0;
+        if (timer && timerIcon.getDrawable() == null) {
+            timerIcon.setImageBitmap(Glyphs.get("timer", dp(15), ControlCentreActivity.CYAN));
+        }
+        timerIcon.setVisibility(timer ? View.VISIBLE : View.GONE);
+        statusPadding();
+    }
+
+    /** The time sits evenly in its pill alone, a little nearer the edge after a glyph. */
+    void statusPadding() {
+        boolean glyph = timerIcon.getVisibility() == View.VISIBLE || netIcon.getVisibility() == View.VISIBLE;
+        timeChip.setPadding(glyph ? dp(13) : dp(15), 0, dp(15), 0);  // no layout pass unless it changes
     }
 
     /**
-     * Apple-style network symbol, white only: Wi-Fi as a dot-wedge and two bands lit by signal
-     * strength (unlit at 30%), or Ethernet; "!" beside it without internet (wifi.exclamationmark)
-     * and a slash through dimmed bands with no network (wifi.slash).
+     * Apple-style network symbol for a connection that isn't working, white only: Wi-Fi's wedge
+     * and two bands, or Ethernet, dimmed to 30%, with "!" beside it when there's a network but no
+     * internet (wifi.exclamationmark) and a slash through it with no network (wifi.slash).
      */
-    Bitmap netGlyph(int state, boolean eth, int bars, int s) {
+    Bitmap netGlyph(int state, boolean eth, int s) {
         // Wi-Fi alone is a fan 1.2x as wide as it's tall; "no internet" adds a "!" to its right.
         int w = Math.round(s * (state == 1 ? 1.55f : 1.2f));
         Bitmap b = Bitmap.createBitmap(w, s, Bitmap.Config.ARGB_8888);
@@ -3166,10 +4251,10 @@ public class MainActivity extends Activity {
         if (eth && state != 0) {
             c.save();
             c.translate(s * 0.1f, 0);  // centred where the Wi-Fi fan would be
-            drawEthernet(c, s, state == 2 ? on : off);
+            drawEthernet(c, s, off);
             c.restore();
         } else {
-            drawWifi(c, s, state == 2 ? bars : 0, on, off);
+            drawWifi(c, s, off);
         }
         Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
         p.setColor(on);
@@ -3194,10 +4279,9 @@ public class MainActivity extends Activity {
     /**
      * Apple's Wi-Fi fan: a quarter circle split into a wedge and two bands with even gaps, the band
      * ends cut straight along the fan's edges and every corner slightly rounded. Drawn four times
-     * over size and scaled down smoothly, as type is, so the small curves come out even; bands
-     * beyond the signal strength are dimmed.
+     * over size and scaled down smoothly, as type is, so the small curves come out even.
      */
-    void drawWifi(Canvas c, float s, int lit, int on, int off) {
+    void drawWifi(Canvas c, float s, int col) {
         int k = 4, bw = Math.round(c.getWidth() * k), bh = Math.round(s * k);
         Bitmap big = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888);
         Canvas g = new Canvas(big);
@@ -3224,7 +4308,7 @@ public class MainActivity extends Activity {
                 ring.op(hole, android.graphics.Path.Op.DIFFERENCE);
             }
             ring.op(fan, android.graphics.Path.Op.INTERSECT);
-            p.setColor(i < lit ? on : off);
+            p.setColor(col);
             g.drawPath(ring, p);
         }
         // Down in halves with filtering: each pixel the average of the ones it covers.
@@ -3254,20 +4338,30 @@ public class MainActivity extends Activity {
         c.drawRoundRect(r, s * 0.06f, s * 0.06f, p);
     }
 
-    /** Android TV's system click on D-pad moves, select and Back (Settings -> Home -> Navigation sounds). */
+    /**
+     * Glass Home's own clicks (Clicks) on D-pad moves, select and Back, unless they're off in
+     * Settings › Home Screen › Navigation Clicks; an arrow's direction is also kept for Glass.lift,
+     * so a newly focused control can nudge the way the remote moved.
+     */
     static void navSound(Context c, KeyEvent ev) {
+        navSound(c, ev, true);
+    }
+
+    /**
+     * As navSound; tickMoves false leaves the arrows' tick to the caller, which plays it only when
+     * focus really moved (Home), as tvOS never ticks for a press into a wall.
+     */
+    static void navSound(Context c, KeyEvent ev, boolean tickMoves) {
         if (ev.getAction() != KeyEvent.ACTION_DOWN) return;
         int k = ev.getKeyCode();
-        if (k >= KeyEvent.KEYCODE_DPAD_UP && k <= KeyEvent.KEYCODE_DPAD_RIGHT) {
-            Glass.dirX = k == KeyEvent.KEYCODE_DPAD_LEFT ? -1 : k == KeyEvent.KEYCODE_DPAD_RIGHT ? 1 : 0;
-            Glass.dirY = k == KeyEvent.KEYCODE_DPAD_UP ? -1 : k == KeyEvent.KEYCODE_DPAD_DOWN ? 1 : 0;
-        }
-        switch (ev.getKeyCode()) {
+        switch (k) {
             case KeyEvent.KEYCODE_DPAD_UP:
             case KeyEvent.KEYCODE_DPAD_DOWN:
             case KeyEvent.KEYCODE_DPAD_LEFT:
             case KeyEvent.KEYCODE_DPAD_RIGHT:
-                Clicks.move(c, ev.getKeyCode());
+                Glass.dirX = k == KeyEvent.KEYCODE_DPAD_LEFT ? -1 : k == KeyEvent.KEYCODE_DPAD_RIGHT ? 1 : 0;
+                Glass.dirY = k == KeyEvent.KEYCODE_DPAD_UP ? -1 : k == KeyEvent.KEYCODE_DPAD_DOWN ? 1 : 0;
+                if (tickMoves) Clicks.move(c, 0.5f, ev.getRepeatCount() > 0);
                 break;
             case KeyEvent.KEYCODE_DPAD_CENTER:
             case KeyEvent.KEYCODE_ENTER:
@@ -3284,22 +4378,26 @@ public class MainActivity extends Activity {
     // ---------------------------------------------------------------- idle full-screen carousel
 
     boolean idle, swallowUp;
-    float idleScrollY, idleInfoY, idleDotsY;
+    float idleScrollY, idleInfoY;
     boolean idleOverviewShown;
 
-    /** Seconds without input before the dock slides away (Settings -> Home); 0 = never. */
+    /** Seconds without input before the dock slides away (Settings -> Home Screen); 0 = never. */
     int idleSeconds() {
-        return Profiles.homePrefs(this).getInt("idle_sec", 20);
+        return prefs.getInt("idle_sec", 20);  // asked on every key press: the store already open
     }
 
     final Runnable idleRunnable = this::enterIdle;
 
     void resetIdle() {
         handler.removeCallbacks(idleRunnable);
-        if (handler.hasCallbacks(idleRise)) {
-            // A press while rising to the top: stay up there (the press moves from the dock).
+        if (idleRising) {
+            // A press while rising to the top: stay up there (the press moves from the dock), on
+            // the shelf of the app in focus, which the rise held back.
             handler.removeCallbacks(idleRise);
+            idleRising = false;
             idleReturnIndex = -1;
+            handler.removeCallbacks(shelfUpdate);
+            handler.postDelayed(shelfUpdate, 260);
         }
         int sec = idleSeconds();
         if (sec > 0 && resumed) handler.postDelayed(idleRunnable, sec * 1000L);
@@ -3311,7 +4409,7 @@ public class MainActivity extends Activity {
      */
     void enterIdle() {
         if (idle || !resumed || heroItems.isEmpty() || folderMode
-                || pickerLayer != null || menuLayer != null || moveIndex >= 0 || switcher != null) {
+                || forecastLayer != null || menuLayer != null || moveIndex >= 0 || switcher != null) {
             resetIdle();
             return;
         }
@@ -3320,8 +4418,12 @@ public class MainActivity extends Activity {
             // carousel is up (the same wait as from the dock); the press that wakes it returns here.
             idleReturnIndex = focusedIndex;
             goTop();
+            // Not the first dock app's own shelf on the way up: full screen dissolves to the mix
+            // moments later, and two decodes would land on the rise and the slide.
+            handler.removeCallbacks(shelfUpdate);
             handler.removeCallbacks(idleRunnable);
             handler.postDelayed(idleRise, 900);
+            idleRising = true;
             return;
         }
         idle = true;
@@ -3329,13 +4431,16 @@ public class MainActivity extends Activity {
         shelfFor(null, false);
         idleScrollY = scroll.getTranslationY();
         idleInfoY = heroInfoY;
-        idleDotsY = heroDotsY;
         idleOverviewShown = heroOverview.getVisibility() == View.VISIBLE;
         scroll.animate().cancel();
-        // The apps slide away whole, as on tvOS: no fade, so no full-screen layer to blend.
-        scroll.animate().translationY(screenH).setDuration(900).setInterpolator(EASE)
-                .setUpdateListener(null).start();
-        moveHeroInfo(0, dp(4), 900);
+        // The apps slide away whole, as on tvOS: no fade, so no full-screen layer to blend. Only as
+        // far as the carousel focused takes them (the dock just out of sight), so the whole move is
+        // seen, setting off gently: nothing was pressed for it. All the way down to the bottom of
+        // the screen, the dock was gone in the first eighth of a second and the rest was unseen.
+        scroll.animate().translationY(Math.max(scroll.getTranslationY(), screenH - shelfH + dp(30)))
+                .setDuration(700).setInterpolator(STANDARD).setUpdateListener(null).start();
+        moveHeroInfo(0, 700, STANDARD);
+        heroChrome(0, 600);  // the page dots and meta line come up as the apps go
         weatherCard.animate().alpha(0f).setDuration(500).setInterpolator(EASE).start();
         heroButton.animate().alpha(0f).setDuration(300).setInterpolator(EASE).start();
         heroOverview.animate().cancel();
@@ -3346,9 +4451,13 @@ public class MainActivity extends Activity {
     }
 
     final Runnable idleRise = () -> {
+        idleRising = false;
         if (resumed && heroShown) enterIdle();
         else idleReturnIndex = -1;
     };
+
+    /** idleRise is waiting to run (Handler.hasCallbacks would need Android 10). */
+    boolean idleRising;
 
     /** Where focus was in the app grid before going full screen, to go back to; -1 for the dock. */
     int idleReturnIndex = -1;
@@ -3363,14 +4472,19 @@ public class MainActivity extends Activity {
         // there, as it is whenever the grid is scrolled up.
         boolean toGrid = idleReturnIndex >= 0;
         if (toGrid) {
+            // Already on its card, its row in view, before the apps come back up: only the slide
+            // shows (a scroll starting under it fought the slide).
             int back = idleReturnIndex;
             idleReturnIndex = -1;
-            handler.postDelayed(() -> focusIndex(back), 120);
+            snapFocus = true;
+            focusIndex(back, false);
+            snapFocus = false;
         }
         scroll.animate().cancel();
         scroll.animate().translationY(idleScrollY).setDuration(450).setInterpolator(EASE)
                 .setUpdateListener(null).withEndAction(this::invalidateGlass).start();
-        moveHeroInfo(idleInfoY, idleDotsY, 450);
+        moveHeroInfo(idleInfoY, 450, EASE);
+        heroChrome(0, 200);
         weatherCard.animate().alpha(toGrid ? 0f : weatherAlpha()).setDuration(350).setInterpolator(EASE).start();
         if (shelfView.isFocused()) {
             heroButton.animate().alpha(1f).setDuration(300).setInterpolator(EASE).start();
@@ -3381,22 +4495,25 @@ public class MainActivity extends Activity {
                     .withEndAction(() -> heroOverview.setVisibility(View.GONE)).start();
         }
         resetIdle();
+        scanAfter(500);  // once the apps have slid back up
     }
 
     // ---------------------------------------------------------------- weather
 
     /**
      * Once a minute: fetch when the forecast is due (every 15 minutes by default), move "Now" on,
-     * and pick up Wi-Fi signal changes.
+     * and show or clear the sleep timer's glyph (the network's comes with its own callback).
      */
     int tickCount;
     final Runnable weatherTick = new Runnable() {
         @Override public void run() {
-            Weather.refresh(MainActivity.this, false, MainActivity.this::updateWeather);
+            boolean fresh = firstTick;
+            firstTick = false;
+            if (online(fresh)) Weather.refresh(MainActivity.this, false, MainActivity.this::updateWeather);
             updateWeather();
             // Carousel content rotates even if Home stays open for hours (fetches only when stale).
-            if (++tickCount % 5 == 0 && !shelfView.hasFocus()) loadHero();
-            updateNet();
+            if (++tickCount % 5 == 0 && !shelfView.hasFocus()) loadHero(online(false));
+            timerGlyph();
             handler.postDelayed(this, 60 * 1000L);
         }
     };
@@ -3411,6 +4528,9 @@ public class MainActivity extends Activity {
         return folderMode || weatherOpen || idle ? 0f : clockAlpha();
     }
 
+    /** The forecast the pill shows: one that hasn't changed isn't laid out or prepared again. */
+    Weather.Data weatherData;
+
     /** Shows the cached forecast (hidden when weather is off or nothing has loaded yet). */
     void updateWeather() {
         if (weatherCard == null) return;
@@ -3418,8 +4538,11 @@ public class MainActivity extends Activity {
         boolean show = d != null;
         if (!show && weatherCard.isFocused()) focusTop();
         weatherCard.setVisibility(show ? View.VISIBLE : View.GONE);
-        weatherCard.setData(d);
-        if (show) io.execute(() -> WeatherView.prepare(d, unit));
+        if (d != weatherData) {
+            weatherData = d;
+            weatherCard.setData(d);
+            if (show) io.execute(() -> WeatherView.prepare(d, unit));
+        }
         if (show && !weatherCard.isFocused()) weatherCard.setAlpha(weatherAlpha());
     }
 
@@ -3427,7 +4550,7 @@ public class MainActivity extends Activity {
     void showWeather() {
         Weather.Data d = Weather.cached(this);
         if (d == null) return;
-        if (pickerLayer != null) root.removeView(pickerLayer);
+        if (forecastLayer != null) root.removeView(forecastLayer);
         popoverReturn = weatherCard;
         FrameLayout layer = new FrameLayout(this);
         layer.setClickable(true);
@@ -3438,7 +4561,10 @@ public class MainActivity extends Activity {
         layer.addView(shade, new FrameLayout.LayoutParams(screenW * 3 / 5, ViewGroup.LayoutParams.MATCH_PARENT, Gravity.START));
 
         WeatherView panel = new WeatherView(this, true, unit);
-        LiquidGlass glass = new LiquidGlass(dp(26), 0x33000000, glassSource, screenW, screenH, unit).adaptive();
+        // tvOS's regular dark material, as its large panels use: half black over the picture, its
+        // colour kept. One dark tint whatever is behind (large glass never turns light), so it's
+        // no milky sheet, and the forecast's colours stand out on it.
+        LiquidGlass glass = new LiquidGlass(dp(26), 0x80000000, glassSource, screenW, screenH, unit);
         glass.lens = dp(7);
         panel.setBackground(glass);
         panel.setFocusable(true);
@@ -3450,27 +4576,21 @@ public class MainActivity extends Activity {
         layer.addView(panel, plp);
 
         root.addView(layer, match());
-        pickerLayer = layer;
-        pickerCells = new ArrayList<>();
-        pickerCells.add(panel);
+        forecastLayer = layer;
         weatherOpen = true;
-        // The forecast grows out of the pill, from its corner, on the focus spring; the pill
-        // fades into it and the shade comes up behind.
+        // The forecast grows out of the pill, from its corner, as the Apple TV app's menus come
+        // out of what opened them (from 0.35 of its size, fading up, easeOut 380 ms); the pill
+        // fades into it and the shade comes up behind, as a menu's dim does (400 ms, linear).
         weatherCard.animate().alpha(0f).setDuration(140).setInterpolator(EASE).start();
         shade.setAlpha(0f);
-        shade.animate().alpha(1f).setDuration(300).setInterpolator(EASE).start();
+        shade.animate().alpha(1f).setDuration(400).setInterpolator(new android.view.animation.LinearInterpolator()).start();
         panel.setPivotX(0);
         panel.setPivotY(0);
-        panel.setScaleX(0.7f);
-        panel.setScaleY(0.7f);
+        panel.setScaleX(0.35f);
+        panel.setScaleY(0.35f);
         panel.setAlpha(0f);
         // As one picture while it grows (no text redrawn at each size); it lands at its own size.
-        panel.animate().scaleX(1f).scaleY(1f).setDuration(520).setInterpolator(Glass.SNAP).withLayer().start();
-        ValueAnimator in = ValueAnimator.ofFloat(0f, 1f);
-        in.setDuration(200);
-        in.setInterpolator(EASE);
-        in.addUpdateListener(a -> panel.setAlpha((float) a.getAnimatedValue()));
-        in.start();
+        panel.animate().scaleX(1f).scaleY(1f).alpha(1f).setDuration(380).setInterpolator(EASE_OUT_QUAD).withLayer().start();
         panel.requestFocus();
         Weather.refresh(this, false, () -> {
             Weather.Data nd = Weather.cached(this);
@@ -3481,58 +4601,27 @@ public class MainActivity extends Activity {
 
     // ---------------------------------------------------------------- popover
 
-    List<View> pickerCells = new ArrayList<>();
-
     boolean statusFocused() {
         View f = getCurrentFocus();
         return f != null && f == ccButton;
     }
 
-    /** Directional focus inside a popover: nearest cell whose centre lies in that direction. */
-    boolean pickerMove(int keyCode) {
-        View cur = getCurrentFocus();
-        if (!pickerCells.contains(cur)) {
-            if (!pickerCells.isEmpty()) pickerCells.get(0).requestFocus();
-            return true;
-        }
-        int[] a = new int[2];
-        cur.getLocationOnScreen(a);
-        float ax = a[0] + cur.getWidth() / 2f, ay = a[1] + cur.getHeight() / 2f;
-        View best = null;
-        float bestScore = Float.MAX_VALUE;
-        for (View v : pickerCells) {
-            if (v == cur) continue;
-            int[] b = new int[2];
-            v.getLocationOnScreen(b);
-            float dx = b[0] + v.getWidth() / 2f - ax, dy = b[1] + v.getHeight() / 2f - ay;
-            float main, cross;
-            switch (keyCode) {
-                case KeyEvent.KEYCODE_DPAD_LEFT: main = -dx; cross = dy; break;
-                case KeyEvent.KEYCODE_DPAD_RIGHT: main = dx; cross = dy; break;
-                case KeyEvent.KEYCODE_DPAD_UP: main = -dy; cross = dx; break;
-                default: main = dy; cross = dx; break;
-            }
-            if (main <= dp(4)) continue;
-            float score = main + Math.abs(cross) * 2.2f;
-            if (score < bestScore) {
-                bestScore = score;
-                best = v;
-            }
-        }
-        if (best != null) best.requestFocus();
-        return true;
-    }
-
     View popoverReturn;
 
     void closePopover() {
-        if (pickerLayer == null) return;
-        FrameLayout l = pickerLayer;
-        pickerLayer = null;
-        // Back into the pill: the panel shrinks towards its corner as it fades, and the pill returns.
+        if (forecastLayer == null) return;
+        FrameLayout l = forecastLayer;
+        forecastLayer = null;
+        // Back into the pill: the panel shrinks towards its corner as it fades (back to 0.35 in
+        // 210 ms, as a menu closes), the shade lifts, and the pill returns.
         View panel = l.getChildCount() > 1 ? l.getChildAt(1) : null;
-        if (panel != null) panel.animate().scaleX(0.8f).scaleY(0.8f).alpha(0f).setDuration(200).setInterpolator(EASE).withLayer().start();
-        l.getChildAt(0).animate().alpha(0f).setDuration(240).setInterpolator(EASE).withEndAction(() -> root.removeView(l)).start();
+        View shade = l.getChildAt(0);
+        shade.animate().alpha(0f).setDuration(100).setInterpolator(new android.view.animation.LinearInterpolator())
+                .withEndAction(panel == null ? () -> root.removeView(l) : null).start();
+        if (panel != null) {
+            panel.animate().scaleX(0.35f).scaleY(0.35f).alpha(0f).setDuration(210).setInterpolator(EASE_OUT_QUAD).withLayer()
+                    .withEndAction(() -> root.removeView(l)).start();
+        }
         weatherOpen = false;
         if (popoverReturn != null && popoverReturn.isAttachedToWindow()) popoverReturn.requestFocus();
         else goTop();
@@ -3540,6 +4629,7 @@ public class MainActivity extends Activity {
         // Faded up after focus has landed: focusing the pill lifts it, and the lift would stop a fade begun before.
         weatherCard.setAlpha(0f);
         weatherCard.animate().alpha(weatherAlpha()).setDuration(260).setInterpolator(EASE).start();
+        scanAfter(250);
     }
 
     // ---------------------------------------------------------------- tvOS context menu
@@ -3556,17 +4646,22 @@ public class MainActivity extends Activity {
         menuReturnFocus = anchor;
         menuLayer = new FrameLayout(this);
         menuLayer.setClickable(true);
-        // The dim behind the menu fades with it (its own view, so the fade is a single alpha).
+        // The dim behind the menu fades with it (its own view, so the fade is a single alpha):
+        // tvOS dims the screen behind a menu to 70%.
         View dim = new View(this);
-        dim.setBackgroundColor(0x59000000);
+        dim.setBackgroundColor(0x4D000000);
         dim.setAlpha(0f);
         menuLayer.addView(dim, match());
 
         LinearLayout panel = new LinearLayout(this);
         panel.setOrientation(LinearLayout.VERTICAL);
-        panel.setPadding(dp(8), dp(12), dp(8), dp(8));
-        // "Regular" Liquid Glass: heavier dimming so the menu text stays legible over anything.
-        LiquidGlass glass = new LiquidGlass(dp(20), 0xB81A1A20, glassSource, screenW, screenH, unit);
+        // tvOS's menu geometry: 454 px wide, 54 px corners, 21 px inside, 66 px capsule rows whose
+        // corners are concentric with the panel's (54 - 21 = 33).
+        panel.setPadding(dp(10.5f), dp(12), dp(10.5f), dp(10.5f));
+        // tvOS's regular dark material (half black, the picture's colour kept), over the picture
+        // as dimmed behind the menu, so the panel darkens with everything around it: the text
+        // stays legible over anything.
+        LiquidGlass glass = new LiquidGlass(dp(27), 0x80000000, glassSource, screenW, screenH, unit).dimmed(0.7f);
         glass.lens = dp(8);
         panel.setBackground(glass);
         panel.setElevation(dp(30));
@@ -3576,7 +4671,7 @@ public class MainActivity extends Activity {
         TextView head = text(11, Ui.font(this, "semibold"), 0.55f);
         head.setText(title);
         head.setShadowLayer(0, 0, 0, 0);
-        head.setPadding(dp(12), 0, dp(12), dp(8));
+        head.setPadding(dp(15), 0, dp(15), dp(8));
         head.setSingleLine(true);
         head.setEllipsize(TextUtils.TruncateAt.END);
         panel.addView(head);
@@ -3589,13 +4684,13 @@ public class MainActivity extends Activity {
             row.setText(labels.get(i));
             row.setShadowLayer(0, 0, 0, 0);
             row.setGravity(Gravity.CENTER_VERTICAL);
-            row.setPadding(dp(12), 0, dp(12), 0);
+            row.setPadding(dp(15), 0, dp(15), 0);
             row.setFocusable(true);
             row.setClickable(true);
             int base = i == destructive ? 0xFFFF6B5E : Color.WHITE;
             row.setTextColor(base);
             GradientDrawable pill = new GradientDrawable();
-            pill.setCornerRadius(dp(12));
+            pill.setCornerRadius(dp(16.5f));
             pill.setColor(Color.WHITE);
             pill.setAlpha(0);
             row.setBackground(pill);
@@ -3606,10 +4701,10 @@ public class MainActivity extends Activity {
                     row.setTextColor(focusedText);
                     return;
                 }
-                // The white plate and the text colour fade together, like every other control.
+                // The white plate and the text colour fade together, on tvOS's menu-row timing.
                 android.animation.ArgbEvaluator ev = new android.animation.ArgbEvaluator();
                 ValueAnimator fade = ValueAnimator.ofFloat(pill.getAlpha() / 255f, has ? 1f : 0f);
-                fade.setDuration(has ? 200 : 260);
+                fade.setDuration(has ? 100 : 200);
                 fade.setInterpolator(EASE);
                 fade.addUpdateListener(an -> {
                     float t = (float) an.getAnimatedValue();
@@ -3623,7 +4718,7 @@ public class MainActivity extends Activity {
                 closeMenu();
                 actions.get(idx).run();
             });
-            LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(34));
+            LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(33));
             rlp.topMargin = dp(2);
             panel.addView(row, rlp);
             rows.add(row);
@@ -3641,60 +4736,76 @@ public class MainActivity extends Activity {
             r.setNextFocusRightId(r.getId());
         }
 
-        int w = dp(220);
+        // Beside the card as it will be once back up from the press that opened the menu (it's
+        // still rising now): placed from its centre and its focused size, not its size this frame.
+        int w = dp(227);
         int[] loc = new int[2];
         anchor.getLocationInWindow(loc);
-        float aw = anchor.getWidth() * anchor.getScaleX(), ah = anchor.getHeight() * anchor.getScaleY();
-        int x = (int) (loc[0] + aw + dp(18));
-        if (x + w > screenW - dp(24)) x = (int) (loc[0] - w - dp(18));
+        float cx = loc[0] + anchor.getWidth() * anchor.getScaleX() / 2f;
+        float cy = loc[1] + anchor.getHeight() * anchor.getScaleY() / 2f;
+        float half = anchor.getWidth() * FOCUS_SCALE / 2f;
+        int x = (int) (cx + half + dp(18));
+        if (x + w > screenW - dp(24)) x = (int) (cx - half - w - dp(18));
         x = Math.max(dp(24), x);
         panel.measure(View.MeasureSpec.makeMeasureSpec(w, View.MeasureSpec.EXACTLY), View.MeasureSpec.UNSPECIFIED);
         int h = panel.getMeasuredHeight();
-        int y = (int) (loc[1] + ah / 2 - h / 2f);
+        int y = (int) (cy - h / 2f);
         y = Math.max(dp(24), Math.min(y, screenH - h - dp(24)));
         FrameLayout.LayoutParams plp = new FrameLayout.LayoutParams(w, ViewGroup.LayoutParams.WRAP_CONTENT);
         plp.leftMargin = x;
         plp.topMargin = y;
         menuLayer.addView(panel, plp);
         root.addView(menuLayer, match());
+        // The glass samples the picture where the panel will be, not where its opening scale puts it.
+        int[] at = new int[2];
+        root.getLocationOnScreen(at);
+        glass.fixedLoc = new int[]{at[0] + x, at[1] + y};
 
-        // Pops out of the card's side on a spring, fading up as it grows. It moves as one picture
+        // Grows out of the card, as the Apple TV app's menus do: from 0.35 of its size at the side
+        // touching the card, level with the card's middle (even when the panel is held inside the
+        // screen), fading up, easeOut 380 ms; the dim comes up over 400 ms. It moves as one picture
         // (a GPU layer), so its words aren't redrawn at a new size every frame; it lands at exactly
         // its own size, so there's no change when the picture gives way to the real thing.
-        panel.setPivotX(x > loc[0] ? 0 : w);
-        panel.setPivotY(h / 2f);
+        panel.setPivotX(x > cx ? 0 : w);
+        panel.setPivotY(Math.max(0f, Math.min(h, cy - y)));
         panel.setAlpha(0f);
-        panel.setScaleX(0.86f);
-        panel.setScaleY(0.86f);
+        panel.setScaleX(0.35f);
+        panel.setScaleY(0.35f);
         if (!rows.isEmpty()) rows.get(0).requestFocus();
         opening[0] = false;
-        panel.animate().scaleX(1f).scaleY(1f).setDuration(460).setInterpolator(Glass.SNAP).withLayer().start();
-        // Alpha on its own, shorter animator: the menu is opaque well before the spring settles.
-        ValueAnimator in = ValueAnimator.ofFloat(0f, 1f);
-        in.setDuration(180);
-        in.setInterpolator(EASE);
-        in.addUpdateListener(a -> panel.setAlpha((float) a.getAnimatedValue()));
-        in.start();
-        dim.animate().alpha(1f).setDuration(240).setInterpolator(EASE).start();
+        panel.animate().scaleX(1f).scaleY(1f).alpha(1f).setDuration(380).setInterpolator(EASE_OUT_QUAD).withLayer().start();
+        dim.animate().alpha(1f).setDuration(400).setInterpolator(new android.view.animation.LinearInterpolator()).start();
     }
 
     void closeMenu() {
         if (menuLayer == null) return;
         FrameLayout m = menuLayer;
         menuLayer = null;
-        // Back into the card it came from: a little smaller as it fades, and the dim lifts.
+        // Back into the card it came from (to 0.35 as it fades, 210 ms), and the dim lifts (100 ms).
+        // The layer goes when the panel has, which outlasts the dim.
         View panel = m.getChildCount() > 1 ? m.getChildAt(1) : null;
-        if (panel != null) panel.animate().scaleX(0.92f).scaleY(0.92f).alpha(0f).setDuration(160).setInterpolator(EASE).withLayer().start();
-        m.getChildAt(0).animate().alpha(0f).setDuration(200).setInterpolator(EASE).withEndAction(() -> root.removeView(m)).start();
+        // Its rows can't take focus while it fades: beside the card, an arrow pressed meanwhile
+        // would land in a menu that's about to go.
+        m.setDescendantFocusability(ViewGroup.FOCUS_BLOCK_DESCENDANTS);
+        m.getChildAt(0).animate().alpha(0f).setDuration(100).setInterpolator(new android.view.animation.LinearInterpolator())
+                .withEndAction(panel == null ? () -> root.removeView(m) : null).start();
+        if (panel != null) {
+            panel.animate().scaleX(0.35f).scaleY(0.35f).alpha(0f).setDuration(210).setInterpolator(EASE_OUT_QUAD).withLayer()
+                    .withEndAction(() -> root.removeView(m)).start();
+        }
+        // The card never went down: focus simply returns to it, with no lift or glare replayed.
+        snapFocus = true;
         if (menuReturnFocus != null && menuReturnFocus.isAttachedToWindow()) menuReturnFocus.requestFocus();
+        snapFocus = false;
         menuReturnFocus = null;
+        scanAfter(250);  // after the chosen row's action, and once the menu has faded
     }
 
     void startSafe(Intent i) {
         try {
             startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
         } catch (ActivityNotFoundException e) {
-            toast("Not available on this TV");
+            hint("Not available on this TV", false);
         }
     }
 
@@ -3702,15 +4813,22 @@ public class MainActivity extends Activity {
 
     void startMove(int index) {
         moveIndex = index;
+        handler.removeCallbacks(heroAdvance);
         focusIndex(index);
         startWiggle(tiles.get(index));
-        toast("Move with the arrows. Press OK when done.");
+        hint("Move with the arrows, then press OK", true);
     }
 
-    void moveTo(int to) {
+    /** The card being moved goes to slot to; first is a fresh press (not a held arrow's repeat). */
+    void moveTo(int to, boolean first) {
         int last = apps.size() - 1;  // the folder tile always stays at the end
         if (to > last && moveIndex / COLS < last / COLS) to = last;
-        if (to < 0 || to > last || to == moveIndex) return;
+        if (to < 0 || to > last) {
+            // Nowhere to go that way: the card leans towards the press and back, as at any wall.
+            if (first && moveIndex < tiles.size()) bump(tiles.get(moveIndex), Glass.dirX, Glass.dirY);
+            return;
+        }
+        if (to == moveIndex) return;
         Map<String, int[]> before = tilePositions();
         AppEntry e = apps.remove(moveIndex);
         apps.add(to, e);
@@ -3756,13 +4874,15 @@ public class MainActivity extends Activity {
                         cell.setAlpha(0f);
                         cell.setScaleX(0.86f);
                         cell.setScaleY(0.86f);
-                        cell.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(400).setInterpolator(Glass.SNAP).start();
+                        cell.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(300).setInterpolator(EASE_OUT_QUAD).start();
                         continue;
                     }
-                    // Neighbours make room on the focus spring: quick, with a small settle.
+                    // Neighbours slide aside with a 300 ms ease, as tvOS's do: visibly making room
+                    // (on the focus spring they were nine-tenths there in the first 90 ms, a jump).
                     t.setTranslationX(dx);
                     t.setTranslationY(dy);
-                    t.animate().translationX(0).translationY(0).setDuration(420).setInterpolator(Glass.SNAP).start();
+                    t.animate().translationX(0).translationY(0).setStartDelay(0).setDuration(300)
+                            .setInterpolator(EASE_OUT_QUAD).start();
                 }
                 return true;
             }
@@ -3770,26 +4890,36 @@ public class MainActivity extends Activity {
     }
 
     void endMove() {
-        stopWiggle();
+        stopWiggle(true);
+        hideHint();
         moveIndex = -1;
+        scheduleAdvance();
+        scanAfter(0);
     }
 
+    /**
+     * Edit mode's jiggle, tvOS's own (its Home Screen's): only the card being moved, turning to
+     * 1.616 degrees either way and back every 0.325 s, for as long as it's held.
+     */
     void startWiggle(View v) {
-        stopWiggle();
-        wiggle = ObjectAnimator.ofFloat(v, View.ROTATION, -1.5f, 1.5f);
-        wiggle.setDuration(130);
+        stopWiggle(false);
+        wiggle = ObjectAnimator.ofFloat(v, View.ROTATION, -1.616f, 1.616f);
+        wiggle.setDuration(162);  // each way: the whole swing is 0.325 s
         wiggle.setRepeatCount(ValueAnimator.INFINITE);
         wiggle.setRepeatMode(ValueAnimator.REVERSE);
         wiggle.start();
     }
 
-    void stopWiggle() {
-        if (wiggle != null) {
-            wiggle.cancel();
-            Object t = wiggle.getTarget();
-            if (t instanceof View) ((View) t).setRotation(0);
-            wiggle = null;
-        }
+    /** The jiggle stops: the card settles level over tvOS's 88 ms (settle), or at once (rebuilt, gone). */
+    void stopWiggle(boolean settle) {
+        if (wiggle == null) return;
+        ObjectAnimator w = wiggle;
+        wiggle = null;
+        w.cancel();
+        if (!(w.getTarget() instanceof View)) return;
+        View v = (View) w.getTarget();
+        if (settle) v.animate().rotation(0).setStartDelay(0).setDuration(88).setInterpolator(EASE_OUT_QUAD).start();
+        else v.setRotation(0);
     }
 
     // ---------------------------------------------------------------- helpers
@@ -3813,7 +4943,48 @@ public class MainActivity extends Activity {
         return Math.round(v * unit);
     }
 
-    void toast(String s) {
-        Toast.makeText(this, s, Toast.LENGTH_SHORT).show();
+    /** The message on show (hint), and the glass capsule it's on, made the first time. */
+    TextView hintView;
+    final Runnable hideHintRun = this::hideHint;
+
+    /**
+     * A short message on a glass capsule at the top of the screen, tvOS's way (it has no Android
+     * toasts): on the status row's centre line, between the weather and the clock, so it never
+     * covers the dock or a card being moved. Sticky ones stay until hideHint; the rest go after 2 s.
+     */
+    void hint(String text, boolean sticky) {
+        handler.removeCallbacks(hideHintRun);
+        if (hintView == null) {
+            hintView = text(13, Ui.font(this, "medium"), 0f);
+            hintView.setShadowLayer(0, 0, 0, 0);  // the glass gives the contrast
+            hintView.setSingleLine(true);
+            hintView.setGravity(Gravity.CENTER);
+            hintView.setPadding(dp(16), 0, dp(16), 0);
+            hintView.setBackground(pillGlass(dp(16)));
+        }
+        hintView.setText(text);
+        if (hintView.getParent() == null) {
+            FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(32),
+                    Gravity.TOP | Gravity.CENTER_HORIZONTAL);
+            lp.topMargin = dp(24) + (dp(WeatherView.COMPACT_H) - dp(32)) / 2;
+            root.addView(hintView, lp);
+            hintView.setAlpha(0f);
+            hintView.setTranslationY(dp(8));
+        }
+        // Redrawn once it has risen: the glass takes its place in the picture when drawn, and the
+        // rise itself doesn't redraw it.
+        TextView v = hintView;
+        v.animate().alpha(1f).translationY(0).setStartDelay(0).setDuration(200).setInterpolator(EASE)
+                .withEndAction(v::invalidate).start();
+        if (!sticky) handler.postDelayed(hideHintRun, 2000);
+    }
+
+    /** The hint fades and leaves the screen (nothing left to draw, or to redraw with the glass). */
+    void hideHint() {
+        handler.removeCallbacks(hideHintRun);
+        TextView v = hintView;
+        if (v == null || v.getParent() == null) return;
+        v.animate().alpha(0f).setStartDelay(0).setDuration(160).setInterpolator(EASE)
+                .withEndAction(() -> root.removeView(v)).start();
     }
 }

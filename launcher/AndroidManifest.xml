@@ -5,20 +5,25 @@
     <uses-feature android:name="android.software.leanback" android:required="false" />
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
 
+    <!-- Uninstall, from an app's menu on Home (Android's own screen asks first). -->
     <uses-permission android:name="android.permission.REQUEST_DELETE_PACKAGES" />
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- Search: dictation from the remote's mic, through a speech recogniser that isn't the Gemini app. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
-    <!-- Puts the remote-buttons helper back after a force stop switched it off (granted over adb). -->
+    <!-- Settings > Screen Saver (the TV's own screen saver and turn-off settings), and the
+         remote-buttons helper put back on after a force stop switched it off (granted over adb). -->
     <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS" />
-    <uses-permission android:name="android.permission.KILL_BACKGROUND_PROCESSES" />
-    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- Home's network status and Control Centre's Wi-Fi name (Android only gives it with location). -->
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
-    <uses-permission android:name="android.permission.ACCESS_NOTIFICATION_POLICY" />
-    <!-- Normal-level permission: lets us try reading apps' published TV rows for the top shelf. -->
-    <uses-permission android:name="com.android.providers.tv.permission.READ_EPG_DATA" />
+    <!-- Android 12+ shows no prompt for fine location asked for without coarse. -->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <!-- Sleep Timer: an exact alarm, so the TV turns off on the minute, not when Android gets round to it. -->
+    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" android:maxSdkVersion="32" />
+    <!-- App Switcher: the apps used most recently (granted over adb, or in Settings > Usage access). -->
+    <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS" />
 
     <queries>
         <intent>
@@ -36,8 +41,10 @@
         <intent>
             <action android:name="android.service.dreams.DreamService" />
         </intent>
-        <!-- Glass Aerials, for Control Centre's Screen Saver button. -->
+        <!-- The screen saver now, for Back on the first app and Control Centre's Screen Saver button:
+             Android's "start screen saver" (Somnambulator), or Glass Aerials when the TV can't. -->
         <package android:name="app.glasshome.aerials" />
+        <package android:name="com.android.systemui" />
     </queries>
 
     <application
@@ -69,7 +76,7 @@
             </intent-filter>
         </activity>
 
-        <!-- Control Center: Power Off / Sleep Timer (force-lock device admin only). -->
+        <!-- Control Centre: Turn Off / Sleep Timer (force-lock device admin only). -->
         <receiver
             android:name=".SleepReceiver$Admin"
             android:exported="true"
@@ -92,7 +99,8 @@
             <meta-data android:name="android.accessibilityservice" android:resource="@xml/power_service" />
         </service>
 
-        <!-- Remote buttons only the stock Google TV home answered (Netflix, Prime Video, YouTube, Quick Settings). -->
+        <!-- Remote buttons only the stock Google TV home answered (Netflix, Prime Video, YouTube, Quick
+             Settings), hold-to-talk on the mic, and Home pressed twice for the App Switcher. -->
         <service
             android:name=".KeysService"
             android:exported="true"
@@ -115,7 +123,8 @@
             </intent-filter>
         </service>
 
-        <!-- Control Centre over the current app, for the remote's Quick Settings button (KeysService). -->
+        <!-- Control Centre: from Home's button, and over the current app from the remote's Quick
+             Settings button (KeysService). -->
         <activity
             android:name=".ControlCentreActivity"
             android:exported="false"
@@ -136,7 +145,7 @@
             android:theme="@style/PageTheme"
             android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenSize|smallestScreenSize|screenLayout|uiMode|density" />
 
-        <!-- Search: the remote's mic button lands here once the Google/Gemini voice app is disabled. -->
+        <!-- Search: the remote's mic button (KeysService), or as the TV's assistant when the helper is off. -->
         <activity
             android:name=".SearchActivity"
             android:theme="@style/OverlayTheme"
@@ -157,8 +166,10 @@
             </intent-filter>
         </activity>
 
+        <!-- First-run setup (and Settings > Home Screen > Run Setup Again): opens and closes like the other pages. -->
         <activity
             android:name=".SetupActivity"
+            android:theme="@style/PageTheme"
             android:exported="true"
             android:excludeFromRecents="true"
             android:screenOrientation="landscape"

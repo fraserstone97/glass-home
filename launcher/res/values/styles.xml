@@ -6,9 +6,9 @@
         <item name="android:windowNoTitle">true</item>
         <item name="android:windowFullscreen">true</item>
     </style>
-    <!-- Settings and title pages: they open over Home as a page that fades up and settles, and
-         close the same way, with Home held still beneath (the TV's own transition left a blank
-         half second, then cut). -->
+    <!-- Settings, Setup and title pages: they open and close over Home with the Apple TV app's
+         300 ms crossfade, Home held still beneath (the TV's own transition left a blank half
+         second, then cut). -->
     <style name="PageTheme" parent="HomeTheme">
         <item name="android:windowAnimationStyle">@style/PageAnimations</item>
     </style>

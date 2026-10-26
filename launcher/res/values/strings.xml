@@ -3,8 +3,8 @@
     <!-- The app's name: build.sh replaces "Glass Home" everywhere in this file with $APP_NAME. -->
     <string name="app_name">Glass Home</string>
     <string name="label_sleep">Glass Home sleep</string>
-    <string name="label_power">Glass Home – Power Off</string>
+    <string name="label_power">Glass Home – Turn Off and Sleep Timer</string>
     <string name="label_keys">Glass Home – Remote buttons</string>
-    <string name="power_service_desc">Lets Glass Home put the TV to sleep (Power Off, Sleep Timer) on TVs that don\'t allow it any other way. It is only used when you ask, and reads nothing on screen.</string>
-    <string name="keys_service_desc">Makes the remote\'s Netflix, Prime Video, YouTube and Quick Settings buttons work with Glass Home. It only looks at those buttons and reads nothing on screen.</string>
+    <string name="power_service_desc">Lets Glass Home put the TV to sleep (Control Centre\'s Turn Off and Sleep Timer) on TVs that don\'t allow it any other way. It is only used when you ask, and reads nothing on screen.</string>
+    <string name="keys_service_desc">Makes the remote\'s Netflix, Prime Video, YouTube, Quick Settings and microphone buttons work with Glass Home, and opens the App Switcher when Home is pressed twice. It only acts on those buttons and reads nothing on screen.</string>
 </resources>

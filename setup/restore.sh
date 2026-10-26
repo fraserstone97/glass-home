@@ -54,7 +54,7 @@ tv settings delete global private_dns_specifier >/dev/null 2>&1
 
 if [ "${UNINSTALL:-0}" = 1 ]; then
     echo "Removing Glass Home and Glass Aerials"
-    # Glass Home holds device admin for the sleep timer; Android won't uninstall it until that's off.
+    # Glass Home holds device admin for Turn Off and the Sleep Timer; Android won't uninstall it until that's off.
     tv dpm remove-active-admin "$HOME_PKG/.SleepReceiver\\\$Admin" >/dev/null 2>&1 || true
     tv pm uninstall "$AERIALS_PKG"
     tv pm uninstall "$HOME_PKG" || echo "If it won't uninstall: Settings > Privacy > Device admin apps > Glass Home sleep > Deactivate, then run this again."

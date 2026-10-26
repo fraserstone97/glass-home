@@ -12,7 +12,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * TV inputs (HDMI, AV, component, tuner) from Android's TV input framework, and switching to
+ * TV inputs (HDMI, AV, component) from Android's TV input framework, and switching to
  * one the way the stock launcher does: VIEW the input's passthrough "channel" so the TV app
  * shows it. Boxes without inputs (e.g. a Mi Box) report none, and the Inputs card and button hide.
  */
@@ -25,7 +25,7 @@ final class Inputs {
     static final class Input {
         String id, label;
         int type;
-        boolean passthrough, disconnected, usb;
+        boolean disconnected, usb;
         /** Given a name in the TV's input settings ("PS5"), so something is plugged in there. */
         boolean named;
     }
@@ -42,10 +42,18 @@ final class Inputs {
         return prefs(c).getBoolean(K_CARD, true);
     }
 
-    /** No aerial is connected to this TV, so the tuner (Live TV) isn't offered as an input. */
-    static final boolean HIDE_TUNER = true;
+    /**
+     * Whether the TV has any inputs: once a list() has found some (Home reads it at start-up),
+     * Control Centre opens without asking the TV input service again, as hardware inputs don't go
+     * away. Only a yes is kept: just after a restart the TV may not have listed its ports yet.
+     */
+    static volatile boolean any;
 
-    /** Hardware inputs in a natural order: HDMI first, then AV and the rest, tuner last. */
+    static boolean any(Context c) {
+        return any || !list(c).isEmpty();
+    }
+
+    /** Hardware inputs in a natural order: HDMI first, then AV and the rest. */
     static List<Input> list(Context c) {
         List<Input> out = new ArrayList<>();
         TvInputManager tm;
@@ -64,18 +72,16 @@ final class Inputs {
         for (TvInputInfo info : infos) {
             try {
                 if (info.isHidden(c) || info.getParentId() != null) continue;
-                if (!info.isPassthroughInput() && info.getType() != TvInputInfo.TYPE_TUNER) continue;
-                if (HIDE_TUNER && info.getType() == TvInputInfo.TYPE_TUNER) continue;
-                // Only the TV's own hardware (HDMI, AV, built-in tuner): their ids end in "/HW<n>".
+                if (!info.isPassthroughInput()) continue;  // not the tuner (Live TV): no aerial on this TV
+                // Only the TV's own hardware (HDMI, AV): their ids end in "/HW<n>".
                 // App-provided channel sources (Mi TV+, VLC previews...) are not inputs.
                 if (!info.getId().contains("/HW")) continue;
                 Input in = new Input();
                 in.id = info.getId();
                 in.type = info.getType();
-                in.passthrough = info.isPassthroughInput();
                 CharSequence custom = info.loadCustomLabel(c), label = info.loadLabel(c);
                 in.named = custom != null && custom.length() > 0;
-                in.label = in.named ? custom.toString() : label != null ? tidy(label.toString(), in.type) : "Input";
+                in.label = in.named ? custom.toString() : label != null ? tidy(label.toString()) : "Input";
                 in.disconnected = tm.getInputState(in.id) == TvInputManager.INPUT_STATE_DISCONNECTED;
                 out.add(in);
             } catch (Exception ignored) {
@@ -103,6 +109,7 @@ final class Inputs {
                 // no storage info
             }
         }
+        if (!out.isEmpty()) any = true;
         return out;
     }
 
@@ -112,14 +119,12 @@ final class Inputs {
             case TvInputInfo.TYPE_DISPLAY_PORT: return 1;
             case TvInputInfo.TYPE_COMPONENT: return 2;
             case TvInputInfo.TYPE_COMPOSITE: return 3;
-            case TvInputInfo.TYPE_TUNER: return 9;
             default: return 5;
         }
     }
 
-    /** "HDMI1" -> "HDMI 1", "AV1" -> "AV 1"; tuners read "TV". */
-    private static String tidy(String s, int type) {
-        if (type == TvInputInfo.TYPE_TUNER && (s.toUpperCase().contains("TV") || s.isEmpty())) return "TV";
+    /** "HDMI1" -> "HDMI 1", "AV1" -> "AV 1". */
+    private static String tidy(String s) {
         return s.replaceAll("^([A-Za-z]+)(\\d+)$", "$1 $2");
     }
 
@@ -132,7 +137,6 @@ final class Inputs {
             if (name.contains(k)) return "gamepad";
         }
         switch (in.type) {
-            case TvInputInfo.TYPE_TUNER: return "antenna";
             case TvInputInfo.TYPE_HDMI: return "hdmi";
             case TvInputInfo.TYPE_COMPOSITE: return "av";
             case TvInputInfo.TYPE_COMPONENT: return "component";
@@ -158,8 +162,7 @@ final class Inputs {
     static boolean open(Context c, Input in) {
         if (in.usb) {
             for (String pkg : USB_APPS) {
-                Intent l = c.getPackageManager().getLeanbackLaunchIntentForPackage(pkg);
-                if (l == null) l = c.getPackageManager().getLaunchIntentForPackage(pkg);
+                Intent l = Suggestions.launchIntent(c, pkg);
                 if (l != null) {
                     c.startActivity(l.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
                     return true;
@@ -167,9 +170,9 @@ final class Inputs {
             }
             return false;
         }
-        Uri uri = in.passthrough ? TvContract.buildChannelUriForPassthroughInput(in.id) : TvContract.buildChannelsUriForInput(in.id);
+        Uri uri = TvContract.buildChannelUriForPassthroughInput(in.id);
         Intent i = new Intent(Intent.ACTION_VIEW)
-                .setDataAndType(uri, in.passthrough ? TvContract.Channels.CONTENT_ITEM_TYPE : TvContract.Channels.CONTENT_TYPE)
+                .setDataAndType(uri, TvContract.Channels.CONTENT_ITEM_TYPE)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
         try {
             c.startActivity(i);

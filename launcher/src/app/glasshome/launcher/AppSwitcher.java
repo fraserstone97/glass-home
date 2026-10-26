@@ -3,10 +3,12 @@ package app.glasshome.launcher;
 import android.app.usage.UsageEvents;
 import android.app.usage.UsageStatsManager;
 import android.graphics.Bitmap;
+import android.graphics.Color;
 import android.graphics.PorterDuff;
 import android.graphics.drawable.BitmapDrawable;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
+import android.os.SystemClock;
 import android.text.TextUtils;
 import android.view.Gravity;
 import android.view.KeyEvent;
@@ -24,8 +26,10 @@ import java.util.Map;
 
 /**
  * The App Switcher, as on Apple TV: press Home twice quickly (KeysService) and the apps you've
- * used lately line up as big cards over a dimmed Home, the latest first. Left and right move along
- * them, OK goes back into one (it grows out of its card), Back or Home closes. It's built when
+ * used lately line up as big cards over a dimmed Home, the oldest on the left and a card for Home
+ * itself on the right. The app you were just in is in front (Home's card is, when Home twice came
+ * from Home): Left goes back through older apps, Right towards Home. OK goes back into one (it
+ * grows out of its card), or on Home's card to Home; Back or Home closes. It's built when
  * asked for and dropped when it closes, so Home carries nothing for it the rest of the time.
  * Which apps you've used comes from Android's usage history, which install.sh lets Home read;
  * without that, Home twice is just Home.
@@ -35,12 +39,15 @@ final class AppSwitcher {
     static final String AERIALS = "app.glasshome.aerials";
 
     final MainActivity home;
+    /** The apps, oldest first; their cells and cards share the index, and Home's comes after them. */
     final List<MainActivity.AppEntry> apps;
     final FrameLayout layer, strip;
     final ImageView backdrop;
     final List<View> cells = new ArrayList<>();
     final List<ImageView> cards = new ArrayList<>();
     final int w, h, pitch;
+    /** When the cards have all risen into place (uptime). */
+    final long riseEnd;
     int sel;
     /** The key whose press began while the switcher was up: only its release acts. */
     int pressed = -1;
@@ -58,27 +65,45 @@ final class AppSwitcher {
         int w = Math.round(home.screenW * 0.36f), h = w * 9 / 16;
         // Its own thread: Home's queue is busy with the carousel and weather just after it returns.
         new Thread(() -> {
-            List<MainActivity.AppEntry> recent = recent(home, byPkg);
+            Map<String, Long> left = new HashMap<>();
+            List<MainActivity.AppEntry> recent = recent(home, byPkg, left);
             if (recent.isEmpty()) return;
+            // Pressed from inside an app (the first press only just left it), that app is in
+            // front; pressed on Home, Home's own card is.
+            Long out = left.get(recent.get(0).pkg);
+            boolean fromApp = out == null || System.currentTimeMillis() - out < 1500;
             home.runOnUiThread(() -> {
                 if (home.switcher != null || home.isFinishing()) return;
-                AppSwitcher s = home.switcher = new AppSwitcher(home, recent, w, h);
+                AppSwitcher s = home.switcher = new AppSwitcher(home, recent, w, h, fromApp);
                 new Thread(s::drawCards, "AppSwitcher").start();
             });
         }, "AppSwitcher").start();
     }
 
-    /** Each card's art, nearest first, so the ones you see are drawn before those off to the right. */
+    /**
+     * Each app's card art, nearest the front first, so the ones you see are drawn before those further
+     * left. Those off the screen (two or more left of the front) wait until the cards have risen:
+     * decoding and drawing them meanwhile would take from the rise's frames.
+     */
     void drawCards() {
-        for (int i = 0; i < apps.size() && !closing; i++) {
+        int first = sel;
+        for (int i = apps.size() - 1; i >= 0 && !closing; i--) {
+            if (i == first - 2) {
+                SystemClock.sleep(Math.max(0, riseEnd - SystemClock.uptimeMillis()));
+                if (closing) return;
+            }
             Bitmap b = Suggestions.onGpu(cardArt(home, apps.get(i), w, h));
             ImageView card = cards.get(i);
             if (b != null) home.runOnUiThread(() -> card.setImageBitmap(b));
         }
     }
 
-    /** Apps opened in the last day, the latest first, as Android's usage history has them. */
-    static List<MainActivity.AppEntry> recent(MainActivity home, Map<String, MainActivity.AppEntry> byPkg) {
+    /**
+     * Apps opened in the last day, the latest first, as Android's usage history has them. `left`
+     * gets when each was last left, for those left since they were last opened.
+     */
+    static List<MainActivity.AppEntry> recent(MainActivity home, Map<String, MainActivity.AppEntry> byPkg,
+                                              Map<String, Long> left) {
         List<MainActivity.AppEntry> out = new ArrayList<>();
         UsageStatsManager um = home.getSystemService(UsageStatsManager.class);
         long now = System.currentTimeMillis();
@@ -88,8 +113,13 @@ final class AppSwitcher {
         UsageEvents.Event e = new UsageEvents.Event();
         while (events.hasNextEvent()) {
             events.getNextEvent(e);
-            if (e.getEventType() == UsageEvents.Event.ACTIVITY_RESUMED && byPkg.containsKey(e.getPackageName())) {
-                last.put(e.getPackageName(), e.getTimeStamp());
+            String p = e.getPackageName();
+            if (!byPkg.containsKey(p)) continue;
+            if (e.getEventType() == UsageEvents.Event.ACTIVITY_RESUMED) {
+                last.put(p, e.getTimeStamp());
+                left.remove(p);
+            } else if (e.getEventType() == UsageEvents.Event.ACTIVITY_PAUSED) {
+                left.put(p, e.getTimeStamp());
             }
         }
         List<String> pkgs = new ArrayList<>(last.keySet());
@@ -117,9 +147,10 @@ final class AppSwitcher {
         return d == null ? null : MainActivity.art(d, w, h);
     }
 
-    AppSwitcher(MainActivity home, List<MainActivity.AppEntry> apps, int w, int h) {
+    AppSwitcher(MainActivity home, List<MainActivity.AppEntry> recent, int w, int h, boolean fromApp) {
         this.home = home;
-        this.apps = apps;
+        apps = new ArrayList<>(recent);
+        Collections.reverse(apps);  // the oldest on the left
         this.w = w;
         this.h = h;
         pitch = w + home.dp(26);
@@ -146,8 +177,9 @@ final class AppSwitcher {
         int head = home.dp(34);
         int left = (home.screenW - w) / 2;
         int top = Math.round((home.screenH - head - h) / 2f);
-        for (int i = 0; i < apps.size(); i++) {
-            MainActivity.AppEntry a = apps.get(i);
+        int n = apps.size();
+        for (int i = 0; i <= n; i++) {
+            MainActivity.AppEntry a = i < n ? apps.get(i) : null;  // null: Home's card, last
             LinearLayout cell = new LinearLayout(home);
             cell.setOrientation(LinearLayout.VERTICAL);
             cell.setClipChildren(false);
@@ -158,11 +190,15 @@ final class AppSwitcher {
             name.setGravity(Gravity.CENTER_VERTICAL);
             ImageView icon = new ImageView(home);
             icon.setScaleType(ImageView.ScaleType.FIT_CENTER);
-            Drawable.ConstantState own = a.icon == null ? null : a.icon.getConstantState();
-            icon.setImageDrawable(own != null ? own.newDrawable(home.getResources()) : a.icon);  // its own copy
+            if (a == null) {
+                icon.setImageBitmap(Glyphs.get("house", home.dp(20), Color.WHITE));
+            } else {
+                Drawable.ConstantState own = a.icon == null ? null : a.icon.getConstantState();
+                icon.setImageDrawable(own != null ? own.newDrawable(home.getResources()) : a.icon);  // its own copy
+            }
             name.addView(icon, new LinearLayout.LayoutParams(home.dp(20), home.dp(20)));
             TextView label = home.text(14, Ui.font(home, "semibold"), 1f);
-            label.setText(a.label);
+            label.setText(a == null ? "Home" : a.label);
             label.setSingleLine(true);
             label.setEllipsize(TextUtils.TruncateAt.END);
             LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, -2, 1f);
@@ -174,7 +210,7 @@ final class AppSwitcher {
             ImageView card = new ImageView(home);
             GradientDrawable well = new GradientDrawable();
             well.setCornerRadius(home.dp(14));
-            well.setColor(a.color);
+            well.setColor(a == null ? 0xFF1C1C1E : a.color);
             card.setBackground(well);
             card.setClipToOutline(true);
             card.setScaleType(ImageView.ScaleType.CENTER_CROP);
@@ -189,10 +225,14 @@ final class AppSwitcher {
             cells.add(cell);
             cards.add(card);
         }
+        sel = fromApp ? n - 1 : n;
+        strip.setTranslationX(-sel * pitch);
+        homeCard(cards.get(n));
         home.root.addView(layer, home.match());
         home.handler.removeCallbacks(home.heroAdvance);  // nothing moves underneath meanwhile
 
         // In: the picture dims up while the cards rise into place, the nearest first.
+        riseEnd = SystemClock.uptimeMillis() + 670;  // 560 ms, after up to 105 ms of stagger
         backdrop.animate().alpha(1f).setDuration(260).setInterpolator(MainActivity.EASE).start();
         for (int k = 0; k < cells.size(); k++) {
             View c = cells.get(k);
@@ -201,8 +241,36 @@ final class AppSwitcher {
             c.setScaleY(s * 0.9f);
             c.setTranslationY(home.dp(18));
             c.setAlpha(0f);
-            c.animate().scaleX(s).scaleY(s).translationY(0).alpha(fade(k)).setStartDelay(Math.min(k, 3) * 35L)
+            c.animate().scaleX(s).scaleY(s).translationY(0).alpha(fade(k)).setStartDelay(Math.min(Math.abs(k - sel), 3) * 35L)
                     .setDuration(560).setInterpolator(Glass.SNAP).start();
+        }
+    }
+
+    /**
+     * Home's card shows Home as it is: a copy of its screen at card size, made by the GPU and
+     * handed to the card off the main thread. Home's picture stands in until it arrives (or if
+     * there's no copy to be had). Taken before the switcher is added, though its first frame is
+     * see-through anyway.
+     */
+    void homeCard(ImageView card) {
+        Drawable now = home.heroShown && home.heroFront.getDrawable() != null ? home.heroFront.getDrawable()
+                : home.wallView.getDrawable();
+        Drawable.ConstantState cs = now == null ? null : now.getConstantState();
+        if (cs != null) card.setImageDrawable(cs.newDrawable(home.getResources()));
+        if (android.os.Build.VERSION.SDK_INT < 26) return;
+        Bitmap snap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+        try {
+            android.view.PixelCopy.request(home.getWindow(), snap, r -> {
+                if (r != android.view.PixelCopy.SUCCESS || closing) return;
+                new Thread(() -> {
+                    Bitmap b = Suggestions.onGpu(snap);
+                    home.runOnUiThread(() -> {
+                        if (!closing) card.setImageBitmap(b);
+                    });
+                }, "AppSwitcher").start();
+            }, home.handler);
+        } catch (IllegalArgumentException e) {
+            // no surface to copy from yet: the picture stays
         }
     }
 
@@ -254,8 +322,12 @@ final class AppSwitcher {
             case KeyEvent.KEYCODE_DPAD_CENTER:
             case KeyEvent.KEYCODE_ENTER:
                 // Back into the app, growing out of its card. The switcher stays up underneath
-                // until Home is out of sight (onStop), so Home doesn't flash in between.
-                if (!down && pressed == k) home.launchAnimated(cards.get(sel), apps.get(sel));
+                // until Home is out of sight (onStop), so Home doesn't flash in between. Home's
+                // own card is Home, already underneath: the switcher just goes.
+                if (!down && pressed == k) {
+                    if (sel == apps.size()) close();
+                    else home.launchAnimated(cards.get(sel), apps.get(sel));
+                }
                 return true;
             case KeyEvent.KEYCODE_BACK:
             case KeyEvent.KEYCODE_ESCAPE:

@@ -42,19 +42,20 @@ public final class Ui {
 
     /**
      * Inter (OFL, bundled): the closest open font to Apple's SF. "display" is Inter Display Bold for
-     * large titles; "regular", "medium", "semibold" for UI and body text.
+     * large titles; "regular", "medium", "semibold" for UI and body text. Any other weight is
+     * Regular, and shares its copy: each file is read into memory once.
      */
     public static android.graphics.Typeface font(Context c, String weight) {
-        android.graphics.Typeface t = FONTS.get(weight);
+        String file = weight.equals("display") ? "InterDisplay-Bold" : weight.equals("medium") ? "Inter-Medium"
+                : weight.equals("semibold") ? "Inter-SemiBold" : "Inter-Regular";
+        android.graphics.Typeface t = FONTS.get(file);
         if (t == null) {
-            String file = weight.equals("display") ? "InterDisplay-Bold" : weight.equals("medium") ? "Inter-Medium"
-                    : weight.equals("semibold") ? "Inter-SemiBold" : "Inter-Regular";
             try {
                 t = android.graphics.Typeface.createFromAsset(c.getAssets(), "fonts/" + file + ".ttf");
             } catch (RuntimeException e) {
                 t = android.graphics.Typeface.DEFAULT;
             }
-            FONTS.put(weight, t);
+            FONTS.put(file, t);
         }
         return t;
     }
@@ -77,9 +78,13 @@ public final class Ui {
         return b;
     }
 
-    /** Liquid Glass backdrop: blurred image with boosted saturation and a slight lift, baked once. */
+    /**
+     * Liquid Glass backdrop: blurred image with boosted saturation and a slight lift, baked once.
+     * Frosted as tvOS's Control Centre glass measures: at 160 wide, three radius-2 passes are a
+     * sigma of about 29 px on a 1080p screen, so the picture's soft shapes and colour still show.
+     */
     static android.graphics.Bitmap glassBackdrop(android.graphics.Bitmap src, int w, int h) {
-        android.graphics.Bitmap blurred = blur(src, w, h, 3, 3);
+        android.graphics.Bitmap blurred = blur(src, w, h, 2, 3);
         if (blurred == null) return null;
         android.graphics.Bitmap out = android.graphics.Bitmap.createBitmap(w, h, android.graphics.Bitmap.Config.ARGB_8888);
         android.graphics.ColorMatrix cm = new android.graphics.ColorMatrix();

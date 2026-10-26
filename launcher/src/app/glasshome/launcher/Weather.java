@@ -8,11 +8,10 @@ import android.os.Looper;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
-import java.io.ByteArrayOutputStream;
-import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Calendar;
@@ -26,15 +25,17 @@ import java.util.TimeZone;
 /**
  * Current weather and a 5-day forecast from free services that need no key: Open-Meteo,
  * MET Norway (Yr) and wttr.in. The chosen source is tried first and the others are fallbacks.
- * The location comes from the internet address (ipapi.co, ipwho.is, geojs.io) unless a city is
- * chosen in Settings. Every source is stored in one format, cached, and refreshed on a schedule
- * (every 15 minutes by default).
+ * The location comes from the internet address (ipapi.co, ipwho.is, geojs.io; looked up once a
+ * day) unless a city is chosen in Settings. Every source is stored in one format, cached, and
+ * refreshed on a schedule (every 15 minutes by default). Day and night come from the sun's position
+ * when the forecast is shown, so the icons turn to the moon at sunset even with no new fetch.
  */
 final class Weather {
     static final String PREFS = "weather";
     static final String K_ENABLED = "enabled", K_UNITS = "units", K_PLACE = "place", K_LAT = "lat", K_LON = "lon",
             K_MANUAL = "manual", K_SOURCE = "source", K_REFRESH = "refresh_min",
-            K_CACHE = "cache2", K_CACHE_AT = "cache_at", K_CACHE_KEY = "cache_key";
+            K_CACHE = "cache2", K_CACHE_AT = "cache_at", K_CACHE_KEY = "cache_key",
+            K_AUTO_LAT = "auto_lat", K_AUTO_LON = "auto_lon", K_AUTO_PLACE = "auto_place", K_AUTO_AT = "auto_at";
     static final String SRC_METOFFICE = "metoffice", SRC_OPEN_METEO = "openmeteo", SRC_MET = "met", SRC_WTTR = "wttr";
     static final String[] SOURCES = {SRC_METOFFICE, SRC_OPEN_METEO, SRC_MET, SRC_WTTR};
     static final int[] REFRESH_CHOICES = {10, 15, 30, 60};
@@ -88,8 +89,10 @@ final class Weather {
     // ---------------------------------------------------------------- data
 
     static final class Hour {
+        static final int HOUR = 0, SUNRISE = 1, SUNSET = 2;
         long time;
-        int temp, code;
+        int temp, code, rain = -1;
+        int type;  // HOUR, or a sunrise or sunset cell put between the hours (never stored)
         boolean day;
         String label;
     }
@@ -97,29 +100,33 @@ final class Weather {
     static final class Day {
         String date, label;
         int code, max, min, rain = -1;
+        long rise, set;  // 0 when the source doesn't give them
     }
 
     static final class Data {
         String place = "", source = SRC_OPEN_METEO, windUnit = "km/h";
         long fetchedAt;
-        int temp, feels, code, humidity, wind, max, min;
-        boolean day = true;
+        int temp, code, humidity, wind, max, min;
+        boolean day = true, fahrenheit;
+        double lat = Double.NaN, lon = Double.NaN;
         final List<Hour> hours = new ArrayList<>();
         final List<Day> days = new ArrayList<>();
 
         JSONObject toJson() throws Exception {
             JSONObject j = new JSONObject();
             j.put("place", place).put("source", source).put("windUnit", windUnit).put("fetchedAt", fetchedAt)
-                    .put("temp", temp).put("feels", feels).put("code", code).put("humidity", humidity)
-                    .put("wind", wind).put("day", day);
+                    .put("temp", temp).put("code", code).put("humidity", humidity)
+                    .put("wind", wind).put("day", day).put("f", fahrenheit);
+            if (!Double.isNaN(lat)) j.put("lat", lat).put("lon", lon);  // JSON has no NaN
             JSONArray h = new JSONArray();
             for (Hour x : hours) {
-                h.put(new JSONObject().put("t", x.time).put("temp", x.temp).put("code", x.code).put("day", x.day));
+                h.put(new JSONObject().put("t", x.time).put("temp", x.temp).put("code", x.code).put("day", x.day)
+                        .put("rain", x.rain));
             }
             JSONArray d = new JSONArray();
             for (Day x : days) {
                 d.put(new JSONObject().put("date", x.date).put("code", x.code).put("max", x.max).put("min", x.min)
-                        .put("rain", x.rain));
+                        .put("rain", x.rain).put("rise", x.rise).put("set", x.set));
             }
             return j.put("hours", h).put("days", d);
         }
@@ -131,11 +138,13 @@ final class Weather {
             d.windUnit = j.optString("windUnit", "km/h");
             d.fetchedAt = j.optLong("fetchedAt");
             d.temp = j.getInt("temp");
-            d.feels = j.optInt("feels", d.temp);
             d.code = j.getInt("code");
             d.humidity = j.optInt("humidity");
             d.wind = j.optInt("wind");
             d.day = j.optBoolean("day", true);
+            d.fahrenheit = j.optBoolean("f", false);
+            d.lat = j.optDouble("lat", Double.NaN);
+            d.lon = j.optDouble("lon", Double.NaN);
             JSONArray h = j.getJSONArray("hours");
             for (int i = 0; i < h.length(); i++) {
                 JSONObject o = h.getJSONObject(i);
@@ -144,6 +153,7 @@ final class Weather {
                 x.temp = o.getInt("temp");
                 x.code = o.getInt("code");
                 x.day = o.optBoolean("day", true);
+                x.rain = o.optInt("rain", -1);
                 d.hours.add(x);
             }
             JSONArray a = j.getJSONArray("days");
@@ -155,53 +165,132 @@ final class Weather {
                 x.max = o.getInt("max");
                 x.min = o.getInt("min");
                 x.rain = o.optInt("rain", -1);
+                x.rise = o.optLong("rise");
+                x.set = o.optLong("set");
                 d.days.add(x);
             }
             return d;
         }
     }
 
+    /** After this long without a new forecast, "Now" comes from the cached hourly forecast. */
+    private static final long STALE_NOW = 60 * 60000L;
+
+    // The last result of cached(), with what it was made from and the time it holds for.
+    private static String memoRaw, memoZone;
+    private static boolean memo24;
+    private static Locale memoLocale;
+    private static long memoFrom, memoUntil;
+    private static Data memo;
+
     /**
-     * The cached forecast ready to show: hours from the current hour ("Now" first), days from
-     * today ("Today" first), and today's high/low. Null when nothing has loaded yet.
+     * The cached forecast ready to show: hours from the current hour ("Now" first, with sunrise and
+     * sunset between them), days from today ("Today" first), and today's high/low. Null when nothing
+     * has loaded yet, or when the forecast is too old to cover the current hour. It is parsed once
+     * and shared until something it shows changes (the hour, day or night, a new forecast), so
+     * callers must not change it.
      */
-    static Data cached(Context c) {
+    static synchronized Data cached(Context c) {
         String raw = prefs(c).getString(K_CACHE, null);
         if (raw == null) return null;
-        try {
-            return present(c, Data.fromJson(new JSONObject(raw)));
-        } catch (Exception e) {
-            return null;
+        long now = System.currentTimeMillis();
+        boolean is24 = android.text.format.DateFormat.is24HourFormat(c);
+        Locale loc = Locale.getDefault();
+        String zone = TimeZone.getDefault().getID();
+        if (raw.equals(memoRaw) && is24 == memo24 && loc.equals(memoLocale) && zone.equals(memoZone)
+                && now >= memoFrom && now < memoUntil
+                && (memo == null || Double.isNaN(memo.lat) || sunUp(memo.lat, memo.lon, now) == memo.day)) {
+            return memo;
         }
+        Data d;
+        try {
+            d = present(Data.fromJson(new JSONObject(raw)), now, is24);
+        } catch (Exception e) {
+            d = null;
+        }
+        // Good from this hour's start (a clock set back makes it again) until the next hour, the
+        // switch to the hourly "Now", or the next sunrise or sunset cell.
+        long hour = localHourStart(), until = hour + 3600000L;
+        if (d != null && d.fetchedAt + STALE_NOW > now) until = Math.min(until, d.fetchedAt + STALE_NOW);
+        if (d != null) {
+            for (Hour h : d.hours) {
+                if (h.type != Hour.HOUR) {
+                    until = Math.min(until, h.time);
+                    break;
+                }
+            }
+        }
+        memoRaw = raw;
+        memoZone = zone;
+        memo24 = is24;
+        memoLocale = loc;
+        memoFrom = hour;
+        memoUntil = until;
+        memo = d;
+        return d;
     }
 
-    private static Data present(Context c, Data src) throws Exception {
-        Data d = Data.fromJson(src.toJson());
+    private static Data present(Data d, long now, boolean is24) throws Exception {
+        List<Hour> hours = new ArrayList<>(d.hours);
+        List<Day> days = new ArrayList<>(d.days);
         d.hours.clear();
         d.days.clear();
         long hourStart = localHourStart();
-        SimpleDateFormat hourFmt = new SimpleDateFormat(
-                android.text.format.DateFormat.is24HourFormat(c) ? "HH" : "h a", Locale.getDefault());
-        for (Hour h : src.hours) {
+        boolean old = now - d.fetchedAt > STALE_NOW, sun = !Double.isNaN(d.lat);
+        SimpleDateFormat hourFmt = new SimpleDateFormat(is24 ? "HH" : "h a", Locale.getDefault());
+        for (Hour h : hours) {
             if (h.time < hourStart || d.hours.size() >= 6) continue;
             if (d.hours.isEmpty()) {
                 h.label = "Now";
-                h.temp = d.temp;
-                h.code = d.code;
-                h.day = d.day;
+                if (old) {
+                    // Hours since the last fetch (standby, or every source failing): this hour's
+                    // forecast is nearer the truth than the conditions back then.
+                    d.temp = h.temp;
+                    d.code = h.code;
+                    d.day = h.day;
+                } else {
+                    h.temp = d.temp;
+                    h.code = d.code;
+                }
             } else {
                 h.label = hourFmt.format(new Date(h.time)).replace(" ", "").toUpperCase(Locale.getDefault());
+                if (sun) h.day = sunUp(d.lat, d.lon, h.time);
             }
             d.hours.add(h);
         }
-        String today = new SimpleDateFormat("yyyy-MM-dd", Locale.US).format(new Date());
+        if (old && d.hours.isEmpty()) return null;  // older than its own forecast: wait for a new one
+        // Day or night from the sun now, not from the fetch: a forecast fetched by day turns to the
+        // moon at sunset. Caches from before the location was stored keep the source's flag.
+        if (sun) d.day = sunUp(d.lat, d.lon, now);
+        if (!d.hours.isEmpty()) d.hours.get(0).day = d.day;
+
+        String today = new SimpleDateFormat("yyyy-MM-dd", Locale.US).format(new Date(now));
         SimpleDateFormat ymd = new SimpleDateFormat("yyyy-MM-dd", Locale.US);
         SimpleDateFormat dayFmt = new SimpleDateFormat("EEE", Locale.getDefault());
-        for (Day x : src.days) {
+        for (Day x : days) {
             if (x.date.compareTo(today) < 0 || d.days.size() >= 5) continue;
             x.label = d.days.isEmpty() ? "Today" : dayFmt.format(ymd.parse(x.date));
             d.days.add(x);
         }
+
+        // Sunrise and sunset between the hours, at their exact times, as Apple Weather shows them.
+        if (d.hours.size() > 1) {
+            long last = d.hours.get(d.hours.size() - 1).time;
+            SimpleDateFormat timeFmt = new SimpleDateFormat(is24 ? "HH:mm" : "h:mma", Locale.getDefault());
+            for (int k = 0; k < Math.min(2, d.days.size()); k++) {
+                Day x = d.days.get(k);
+                long rise = x.rise, set = x.set;
+                if ((rise == 0 || set == 0) && sun) {  // MET Norway gives no times: work them out
+                    long[] t = sunTimes(d.lat, d.lon, ymd.parse(x.date).getTime() + 12 * 3600000L);
+                    if (rise == 0) rise = t[0];
+                    if (set == 0) set = t[1];
+                }
+                sunCell(d.hours, rise, Hour.SUNRISE, now, last, timeFmt);
+                sunCell(d.hours, set, Hour.SUNSET, now, last, timeFmt);
+            }
+            while (d.hours.size() > 6) d.hours.remove(d.hours.size() - 1);
+        }
+
         if (!d.days.isEmpty()) {
             d.max = Math.max(d.days.get(0).max, d.temp);
             d.min = Math.min(d.days.get(0).min, d.temp);
@@ -209,6 +298,18 @@ final class Weather {
             d.max = d.min = d.temp;
         }
         return d;
+    }
+
+    /** Puts a sunrise or sunset cell after the hour it falls in, if it is still to come and before the last hour. */
+    private static void sunCell(List<Hour> hours, long t, int type, long now, long last, SimpleDateFormat fmt) {
+        if (t <= now || t >= last) return;
+        Hour e = new Hour();
+        e.time = t;
+        e.type = type;
+        e.label = fmt.format(new Date(t)).replace(" ", "").toUpperCase(Locale.getDefault());
+        int i = 1;
+        while (i < hours.size() && hours.get(i).time <= t) i++;
+        hours.add(i, e);
     }
 
     static boolean stale(Context c) {
@@ -221,28 +322,61 @@ final class Weather {
         return units(c) + "|" + source(c) + (manual(c) ? "|" + prefs(c).getFloat(K_LAT, 0) + "," + prefs(c).getFloat(K_LON, 0) : "|auto");
     }
 
-    private static boolean busy;
+    /** How long the location found from the internet address is kept: the TV doesn't move. */
+    private static final long LOCATION_TTL = 24 * 3600000L;
 
-    /** Fetches in the background when the cache is due; {@code done} runs on the main thread. */
+    private static boolean busy, again;
+    private static Runnable againDone;
+
+    /**
+     * Fetches in the background when the cache is due; {@code done} runs on the main thread once a
+     * new forecast is saved (not after a failure, so a page rebuilt on it can't loop while offline).
+     * A forced fetch asked for while one is running (Wi-Fi back while a fetch still waits out its
+     * timeouts) runs as soon as that one ends.
+     */
     static void refresh(Context ctx, boolean force, Runnable done) {
         Context c = ctx.getApplicationContext();
-        if (!enabled(c) || busy || (!force && !stale(c))) return;
+        if (!enabled(c) || (!force && !stale(c))) return;
+        if (busy) {
+            if (force) {
+                again = true;
+                againDone = done;
+            }
+            return;
+        }
         busy = true;
         Handler main = new Handler(Looper.getMainLooper());
         new Thread(() -> {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
+            boolean saved = false;
             try {
                 SharedPreferences p = prefs(c);
                 double lat, lon;
                 String place;
-                if (manual(c)) {
+                boolean auto = !manual(c);
+                if (!auto) {
                     lat = p.getFloat(K_LAT, 0);
                     lon = p.getFloat(K_LON, 0);
                     place = p.getString(K_PLACE, "");
+                } else if (System.currentTimeMillis() - p.getLong(K_AUTO_AT, 0) < LOCATION_TTL) {
+                    lat = p.getFloat(K_AUTO_LAT, 0);
+                    lon = p.getFloat(K_AUTO_LON, 0);
+                    place = p.getString(K_AUTO_PLACE, "");
                 } else {
                     double[] ll = new double[2];
-                    place = locate(ll);
-                    lat = ll[0];
-                    lon = ll[1];
+                    try {
+                        place = locate(ll);
+                        lat = ll[0];
+                        lon = ll[1];
+                        p.edit().putFloat(K_AUTO_LAT, (float) lat).putFloat(K_AUTO_LON, (float) lon)
+                                .putString(K_AUTO_PLACE, place).putLong(K_AUTO_AT, System.currentTimeMillis()).apply();
+                    } catch (Exception e) {
+                        // The lookup services are down or rate-limited: the last place found will do.
+                        if (!p.contains(K_AUTO_LAT)) throw e;
+                        lat = p.getFloat(K_AUTO_LAT, 0);
+                        lon = p.getFloat(K_AUTO_LON, 0);
+                        place = p.getString(K_AUTO_PLACE, "");
+                    }
                 }
                 boolean f = units(c).equals("f");
                 // The chosen source first, then the others.
@@ -263,15 +397,28 @@ final class Weather {
                 if (d != null) {
                     if (!place.isEmpty() || d.place.isEmpty()) d.place = place;
                     d.fetchedAt = System.currentTimeMillis();
+                    d.fahrenheit = f;
+                    d.lat = lat;
+                    d.lon = lon;
                     p.edit().putString(K_CACHE, d.toJson().toString()).putString(K_PLACE, d.place)
                             .putLong(K_CACHE_AT, d.fetchedAt).putString(K_CACHE_KEY, key(c)).apply();
+                    saved = true;
+                } else if (auto) {
+                    p.edit().putLong(K_AUTO_AT, 0).apply();  // every source failed: look the place up again next time
                 }
             } catch (Exception ignored) {
                 // Keep showing the last forecast.
             }
+            boolean got = saved;
             main.post(() -> {
                 busy = false;
-                if (done != null) done.run();
+                if (got && done != null) done.run();
+                if (again) {
+                    again = false;
+                    Runnable next = againDone;
+                    againDone = null;
+                    refresh(c, true, next);
+                }
             });
         }).start();
     }
@@ -286,16 +433,15 @@ final class Weather {
     private static Data fetchOpenMeteo(double lat, double lon, boolean f, boolean metOffice) throws Exception {
         JSONObject j = new JSONObject(get("https://api.open-meteo.com/v1/forecast?latitude=" + lat + "&longitude=" + lon
                 + (metOffice ? "&models=ukmo_seamless" : "")
-                + "&current=temperature_2m,apparent_temperature,weather_code,is_day,relative_humidity_2m,wind_speed_10m"
-                + "&hourly=temperature_2m,weather_code,is_day"
-                + "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max"
+                + "&current=temperature_2m,weather_code,is_day,relative_humidity_2m,wind_speed_10m"
+                + "&hourly=temperature_2m,weather_code,is_day,precipitation_probability"
+                + "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,sunrise,sunset"
                 + "&timezone=auto&forecast_days=6&forecast_hours=24"
                 + (f ? "&temperature_unit=fahrenheit" : "") + (f || metOffice ? "&wind_speed_unit=mph" : "")));
         Data d = new Data();
         d.windUnit = f || metOffice ? "mph" : "km/h";
         JSONObject cur = j.getJSONObject("current");
         d.temp = round(cur.getDouble("temperature_2m"));
-        d.feels = round(cur.getDouble("apparent_temperature"));
         d.code = cur.getInt("weather_code");
         d.day = cur.optInt("is_day", 1) == 1;
         d.humidity = cur.optInt("relative_humidity_2m");
@@ -303,17 +449,19 @@ final class Weather {
         SimpleDateFormat iso = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm", Locale.US);
         iso.setTimeZone(TimeZone.getTimeZone(j.optString("timezone", "UTC")));
         JSONObject h = j.getJSONObject("hourly");
-        JSONArray ht = h.getJSONArray("time");
+        JSONArray ht = h.getJSONArray("time"), hp = h.optJSONArray("precipitation_probability");
         for (int i = 0; i < ht.length(); i++) {
             Hour x = new Hour();
             x.time = iso.parse(ht.getString(i)).getTime();
             x.temp = round(h.getJSONArray("temperature_2m").getDouble(i));
             x.code = h.getJSONArray("weather_code").getInt(i);
             x.day = h.getJSONArray("is_day").getInt(i) == 1;
+            x.rain = hp == null || hp.isNull(i) ? -1 : hp.getInt(i);
             d.hours.add(x);
         }
         JSONObject dl = j.getJSONObject("daily");
-        JSONArray dt = dl.getJSONArray("time"), rain = dl.optJSONArray("precipitation_probability_max");
+        JSONArray dt = dl.getJSONArray("time"), rain = dl.optJSONArray("precipitation_probability_max"),
+                rise = dl.optJSONArray("sunrise"), set = dl.optJSONArray("sunset");
         for (int i = 0; i < dt.length(); i++) {
             Day x = new Day();
             x.date = dt.getString(i);
@@ -321,6 +469,8 @@ final class Weather {
             x.max = round(dl.getJSONArray("temperature_2m_max").getDouble(i));
             x.min = round(dl.getJSONArray("temperature_2m_min").getDouble(i));
             x.rain = rain == null || rain.isNull(i) ? -1 : rain.getInt(i);
+            x.rise = time(iso, rise == null ? null : rise.optString(i, null));
+            x.set = time(iso, set == null ? null : set.optString(i, null));
             d.days.add(x);
         }
         return d;
@@ -351,7 +501,6 @@ final class Weather {
             if (first && t <= now + 3600000L) {
                 double ws = inst.optDouble("wind_speed", 0), rh = inst.optDouble("relative_humidity", 50);
                 d.temp = temp(c, f);
-                d.feels = temp(apparent(c, rh, ws), f);
                 d.humidity = (int) Math.round(rh);
                 d.wind = (int) Math.round(f ? ws * 2.237 : ws * 3.6);
                 d.code = metCode(sym);
@@ -399,21 +548,21 @@ final class Weather {
     private static Data fetchWttr(double lat, double lon, boolean f) throws Exception {
         JSONObject j = new JSONObject(get(String.format(Locale.US, "https://wttr.in/%.4f,%.4f?format=j1", lat, lon)));
         JSONObject cur = j.getJSONArray("current_condition").getJSONObject(0);
+        long now = System.currentTimeMillis();
         Data d = new Data();
         d.windUnit = f ? "mph" : "km/h";
         d.temp = cur.getInt(f ? "temp_F" : "temp_C");
-        d.feels = cur.optInt(f ? "FeelsLikeF" : "FeelsLikeC", d.temp);
         d.humidity = cur.optInt("humidity");
         d.wind = cur.optInt(f ? "windspeedMiles" : "windspeedKmph");
         d.code = wwoCode(cur.optInt("weatherCode", 116));
-        int hourNow = Calendar.getInstance().get(Calendar.HOUR_OF_DAY);
-        d.day = hourNow >= 6 && hourNow < 18;
+        d.day = sunUp(lat, lon, now);
         try {
             d.place = j.getJSONArray("nearest_area").getJSONObject(0).getJSONArray("areaName").getJSONObject(0).getString("value");
         } catch (Exception ignored) {
             // no area name
         }
         SimpleDateFormat local = new SimpleDateFormat("yyyy-MM-dd HHmm", Locale.US);
+        SimpleDateFormat clock = new SimpleDateFormat("yyyy-MM-dd hh:mm a", Locale.US);
         JSONArray w = j.getJSONArray("weather");
         for (int i = 0; i < w.length(); i++) {
             JSONObject o = w.getJSONObject(i);
@@ -421,6 +570,11 @@ final class Weather {
             x.date = o.getString("date");
             x.max = o.getInt(f ? "maxtempF" : "maxtempC");
             x.min = o.getInt(f ? "mintempF" : "mintempC");
+            JSONArray astro = o.optJSONArray("astronomy");
+            if (astro != null && astro.optJSONObject(0) != null) {  // "06:43 AM", local time
+                x.rise = time(clock, x.date + " " + astro.optJSONObject(0).optString("sunrise"));
+                x.set = time(clock, x.date + " " + astro.optJSONObject(0).optString("sunset"));
+            }
             JSONArray hr = o.getJSONArray("hourly");
             x.code = 3;
             x.rain = 0;
@@ -434,13 +588,13 @@ final class Weather {
                 hour.time = local.parse(x.date + " " + String.format(Locale.US, "%04d", hhmm)).getTime();
                 hour.temp = h.getInt(f ? "tempF" : "tempC");
                 hour.code = code;
-                hour.day = hhmm >= 600 && hhmm < 1800;
+                hour.day = sunUp(lat, lon, hour.time);
+                hour.rain = h.optInt("chanceofrain", -1);
                 d.hours.add(hour);
             }
             d.days.add(x);
         }
         // 3-hour steps: keep the step containing now as the first hour.
-        long now = System.currentTimeMillis();
         List<Hour> keep = new ArrayList<>();
         for (Hour h : d.hours) if (h.time + 3 * 3600000L > now) keep.add(h);
         if (!keep.isEmpty()) keep.get(0).time = Math.max(keep.get(0).time, localHourStart());
@@ -461,7 +615,7 @@ final class Weather {
         String s = sym.replace("_day", "").replace("_night", "").replace("_polartwilight", "");
         if (s.contains("thunder")) return 95;
         if (s.contains("snow")) return s.startsWith("heavy") ? 75 : s.startsWith("light") ? 71 : 73;
-        if (s.contains("sleet")) return 66;
+        if (s.contains("sleet")) return 68;
         if (s.contains("rain")) {
             if (s.contains("showers")) return s.startsWith("heavy") ? 82 : 80;
             return s.startsWith("heavy") ? 65 : s.startsWith("light") ? 61 : 63;
@@ -487,17 +641,24 @@ final class Weather {
             case 179: case 227: case 323: case 326: case 368: return 71;
             case 329: case 332: case 335: case 371: return 73;
             case 230: case 338: case 392: case 395: return 75;
-            case 182: case 185: case 281: case 284: case 311: case 314: case 317: case 320:
-            case 350: case 362: case 365: case 374: case 377: return 66;
+            case 185: case 281: return 56;
+            case 284: return 57;
+            case 311: return 66;
+            case 314: return 67;
+            case 182: case 317: case 320: case 350: case 362: case 365: case 374: case 377: return 68;
             case 200: case 386: case 389: return 95;
             default: return 3;
         }
     }
 
-    /** Apparent temperature (Australian BoM formula), \u00b0C from \u00b0C, % humidity and m/s wind. */
-    static double apparent(double t, double rh, double ws) {
-        double e = rh / 100 * 6.105 * Math.exp(17.27 * t / (237.7 + t));
-        return t + 0.33 * e - 0.70 * ws - 4.00;
+    /** A local date and time parsed with fmt, or 0 when it is missing or isn't a time ("No sunset"). */
+    private static long time(SimpleDateFormat fmt, String s) {
+        if (s == null) return 0;
+        try {
+            return fmt.parse(s).getTime();
+        } catch (Exception e) {
+            return 0;
+        }
     }
 
     /** Start of the current hour in local time (half-hour time zones included). */
@@ -515,6 +676,62 @@ final class Weather {
 
     private static int round(double v) {
         return (int) Math.round(v);
+    }
+
+    /** A chance of rain to show: only from 10%, in steps of 10%, as Apple Weather shows it; -1 for none. */
+    static int chance(int raw) {
+        return raw < 10 ? -1 : Math.min(100, Math.round(raw / 10f) * 10);
+    }
+
+    // ---------------------------------------------------------------- sun
+
+    private static final long DAY = 86400000L;
+    private static final double HORIZON = -0.01454;  // sin(-0.833\u00b0): the sun's top edge, with refraction
+
+    /** Whether the sun is up at lat/lon at time t (as WeatherKit's isDaylight). */
+    static boolean sunUp(double lat, double lon, long t) {
+        double[] s = sun(t);
+        double phi = Math.toRadians(lat);
+        return Math.sin(phi) * Math.sin(s[0]) + Math.cos(phi) * Math.cos(s[0]) * Math.cos(Math.toRadians(s[1] + lon)) > HORIZON;
+    }
+
+    /** Sunrise and sunset (ms) on the day around t at lat/lon; 0 for one that doesn't happen (polar day or night). */
+    static long[] sunTimes(double lat, double lon, long t) {
+        long shift = (long) (lon / 360 * DAY);
+        long noon = Math.floorDiv(t + shift, DAY) * DAY + DAY / 2 - shift;
+        noon -= (long) (wrap(sun(noon)[1] + lon) / 360 * DAY);  // the equation of time
+        return new long[]{crossing(lat, lon, noon, -1), crossing(lat, lon, noon, 1)};
+    }
+
+    /** When the sun's edge crosses the horizon before (side -1) or after (side 1) noon: estimated, then refined once. */
+    private static long crossing(double lat, double lon, long noon, int side) {
+        long t = noon;
+        double phi = Math.toRadians(lat);
+        for (int i = 0; i < 2; i++) {
+            double[] s = sun(t);
+            double cosH = (HORIZON - Math.sin(phi) * Math.sin(s[0])) / (Math.cos(phi) * Math.cos(s[0]));
+            if (cosH < -1 || cosH > 1) return 0;
+            t += (long) (wrap(side * Math.toDegrees(Math.acos(cosH)) - (s[1] + lon)) / 360 * DAY);
+        }
+        return t;
+    }
+
+    /**
+     * The sun's declination (radians) and Greenwich hour angle (degrees) at time t, from Meeus's
+     * low-precision solar coordinates: well under a minute out for sunrise and sunset.
+     */
+    private static double[] sun(long t) {
+        double n = t / (double) DAY - 10957.5;  // days since J2000.0
+        double g = Math.toRadians(357.528 + 0.9856003 * n);
+        double lambda = Math.toRadians(280.460 + 0.9856474 * n + 1.915 * Math.sin(g) + 0.020 * Math.sin(2 * g));
+        double eps = Math.toRadians(23.439 - 0.0000004 * n);
+        double ra = Math.toDegrees(Math.atan2(Math.cos(eps) * Math.sin(lambda), Math.cos(lambda)));
+        return new double[]{Math.asin(Math.sin(eps) * Math.sin(lambda)), (280.46061837 + 360.98564736629 * n - ra) % 360};
+    }
+
+    private static double wrap(double deg) {
+        deg %= 360;
+        return deg > 180 ? deg - 360 : deg < -180 ? deg + 360 : deg;
     }
 
     // ---------------------------------------------------------------- location
@@ -574,20 +791,28 @@ final class Weather {
         e.remove(K_CACHE_AT).apply();
     }
 
-    /** WMO weather code -> short description, as Apple Weather words it. */
+    /**
+     * WMO weather code -> short description, in WeatherKit's own (en-GB) words. Codes 68 and 69
+     * (rain and snow) carry MET Norway's and wttr.in's sleet; Open-Meteo never sends them.
+     */
     static String describe(int code, boolean day) {
         switch (code) {
             case 0: return day ? "Sunny" : "Clear";
             case 1: return day ? "Mostly Sunny" : "Mostly Clear";
             case 2: return "Partly Cloudy";
             case 3: return "Cloudy";
-            case 45: case 48: return "Foggy";
-            case 51: case 53: case 55: case 56: case 57: return "Drizzle";
+            case 45: case 48: return "Fog";
+            case 51: case 53: case 55: return "Drizzle";
+            case 56: case 57: return "Freezing Drizzle";
             case 61: case 63: case 80: case 81: return "Rain";
             case 65: case 82: return "Heavy Rain";
-            case 66: case 67: return "Sleet";
-            case 71: case 73: case 75: case 77: case 85: case 86: return "Snow";
-            case 95: case 96: case 99: return "Thunderstorms";
+            case 66: case 67: return "Freezing Rain";
+            case 68: case 69: return "Sleet";
+            case 71: case 77: case 85: return "Flurries";
+            case 73: return "Snow";
+            case 75: case 86: return "Heavy Snow";
+            case 95: case 96: return "Thunderstorm";
+            case 99: return "Severe Thunderstorm";
             default: return "";
         }
     }
@@ -597,12 +822,8 @@ final class Weather {
         con.setConnectTimeout(8000);
         con.setReadTimeout(10000);
         con.setRequestProperty("User-Agent", UA);
-        try (InputStream in = con.getInputStream()) {
-            ByteArrayOutputStream out = new ByteArrayOutputStream();
-            byte[] b = new byte[8192];
-            int n;
-            while ((n = in.read(b)) > 0) out.write(b, 0, n);
-            return out.toString("UTF-8");
+        try {
+            return new String(Suggestions.readAll(con.getInputStream()), StandardCharsets.UTF_8);
         } finally {
             con.disconnect();
         }

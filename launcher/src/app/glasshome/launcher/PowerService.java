@@ -5,8 +5,8 @@ import android.view.accessibility.AccessibilityEvent;
 
 /**
  * Glass Home's accessibility switch, turned on by the user in the TV's Accessibility settings. It
- * does one thing, only when asked from Glass Home: put the TV to sleep (Power Off, Sleep Timer) on TVs where
- * device admin is switched off. It reads nothing on screen.
+ * does one thing, only when asked from Glass Home: put the TV to sleep (Control Centre's Turn Off
+ * and Sleep Timer) on TVs where device admin is switched off. It reads nothing on screen.
  */
 public class PowerService extends AccessibilityService {
     static PowerService instance;

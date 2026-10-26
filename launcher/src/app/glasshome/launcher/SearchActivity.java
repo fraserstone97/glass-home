@@ -1,9 +1,15 @@
 package app.glasshome.launcher;
 
 import android.Manifest;
+import android.animation.ArgbEvaluator;
+import android.animation.ObjectAnimator;
+import android.animation.TimeInterpolator;
+import android.animation.ValueAnimator;
 import android.app.Activity;
 import android.content.ComponentName;
+import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.graphics.Bitmap;
@@ -11,68 +17,125 @@ import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Outline;
 import android.graphics.Paint;
+import android.graphics.Path;
+import android.graphics.Rect;
 import android.graphics.RectF;
+import android.graphics.drawable.BitmapDrawable;
+import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.LayerDrawable;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.speech.RecognitionListener;
 import android.speech.RecognitionService;
 import android.speech.RecognizerIntent;
 import android.speech.SpeechRecognizer;
 import android.text.Editable;
+import android.text.SpannableString;
+import android.text.SpannableStringBuilder;
+import android.text.Spanned;
+import android.text.TextPaint;
+import android.text.TextUtils;
 import android.text.TextWatcher;
+import android.text.style.CharacterStyle;
+import android.text.style.DynamicDrawableSpan;
+import android.text.style.ImageSpan;
+import android.text.style.UpdateAppearance;
 import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.ViewOutlineProvider;
+import android.view.animation.AccelerateInterpolator;
+import android.view.animation.DecelerateInterpolator;
+import android.view.animation.LinearInterpolator;
+import android.view.animation.PathInterpolator;
 import android.view.inputmethod.EditorInfo;
+import android.view.inputmethod.InputMethodManager;
 import android.widget.EditText;
 import android.widget.FrameLayout;
+import android.widget.HorizontalScrollView;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.lang.ref.WeakReference;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 /**
- * tvOS-style Search: a glass search field, voice dictation and a grid of posters for what's on the
- * UK services this TV has (JustWatch, no key). Dictation uses a speech recogniser other than the
- * Google/Gemini voice app, so the mic button searches content instead of opening an assistant.
- * Started by the remote's mic button (ASSIST / VOICE_ASSIST / SEARCH intents) and from Control Center.
+ * tvOS-style Search, laid out as the Apple TV app lays it out for a remote with arrow keys: the
+ * field across the top, a six-column keyboard on the left and the results beside it, which slide
+ * over to fill the screen when you move into them. Shelves of posters for what's on the UK services
+ * this TV has (JustWatch, no key). Dictation uses a speech recogniser other than the Google/Gemini
+ * voice app, so the mic button searches content instead of opening an assistant. Started by the
+ * remote's mic button (ASSIST / VOICE_ASSIST / SEARCH intents).
  */
 public class SearchActivity extends Activity {
 
     static final String KATNISS = "com.google.android.katniss";
     static final int COLS = 6, REQ_MIC = 7;
+    static final String RECENTLY = "Recently Searched", BROWSE = "Browse";
+    static final String HINT = "Films, Shows, Cast and More";
+    /** Recently Searched, as Apple keeps it: ten titles, each for thirty days. */
+    static final int RECENT = 10;
+    static final long RECENT_MS = 30L * 24 * 60 * 60 * 1000;
+    /** Popular from the last visit is shown without asking again for half an hour. */
+    static final long POPULAR_MS = 30 * 60 * 1000L;
+
+    /** The Apple TV app's lockup focus: in over 85 ms (ease in), out over 230 ms (ease out). */
+    static final TimeInterpolator FOCUS_IN = new AccelerateInterpolator(1f), FOCUS_OUT = new DecelerateInterpolator(1f);
+    /** Its row and page scrolling (a spring of stiffness 150, damping 30) as a curve. */
+    static final PathInterpolator SCROLL = new PathInterpolator(0.2f, 0.7f, 0.25f, 1f);
+    /** Its keyboard sliding away (stiffness 150, damping 22). */
+    static final PathInterpolator SLIDE = new PathInterpolator(0.3f, 0.7f, 0.3f, 1f);
 
     final Handler ui = new Handler(Looper.getMainLooper());
     final ExecutorService io = Executors.newSingleThreadExecutor();
     /** Each search on its own thread: a new one never waits for one that's been typed past. */
     final ExecutorService searches = Executors.newCachedThreadPool();
+    /** The search running now: a newer one stops it. */
+    Future<?> running;
     EditText field;
-    TextView status;
-    MicView mic;
-    GradientDrawable barRim;
-    android.animation.ValueAnimator barAnim;
-    float barGlow;
+    /** "Hold [mic] to dictate", at the field's right while it's empty. */
+    TextView dictate;
+    float barGlow, fieldFocus;
+    android.animation.ValueAnimator barAnim, fieldAnim;
+    KeyGrid keys;
+    /** The results column: suggestions, then the shelves. Beside the keyboard until you move into it. */
+    LinearLayout results;
+    HorizontalScrollView hintRow;
+    LinearLayout hints;
     LinearLayout grid;
-    /** Popular Now from the last visit, kept while tvOS is running. */
-    static List<SearchBrain.Shelf> popular;
-    SearchBrain brain;
     ScrollView scroll;
-    /** Where the shelves start: below the field and status line. */
+    /** Popular from the last visit, kept while Glass Home is running, and when it was fetched. */
+    static List<SearchBrain.Shelf> popular;
+    static long popularAt;
+    SearchBrain brain;
+    /** Where the shelves start: Apple's 251 px, 27 px under the field. */
     int HEADER;
+    /** How far the keyboard slides away, and the results with it. */
+    int KEYS_W;
     SpeechRecognizer recognizer;
     boolean listening;
-    int generation;
+    volatile int generation;
     final Runnable debounced = () -> search(field.getText().toString().trim());
 
     /** One search result: a title and the UK services (installed on this TV) that stream it. */
@@ -85,8 +148,6 @@ public class SearchActivity extends Activity {
         double imdb;
         int tomato = -1;
         boolean certified, rentBuy;
-        /** Its poster on screen, for filling in when the image arrives. */
-        transient ImageView art;
         /** Where it was made (ISO codes), for keeping loose matches to what UK viewers watch. */
         final List<String> countries = new ArrayList<>();
         int tmdbId, votes;
@@ -100,8 +161,12 @@ public class SearchActivity extends Activity {
             for (Suggestions.Item it : offers) if (it.providerId == providerId) return true;
             return false;
         }
+        /** An app: how to open it, and its banner. */
         Intent appLaunch;
         Drawable appBanner;
+        /** A Browse tile: the service it opens, or the genre it browses (JustWatch's code). */
+        Suggestions.Provider service;
+        String genre;
     }
 
     /** Stand-ins in the text for Rotten Tomatoes' icons; showIcons() draws them. */
@@ -120,7 +185,7 @@ public class SearchActivity extends Activity {
         return b.toString();
     }
 
-    /** Swaps the stand-ins in a TextView's text for the drawn icons, sized to its text. */
+    /** Swaps the stand-ins in a TextView's text for the icons, sized to its text. */
     static void showIcons(TextView t) {
         CharSequence s = t.getText();
         if (s == null) return;
@@ -134,6 +199,7 @@ public class SearchActivity extends Activity {
             char ch = s.charAt(i);
             if (ch != FRESH && ch != ROTTEN && ch != CERTIFIED) continue;
             android.graphics.drawable.Drawable d = icon(t.getContext(), ch, size);
+            if (d == null) continue;
             d.setBounds(0, 0, size, size);
             sp.setSpan(new android.text.style.ImageSpan(d, android.os.Build.VERSION.SDK_INT >= 29
                     ? android.text.style.DynamicDrawableSpan.ALIGN_CENTER : android.text.style.DynamicDrawableSpan.ALIGN_BASELINE),
@@ -142,79 +208,34 @@ public class SearchActivity extends Activity {
         t.setText(sp);
     }
 
-    /**
-     * The icon artwork in res/drawable-nodpi (rt_fresh, rt_certified, rt_rotten) when it's there;
-     * otherwise a drawn tomato or splat. Certified falls back to the fresh tomato.
-     */
-    static android.graphics.drawable.Drawable icon(android.content.Context c, char kind, int size) {
+    /** Rotten Tomatoes' icon artwork (res/drawable-nodpi), at this size; null if it won't open. */
+    static android.graphics.drawable.Drawable icon(Context c, char kind, int size) {
         // Each kind and size is made once: a page of results asks for dozens, and decoding the
         // picture for every card cost a results page a sixth of its build time.
         String key = kind + ":" + size;
         android.graphics.Bitmap made = ICONS.get(key);
-        if (made == null) ICONS.put(key, made = iconBitmap(c, kind, size));
+        if (made == null) {
+            made = iconBitmap(c, kind, size);
+            if (made == null) return null;
+            ICONS.put(key, made);
+        }
         return new android.graphics.drawable.BitmapDrawable(c.getResources(), made);
     }
 
     static final java.util.Map<String, android.graphics.Bitmap> ICONS = new java.util.HashMap<>();
 
-    static android.graphics.Bitmap iconBitmap(android.content.Context c, char kind, int size) {
-        String[] names = kind == CERTIFIED ? new String[]{"rt_certified", "rt_fresh"}
-                : kind == FRESH ? new String[]{"rt_fresh"} : new String[]{"rt_rotten"};
-        for (String n : names) {
-            int id = c.getResources().getIdentifier(n, "drawable", c.getPackageName());
-            if (id == 0) continue;
-            // Shrunk in halves to its exact size (a 168 px picture squeezed to 14 px in one go
-            // looks jagged), so the edges stay smooth.
-            android.graphics.Bitmap b = android.graphics.BitmapFactory.decodeResource(c.getResources(), id);
-            if (b == null) continue;
-            while (b.getWidth() / 2 >= size) {
-                android.graphics.Bitmap h = android.graphics.Bitmap.createScaledBitmap(b, b.getWidth() / 2, b.getHeight() / 2, true);
-                if (h != b) b.recycle();
-                b = h;
-            }
-            return android.graphics.Bitmap.createScaledBitmap(b, size, size, true);
+    static android.graphics.Bitmap iconBitmap(Context c, char kind, int size) {
+        int id = kind == CERTIFIED ? R.drawable.rt_certified : kind == FRESH ? R.drawable.rt_fresh : R.drawable.rt_rotten;
+        android.graphics.Bitmap b = android.graphics.BitmapFactory.decodeResource(c.getResources(), id);
+        if (b == null) return null;
+        // Shrunk in halves to its exact size (a 168 px picture squeezed to 14 px in one go
+        // looks jagged), so the edges stay smooth.
+        while (b.getWidth() / 2 >= size) {
+            android.graphics.Bitmap h = android.graphics.Bitmap.createScaledBitmap(b, b.getWidth() / 2, b.getHeight() / 2, true);
+            if (h != b) b.recycle();
+            b = h;
         }
-        return tomatoIcon(kind != ROTTEN, size * 2);
-    }
-
-    /** A red tomato with a green crown (fresh), or a green splat (rotten), drawn at s px. */
-    static android.graphics.Bitmap tomatoIcon(boolean fresh, int s) {
-        android.graphics.Bitmap b = android.graphics.Bitmap.createBitmap(s, s, android.graphics.Bitmap.Config.ARGB_8888);
-        android.graphics.Canvas c = new android.graphics.Canvas(b);
-        android.graphics.Paint p = new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG);
-        float m = s / 2f;
-        if (fresh) {
-            p.setShader(new android.graphics.RadialGradient(s * 0.38f, s * 0.42f, s * 0.55f,
-                    0xFFFF5A3C, 0xFFD8200F, android.graphics.Shader.TileMode.CLAMP));
-            c.drawOval(s * 0.06f, s * 0.2f, s * 0.94f, s * 0.96f, p);
-            p.setShader(null);
-            p.setColor(0xFF2FA84F);
-            android.graphics.Path leaf = new android.graphics.Path();
-            for (int i = 0; i < 5; i++) {  // a five-pointed crown of leaves
-                double a = Math.toRadians(-90 + i * 72);
-                float x = m + (float) Math.cos(a) * s * 0.2f, y = s * 0.24f + (float) Math.sin(a) * s * 0.1f;
-                leaf.addOval(Math.min(m, x) - s * 0.04f, Math.min(s * 0.24f, y) - s * 0.035f,
-                        Math.max(m, x) + s * 0.04f, Math.max(s * 0.24f, y) + s * 0.035f, android.graphics.Path.Direction.CW);
-            }
-            c.drawPath(leaf, p);
-        } else {
-            p.setColor(0xFF4CB03A);
-            android.graphics.Path splat = new android.graphics.Path();
-            int n = 9;
-            for (int i = 0; i <= n * 2; i++) {  // a blob with uneven drips round its edge
-                double a = Math.toRadians(i * 180.0 / n);
-                float r = s * (i % 2 == 0 ? 0.47f - (i % 4 == 0 ? 0.04f : 0f) : 0.3f);
-                float x = m + (float) Math.cos(a) * r, y = m + (float) Math.sin(a) * r;
-                if (i == 0) splat.moveTo(x, y);
-                else splat.lineTo(x, y);
-            }
-            splat.close();
-            p.setPathEffect(new android.graphics.CornerPathEffect(s * 0.12f));
-            c.drawPath(splat, p);
-            p.setPathEffect(null);
-            c.drawCircle(m, m, s * 0.3f, p);
-        }
-        return b;
+        return android.graphics.Bitmap.createScaledBitmap(b, size, size, true);
     }
 
     int u(float units) {
@@ -228,14 +249,18 @@ public class SearchActivity extends Activity {
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
-        createdAt = android.os.SystemClock.uptimeMillis();
+        createdAt = SystemClock.uptimeMillis();
         overHome = MainActivity.onScreen;
         FrameLayout root = new FrameLayout(this);
         GradientDrawable bg = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
                 new int[]{0xFF040405, 0xFF050506, 0xFF000000});
         root.setBackground(bg);
+        int sw = Ui.screen(this).x;
 
-        HEADER = u(40) + u(48) + u(8) + u(30) + u(10);
+        // The Apple TV app's field: 139 px down and 85 px tall.
+        int fieldTop = u(69.5f), fieldH = u(42.5f);
+        HEADER = u(125.5f);
+        KEYS_W = u(256);
         // Behind everything, as on tvOS: the focused title's artwork, soft and dim.
         ambient = new ImageView(this);
         ambient.setScaleType(ImageView.ScaleType.CENTER_CROP);
@@ -247,82 +272,30 @@ public class SearchActivity extends Activity {
         ambient.setLayerType(View.LAYER_TYPE_HARDWARE, null);
         root.addView(ambient, new FrameLayout.LayoutParams(-1, -1));
 
-        // The header (field and status) floats over the shelves on a soft dark fade, and the shelves
-        // glide under it: no hard edge to slice a poster that's lifting as the page scrolls.
-        LinearLayout col = new LinearLayout(this);
-        col.setOrientation(LinearLayout.VERTICAL);
-        col.setPadding(0, u(40), 0, u(18));
-        col.setClipChildren(false);
-        col.setClipToPadding(false);  // the listening glow reaches above the field
-        col.setBackground(new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
-                new int[]{0xF0000000, 0xD9000000, 0x00000000}));
-
-        // Glass search field: mic button + text.
-        LinearLayout bar = new LinearLayout(this);
-        bar.setGravity(Gravity.CENTER_VERTICAL);
-        bar.setPadding(u(4), 0, u(16), 0);  // the mic sits centred in the capsule's round end
-        bar.setBackground(glassBar());
-        // Centred, about half the screen wide, like tvOS's search field.
-        LinearLayout.LayoutParams barLp = new LinearLayout.LayoutParams(Ui.screen(this).x * 56 / 100, u(48));
-        barLp.gravity = Gravity.CENTER_HORIZONTAL;
-        col.addView(bar, barLp);
-
-        mic = new MicView();
-        mic.setFocusable(true);
-        mic.setOnClickListener(v -> toggleListening());
-        mic.setOnFocusChangeListener((v, f) -> mic.animateFocus(f));
-        bar.addView(mic, new LinearLayout.LayoutParams(u(40), u(40)));
-
-        field = new EditText(this);
-        field.setBackground(null);
-        field.setSingleLine(true);
-        field.setTextColor(Color.WHITE);
-        field.setHintTextColor(0x80FFFFFF);
-        field.setHint("Shows, films and apps");
-        field.setTypeface(Ui.font(this, "medium"));
-        Ui.textSize(field, 17);
-        field.setImeOptions(EditorInfo.IME_ACTION_SEARCH);
-        field.setOnEditorActionListener((v, a, e) -> {
-            ui.removeCallbacks(debounced);
-            search(field.getText().toString().trim());
-            return false;
-        });
-        field.addTextChangedListener(new TextWatcher() {
-            @Override public void beforeTextChanged(CharSequence s, int a, int c, int d) { }
-            @Override public void onTextChanged(CharSequence s, int a, int c, int d) { }
-            @Override public void afterTextChanged(Editable s) {
-                ui.removeCallbacks(debounced);
-                ui.postDelayed(debounced, 450);
+        // The results column, beside the keyboard: suggestions directly under the field (no band
+        // when there are none), then the shelves. It clips at its own edges, so posters scrolled
+        // out of a row never show beside the keyboard.
+        results = new LinearLayout(this);
+        results.setOrientation(LinearLayout.VERTICAL);
+        hintRow = new HorizontalScrollView(this);
+        hintRow.setHorizontalScrollBarEnabled(false);
+        hintRow.setClipChildren(false);
+        hintRow.setClipToPadding(false);
+        hintRow.setPadding(u(40), u(7), u(40), u(5));  // Apple's 14 px under the field
+        hints = new LinearLayout(this) {
+            @Override public boolean hasOverlappingRendering() {
+                return false;  // the pills sit side by side: fading the row needs no extra layer
             }
-        });
-        LinearLayout.LayoutParams fLp = new LinearLayout.LayoutParams(0, -1, 1f);
-        fLp.leftMargin = u(10);
-        // The text and, while listening, a waveform in its place (as tvOS dictation does).
-        FrameLayout fieldBox = new FrameLayout(this);
-        fieldBox.addView(field, new FrameLayout.LayoutParams(-1, -1));
-        wave = new WaveView();
-        wave.setAlpha(0f);
-        FrameLayout.LayoutParams wLp = new FrameLayout.LayoutParams(-1, u(26), Gravity.CENTER_VERTICAL);
-        wLp.rightMargin = u(10);
-        fieldBox.addView(wave, wLp);
-        bar.addView(fieldBox, fLp);
+        };
+        hints.setClipChildren(false);
+        hintRow.addView(hints);
+        hintRow.setVisibility(View.GONE);
+        results.addView(hintRow, new LinearLayout.LayoutParams(-1, -2));
 
-        status = new TextView(this);
-        // Just under the field, centred: what's happening (Listening, Searching, no results).
-        // The shelves carry their own headings.
-        status.setTextColor(0xB3FFFFFF);
-        status.setTypeface(Ui.font(this, "medium"));
-        Ui.textSize(status, 13);
-        status.setGravity(Gravity.CENTER);
-        LinearLayout.LayoutParams sLp = new LinearLayout.LayoutParams(-1, u(30));
-        sLp.topMargin = u(8);
-        col.addView(status, sLp);
-
-        // The shelves scroll under the search field, never over it: the scroll clips at its own top,
-        // with padding inside it so a lifted poster still has room. Scrolling follows focus by
+        // The shelves scroll under the search field, never over it. Scrolling follows focus by
         // whole shelves (keepInView), not by Android's own nudging.
         scroll = new ScrollView(this) {
-            @Override protected int computeScrollDeltaToGetChildRectOnScreen(android.graphics.Rect r) {
+            @Override protected int computeScrollDeltaToGetChildRectOnScreen(Rect r) {
                 return 0;
             }
 
@@ -332,9 +305,9 @@ public class SearchActivity extends Activity {
         };
         scroll.setClipChildren(false);
         scroll.setClipToPadding(false);
-        // Starts a little under the field and fades out at its top edge, so a shelf leaving
-        // upwards (or a poster lifting as the page scrolls) softens away instead of being cut.
-        scroll.setPadding(0, u(26), 0, u(40));
+        // A shelf leaving upwards (or a poster lifting as the page scrolls) softens away at the
+        // top instead of being cut.
+        scroll.setPadding(0, u(14), 0, u(40));
         scroll.setVerticalFadingEdgeEnabled(true);
         scroll.setFadingEdgeLength(u(30));
         scroll.setVerticalScrollBarEnabled(false);
@@ -342,28 +315,134 @@ public class SearchActivity extends Activity {
         grid.setOrientation(LinearLayout.VERTICAL);
         grid.setClipChildren(false);
         scroll.addView(grid, new FrameLayout.LayoutParams(-1, -2));
-        FrameLayout.LayoutParams scLp = new FrameLayout.LayoutParams(-1, -1);
-        scLp.topMargin = HEADER - u(26);
-        root.addView(scroll, scLp);
+        results.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1f));
+        FrameLayout.LayoutParams rLp = new FrameLayout.LayoutParams(-1, -1);
+        rLp.topMargin = fieldTop + fieldH;
+        results.setTranslationX(KEYS_W);
+        root.addView(results, rLp);
+
+        keys = new KeyGrid();
+        FrameLayout.LayoutParams kLp = new FrameLayout.LayoutParams(keys.wide(), keys.tall());
+        kLp.leftMargin = u(40) - keys.pad;
+        kLp.topMargin = HEADER - keys.pad;
+        root.addView(keys, kLp);
+
+        // The header (the field) floats over the shelves on a soft dark fade.
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        col.setPadding(0, fieldTop, 0, u(18));
+        col.setClipChildren(false);
+        col.setClipToPadding(false);  // the listening glow reaches above the field
+        col.setBackground(new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
+                new int[]{0xF0000000, 0xD9000000, 0x00000000}));
+
+        // tvOS 26's field: a magnifier and large words straight on the page, across its width.
+        LinearLayout bar = new LinearLayout(this);
+        bar.setGravity(Gravity.CENTER_VERTICAL);
+        bar.setPadding(u(12), 0, u(16), 0);
+        bar.setBackground(glassBar(fieldH));
+        LinearLayout.LayoutParams barLp = new LinearLayout.LayoutParams(sw - 2 * u(40), fieldH);
+        barLp.gravity = Gravity.CENTER_HORIZONTAL;
+        col.addView(bar, barLp);
+
+        ImageView glass = new ImageView(this);
+        glass.setImageBitmap(Glyphs.get("magnifier", u(27), 0x66FFFFFF));
+        bar.addView(glass, new LinearLayout.LayoutParams(u(27), u(27)));
+
+        field = new EditText(this);
+        field.setBackground(null);
+        field.setPadding(0, 0, u(4), 0);  // the large words need the bar's whole height
+        field.setSingleLine(true);
+        field.setTextColor(0x80FFFFFF);  // Apple's typed words are half white, the hint 30%
+        field.setHintTextColor(HINT_COLOUR);
+        field.setHint(HINT);
+        field.setTypeface(Ui.font(this, "display"));
+        Ui.textSize(field, 28);
+        field.setImeOptions(EditorInfo.IME_ACTION_SEARCH);
+        field.setOnEditorActionListener((v, a, e) -> {
+            // The phone-style keyboard's Search: it goes, and the results take focus when they come.
+            InputMethodManager imm = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+            if (imm != null) imm.hideSoftInputFromWindow(field.getWindowToken(), 0);
+            ui.removeCallbacks(debounced);
+            jump = true;
+            search(field.getText().toString().trim());
+            return true;
+        });
+        field.setOnKeyListener((v, k, e) -> {
+            if (k != KeyEvent.KEYCODE_DPAD_DOWN || e.getAction() != KeyEvent.ACTION_DOWN) return false;
+            showKeys();  // down from the field is the keyboard, as on tvOS
+            return true;
+        });
+        field.setOnFocusChangeListener((v, f) -> focusField(f));
+        field.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int a, int c, int d) { }
+            @Override public void onTextChanged(CharSequence s, int a, int c, int d) { }
+            @Override public void afterTextChanged(Editable s) {
+                fieldChanged();
+                if (quiet || listening) return;  // words put there by Search itself, or being dictated
+                ui.removeCallbacks(debounced);
+                jump = false;  // typing: focus stays on the keyboard
+                String t = s.toString().trim();
+                // Back to something already answered (a letter rubbed out): at once, no wait.
+                ui.postDelayed(debounced, t.isEmpty() || SearchBrain.cached(t) != null ? 0 : 250);
+            }
+        });
+        LinearLayout.LayoutParams fLp = new LinearLayout.LayoutParams(0, -1, 1f);
+        fLp.leftMargin = u(10);
+        // The words and, while listening, a waveform in their place (as tvOS dictation does); the
+        // dictation hint at the right.
+        FrameLayout fieldBox = new FrameLayout(this);
+        fieldBox.addView(field, new FrameLayout.LayoutParams(-1, -1));
+        wave = new WaveView();
+        wave.setAlpha(0f);
+        FrameLayout.LayoutParams wLp = new FrameLayout.LayoutParams(-1, u(26), Gravity.CENTER_VERTICAL);
+        wLp.rightMargin = u(10);
+        fieldBox.addView(wave, wLp);
+        dictate = dictateHint();
+        fieldBox.addView(dictate, new FrameLayout.LayoutParams(-2, -2, Gravity.END | Gravity.CENTER_VERTICAL));
+        bar.addView(fieldBox, fLp);
         root.addView(col, new FrameLayout.LayoutParams(-1, -2, Gravity.TOP));
+
+        // Focus into the results slides the keyboard away and the results over it; back out
+        // slides them back.
+        root.getViewTreeObserver().addOnGlobalFocusChangeListener((was, now) -> {
+            if (now == null) return;
+            boolean inside = isIn(now, scroll);
+            slide(inside);
+            if (inside) {
+                lastResult = new WeakReference<>(now);
+                ui.removeCallbacks(ambientTop);  // the focused result's background, not the top one's
+            }
+            if (ambientTodo != null) {  // backgrounds wait until focus has settled
+                ui.removeCallbacks(ambientBatch);
+                ui.postDelayed(ambientBatch, 600);
+            }
+        });
 
         setContentView(root);
         enter(root, col);
         brain = new SearchBrain(this);
+        brain.recent = recentIds();
         setupRecognizer();
-        // A query handed over (adb: --es q "films with tom hardy"), as if it had been typed.
+        live = new WeakReference<>(this);
+        // Your services, for Browse: found off the main thread (each is a question to the system).
+        searches.execute(this::findServices);
+        // A query handed over (a name chosen in a title page's cast; adb: --es q "films with tom
+        // hardy"): searched at once, and focus goes to the results, as onNewIntent does.
         String given = getIntent().getStringExtra("q");
-        if (given != null) field.setText(given);
-        ui.removeCallbacks(debounced);
-        search(given == null ? "" : given);
-        live = new java.lang.ref.WeakReference<>(this);
+        if (given != null) {
+            showText(given);
+            jump = true;
+        }
+        search(given == null ? "" : given.trim());
+        keys.requestFocus();
         if (isVoiceIntent(getIntent())) listenSoon();
-        else mic.requestFocus();
     }
 
     /**
      * The tvOS-style arrival: the page fades up over Home while the search field drops softly into
-     * place on a spring and the shelves rise in after it (show() staggers them).
+     * place on a spring. Shelves already known are simply there; results that arrive meanwhile
+     * wait for it (show) and then rise in.
      */
     void enter(View root, View header) {
         root.setAlpha(0f);
@@ -371,23 +450,29 @@ public class SearchActivity extends Activity {
         header.setScaleX(0.96f);
         header.setScaleY(0.96f);
         // Results that arrive while the page is arriving wait for it (show), so building their
-        // rows never takes frames from the entrance.
+        // rows never takes frames from the entrance; the page built here in onCreate doesn't. A
+        // deadline, not a flag cleared later, which a slow first frame could clear before it's set.
+        enterEnd = SystemClock.uptimeMillis() + 660;
         root.post(() -> entering = true);
-        ui.postDelayed(() -> entering = false, 660);
         root.animate().alpha(1f).setDuration(300).setInterpolator(MainActivity.EASE).withEndAction(() -> {
             // Faded in over Home: from now on the page is solid, so the TV draws only it, not Home
             // underneath as well. (Over another app it stays see-through, so that app isn't stopped.)
             if (overHome && android.os.Build.VERSION.SDK_INT >= 30 && !isFinishing()) setTranslucent(false);
         }).start();
-        // As one image while it moves (like the lifting pills): no text re-drawn at each size.
-        header.animate().translationY(0).scaleX(1f).scaleY(1f).setStartDelay(40).setDuration(620)
-                .setInterpolator(Glass.SNAP).withLayer().start();
+        // As one image while it moves (like the lifting pills): no text re-drawn at each size. Not
+        // when it opens listening: then the glow and waveform inside it change every frame, and a
+        // layer over them would be drawn again each frame too.
+        android.view.ViewPropertyAnimator a = header.animate().translationY(0).scaleX(1f).scaleY(1f).setStartDelay(40)
+                .setDuration(620).setInterpolator(Glass.SNAP);
+        if (!isVoiceIntent(getIntent())) a.withLayer();
+        a.start();
     }
 
     /** Leaving for Home or another app: next time Search starts fresh (a title page keeps it). */
     @Override
     protected void onUserLeaveHint() {
         super.onUserLeaveHint();
+        if (asking) return;  // the system's microphone question, over the page: Search stays for the answer
         stopListening();
         finish();
         overridePendingTransition(0, R.anim.page_out);
@@ -395,6 +480,14 @@ public class SearchActivity extends Activity {
 
     @Override
     public void onBackPressed() {
+        // From the results, Back goes to the keyboard first (and the top of the page), as on
+        // tvOS; from the keyboard it leaves.
+        View f = getCurrentFocus();
+        if (f != null && isIn(f, results)) {
+            glide(0);
+            showKeys();
+            return;
+        }
         super.onBackPressed();
         overridePendingTransition(0, R.anim.page_out);
     }
@@ -403,14 +496,25 @@ public class SearchActivity extends Activity {
     protected void onNewIntent(Intent i) {
         super.onNewIntent(i);
         setIntent(i);
+        live = new WeakReference<>(this);
+        // A name chosen in a title page's cast: their films and series, ready to choose from.
+        String q = i.getStringExtra("q");
+        if (q != null) {
+            jump = true;
+            setQuery(q);
+        }
         if (isVoiceIntent(i)) listenSoon();
-        live = new java.lang.ref.WeakReference<>(this);
     }
 
     static boolean isVoiceIntent(Intent i) {
         String a = i == null ? null : i.getAction();
-        return a != null && !a.equals(Intent.ACTION_MAIN) && !a.equals(Intent.ACTION_SEARCH)
-                && !i.getBooleanExtra("keyboard", false);
+        return a != null && !a.equals(Intent.ACTION_MAIN) && !a.equals(Intent.ACTION_SEARCH);
+    }
+
+    @Override
+    public boolean dispatchKeyEvent(KeyEvent ev) {
+        MainActivity.navSound(this, ev);  // the same ticks as everywhere else
+        return super.dispatchKeyEvent(ev);
     }
 
     @Override
@@ -428,14 +532,51 @@ public class SearchActivity extends Activity {
         stopListening();
     }
 
+    /** A title page was opened from here (Search is under it until it closes). */
+    boolean opened;
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        // Back from a title page opened here: Recently Searched has it at the front now. After the
+        // page's closing fade, so rebuilding takes no frames from it.
+        if (opened) {
+            opened = false;
+            if (lastQuery.isEmpty()) ui.postDelayed(relanded, 350);
+        }
+    }
+
+    final Runnable relanded = this::reland;
+
+    /** The page before a search again, with its pictures (a search since may have pushed them out). */
+    void reland() {
+        if (lastQuery.isEmpty()) search("");
+    }
+
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        // Whatever is still on its way is for a page that's gone: nothing may start work now (the
+        // executors below refuse it, which would take Home's process down with them).
+        generation++;
+        ui.removeCallbacksAndMessages(null);
+        if (live.get() == this) live.clear();
         if (recognizer != null) recognizer.destroy();
         io.shutdownNow();
         searches.shutdownNow();
         ambientIo.shutdownNow();
         ambientNow.shutdownNow();
+        // Search shares Home's process: its pictures don't stay behind in it.
+        AMBIENT.evictAll();
+        POSTERS.trimToSize(4 << 20);
+        waiting.clear();
+    }
+
+    static boolean isIn(View v, View parent) {
+        for (View p = v; p != null; p = p.getParent() instanceof View ? (View) p.getParent() : null) {
+            if (p == parent) return true;
+        }
+        return false;
     }
 
     // ---------------------------------------------------------------- voice
@@ -455,14 +596,14 @@ public class SearchActivity extends Activity {
     void setupRecognizer() {
         ComponentName cn = recognitionService();
         if (cn == null) {
-            mic.setVisibility(View.GONE);
+            dictate.setVisibility(View.GONE);
             return;
         }
         recognizer = SpeechRecognizer.createSpeechRecognizer(this, cn);
         checkLanguage();
         recognizer.setRecognitionListener(new RecognitionListener() {
             @Override public void onReadyForSpeech(Bundle p) {
-                setListening(true, "Listening…");
+                setListening(true);
                 quietEnd = false;
                 ui.removeCallbacks(quietStop);
                 ui.postDelayed(quietStop, QUIET_MS);
@@ -482,48 +623,49 @@ public class SearchActivity extends Activity {
                 if (wave != null) wave.level = Math.max(0f, Math.min(1f, (db - noiseFloor - 1f) / 6f));
             }
             @Override public void onBufferReceived(byte[] buf) { }
-            @Override public void onEndOfSpeech() { setListening(false, "Searching…"); }
+            // You've stopped talking: the light goes, and the answer follows.
+            @Override public void onEndOfSpeech() {
+                ending = true;
+                setListening(false);
+            }
             @Override public void onError(int err) {
                 ui.removeCallbacks(quietStop);
-                if (!listening) return;  // stopped on purpose (a second press)
-                if (quietEnd && (err == SpeechRecognizer.ERROR_NO_MATCH || err == SpeechRecognizer.ERROR_SPEECH_TIMEOUT)) {
-                    quietEnd = false;
-                    setListening(false, "");
-                    return;
-                }
-                setListening(false, err == SpeechRecognizer.ERROR_NO_MATCH || err == SpeechRecognizer.ERROR_SPEECH_TIMEOUT
+                if (!listening && !ending) return;  // stopped on purpose (a second press)
+                ending = false;
+                boolean quiet = quietEnd && (err == SpeechRecognizer.ERROR_NO_MATCH || err == SpeechRecognizer.ERROR_SPEECH_TIMEOUT);
+                quietEnd = false;
+                setListening(false);
+                unsay();
+                if (quiet) return;
+                setStatus(err == SpeechRecognizer.ERROR_NO_MATCH || err == SpeechRecognizer.ERROR_SPEECH_TIMEOUT
                         ? "Didn\u2019t catch that. Try again."
                         : err == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS ? "Microphone access is off."
                         : "Voice isn\u2019t available. Type instead.");
             }
             @Override public void onResults(Bundle r) {
-                setListening(false, null);
+                ending = false;
+                setListening(false);
+                if (isDestroyed()) return;
                 List<String> words = r.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
-                if (words == null || words.isEmpty()) return;
+                if (words == null || words.isEmpty()) {
+                    unsay();
+                    return;
+                }
                 float[] sure = r.getFloatArray(SpeechRecognizer.CONFIDENCE_SCORES);
-                spoken = true;
-                field.setText(words.get(0));
-                field.setSelection(field.length());
-                ui.removeCallbacks(debounced);
+                jump = true;
                 if (words.size() == 1) {
-                    search(words.get(0));
+                    setQuery(words.get(0));
                     return;
                 }
                 // Several things it might have heard ("June", "Dune"): the one that names a real,
                 // well-known title is searched.
-                setStatus("Searching\u2026");
+                showText(words.get(0));
                 int gen = generation;
                 searches.execute(() -> {
                     String best = brain.bestSpoken(words, sure);
-                    android.util.Log.i("SearchVoice", "heard " + words + " \u2192 " + best);
                     ui.post(() -> {
-                        if (gen != generation) return;
-                        if (!best.equals(words.get(0))) {
-                            field.setText(best);
-                            field.setSelection(field.length());
-                            ui.removeCallbacks(debounced);
-                        }
-                        search(best);
+                        if (gen != generation || isDestroyed()) return;
+                        setQuery(best);
                     });
                 });
             }
@@ -531,10 +673,16 @@ public class SearchActivity extends Activity {
                 List<String> words = r.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
                 if (words != null && !words.isEmpty() && !words.get(0).isEmpty()) {
                     ui.removeCallbacks(quietStop);
-                    if (wave != null) wave.kick();
                     ui.removeCallbacks(maxStop);
                     ui.postDelayed(maxStop, 8000);  // talking: up to 8 more seconds
-                    status.setText("“" + words.get(0) + "”");  // live words: no fade
+                    // The words go into the field as they're heard (tvOS dictates into it), and the
+                    // waveform makes way for them; the light keeps flowing until you stop.
+                    if (!heard) {
+                        heard = true;
+                        wave.animate().alpha(0f).setDuration(200).start();
+                        field.animate().alpha(1f).setDuration(200).start();
+                    }
+                    showText(words.get(0));
                 }
             }
             @Override public void onEvent(int t, Bundle p) { }
@@ -551,39 +699,34 @@ public class SearchActivity extends Activity {
         try {
             recognizer.checkRecognitionSupport(i, getMainExecutor(), new android.speech.RecognitionSupportCallback() {
                 @Override public void onSupportResult(android.speech.RecognitionSupport s) {
-                    android.util.Log.i("SearchVoice", "en-GB installed " + s.getInstalledOnDeviceLanguages()
-                            + " pending " + s.getPendingOnDeviceLanguages() + " on device " + s.getSupportedOnDeviceLanguages()
-                            + " online " + s.getOnlineLanguages());
                     boolean have = false, can = false;
                     for (String l : s.getInstalledOnDeviceLanguages()) have |= l.equalsIgnoreCase("en-GB");
                     for (String l : s.getPendingOnDeviceLanguages()) have |= l.equalsIgnoreCase("en-GB");
                     for (String l : s.getSupportedOnDeviceLanguages()) can |= l.equalsIgnoreCase("en-GB");
-                    if (!have && can && recognizer != null) {
-                        android.util.Log.i("SearchVoice", "fetching the en-GB speech model");
-                        recognizer.triggerModelDownload(i);
-                    }
+                    if (!have && can && recognizer != null) recognizer.triggerModelDownload(i);
                 }
                 @Override public void onError(int error) {
-                    android.util.Log.i("SearchVoice", "language check unavailable: " + error);
+                    // the service can't say: it listens with what it has
                 }
             });
         } catch (Exception e) {
-            android.util.Log.i("SearchVoice", "language check failed: " + e);
+            // as above
         }
     }
 
-    void toggleListening() {
-        if (listening) stopListening();
-        else startListening();
-    }
+    /** Words heard so far are in the field; speech has ended and its words are on their way. */
+    boolean heard, ending;
+    /** The text that was in the field before listening. */
+    String before = "";
 
     void startListening() {
         if (recognizer == null) {
+            setListening(false);  // shown as listening while the mic settled (listenSoon)
             setStatus("Voice isn\u2019t available. Type instead.");
-            field.requestFocus();
             return;
         }
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            asking = true;
             requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQ_MIC);
             return;
         }
@@ -597,22 +740,32 @@ public class SearchActivity extends Activity {
                 .putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
                 .putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, getPackageName());
         if (android.os.Build.VERSION.SDK_INT >= 33) {
-            // Lean towards what's on TV now and what you've searched before.
-            java.util.ArrayList<String> likely = new java.util.ArrayList<>(recents());
+            // Lean towards what's on TV now and the titles you've looked up before.
+            ArrayList<String> likely = new ArrayList<>();
+            for (Result r : recentTitles()) likely.add(r.title);
             if (popular != null) for (SearchBrain.Shelf sh : popular) for (Result r : sh.items) likely.add(r.title);
-            if (likely.size() > 60) likely = new java.util.ArrayList<>(likely.subList(0, 60));
+            if (likely.size() > 60) likely = new ArrayList<>(likely.subList(0, 60));
             i.putStringArrayListExtra(RecognizerIntent.EXTRA_BIASING_STRINGS, likely);
         }
-        mic.requestFocus();
-        setListening(true, "Listening…");
+        setListening(true);
         recognizer.startListening(i);
     }
 
     void stopListening() {
         ui.removeCallbacks(quietStop);
         ui.removeCallbacks(maxStop);
+        ending = false;
         if (recognizer != null && listening) recognizer.cancel();
-        setListening(false, null);
+        if (listening) {
+            setListening(false);
+            unsay();
+        }
+    }
+
+    /** Listening ended without a search: the field goes back to what it said before. */
+    void unsay() {
+        if (heard) showText(before);
+        heard = false;
     }
 
     /** When the remote's mic button was pressed (uptime ms), 0 when Search was opened another way. */
@@ -626,14 +779,13 @@ public class SearchActivity extends Activity {
     static final long MIC_SETTLE = 150;
 
     void listenSoon() {
-        long wait = pressedAt == 0 ? 0 : pressedAt + MIC_SETTLE - android.os.SystemClock.uptimeMillis();
+        long wait = pressedAt == 0 ? 0 : pressedAt + MIC_SETTLE - SystemClock.uptimeMillis();
         pressedAt = 0;
         if (wait <= 0) {
             startListening();
             return;
         }
-        mic.requestFocus();
-        setListening(true, "Listening\u2026");
+        setListening(true);
         ui.removeCallbacks(listenRun);
         ui.postDelayed(listenRun, wait);
     }
@@ -669,7 +821,7 @@ public class SearchActivity extends Activity {
         });
         return true;
     }
-    static java.lang.ref.WeakReference<SearchActivity> live = new java.lang.ref.WeakReference<>(null);
+    static WeakReference<SearchActivity> live = new WeakReference<>(null);
 
     /** The mic button was let go: stop listening and search what was said so far. */
     static void released() {
@@ -678,69 +830,180 @@ public class SearchActivity extends Activity {
     }
 
     void finishSpeech() {
-        if (recognizer != null && listening) {
-            recognizer.stopListening();  // ends the audio; the recogniser then delivers its results
-            setStatus("Searching\u2026");
-        }
+        // Ends the audio; the recogniser then delivers its results.
+        if (recognizer != null && listening) recognizer.stopListening();
     }
+
+    /** Asking for the microphone: the system's question opens over Search, which isn't being left. */
+    boolean asking;
 
     @Override
     public void onRequestPermissionsResult(int req, String[] perms, int[] res) {
+        asking = false;
         if (req == REQ_MIC && res.length > 0 && res[0] == PackageManager.PERMISSION_GRANTED) startListening();
         else if (req == REQ_MIC) setStatus("You can still type to search.");
     }
 
-    void setListening(boolean on, String msg) {
-        if (listening != on) {
-            listening = on;
-            mic.animateListening(on);
-            animateBar(on ? 1f : 0f);
+    void setListening(boolean on) {
+        if (listening == on) return;
+        listening = on;
+        if (on) {
+            heard = false;
+            before = field.getText().toString();
         }
-        if (msg != null) setStatus(msg);
+        animateBar(on ? 1f : 0f);
+        fieldChanged();
     }
 
-    /** Status line crossfades instead of jumping. */
-    void setStatus(String text) {
-        if (text.contentEquals(status.getText())) return;
-        status.animate().cancel();
-        status.animate().alpha(0f).setDuration(120).setInterpolator(MainActivity.EASE).withEndAction(() -> {
-            status.setText(text);
-            status.animate().alpha(1f).setDuration(220).setInterpolator(MainActivity.EASE).start();
-        }).start();
+    // ---------------------------------------------------------------- the field
+
+    static final int HINT_COLOUR = 0x4DFFFFFF;
+    /** Words put in the field by Search itself (dictation, a suggestion): not a search of their own. */
+    boolean quiet;
+    ValueAnimator hintAnim;
+    final Runnable hintBack = () -> showHint(HINT);
+
+    /** Puts words in the field without searching them. */
+    void showText(String s) {
+        quiet = true;
+        field.setText(s);
+        field.setSelection(field.length());
+        quiet = false;
+    }
+
+    /** Puts words in the field and searches them now, without the typing wait. */
+    void setQuery(String s) {
+        showText(s);
+        ui.removeCallbacks(debounced);
+        search(s.trim());
     }
 
     /**
-     * Liquid Glass search field: a translucent body brighter at the top and a specular rim; while
-     * listening it brightens slightly all over (barBody) and the rim lifts.
+     * A message (nothing heard, no microphone) shows in the empty field in place of its hint for
+     * three seconds, as tvOS shows nothing under the field. With words in the field, it isn't shown.
      */
-    android.graphics.drawable.LayerDrawable glassBar() {
-        float r = u(24);  // half the field's height: a true capsule, as on tvOS
-        // Subtle, as the App Store's tab bar: a faint capsule with a hairline edge.
-        GradientDrawable body = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
-                new int[]{0x1CFFFFFF, 0x0FFFFFFF, 0x14FFFFFF});
-        body.setCornerRadius(r);
-        GradientDrawable sheen = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
+    void setStatus(String text) {
+        ui.removeCallbacks(hintBack);
+        showHint(text.isEmpty() ? HINT : text);
+        if (!text.isEmpty()) ui.postDelayed(hintBack, 3000);
+    }
+
+    /** The hint crossfades instead of jumping. */
+    void showHint(String text) {
+        if (text.contentEquals(field.getHint())) return;
+        if (hintAnim != null) hintAnim.cancel();
+        int full = Color.alpha(HINT_COLOUR);
+        hintAnim = ValueAnimator.ofFloat(1f, 0f);
+        hintAnim.setDuration(120);
+        hintAnim.setInterpolator(MainActivity.EASE);
+        hintAnim.addUpdateListener(a -> field.setHintTextColor(Color.argb(Math.round(full * (float) a.getAnimatedValue()), 255, 255, 255)));
+        hintAnim.addListener(new android.animation.AnimatorListenerAdapter() {
+            boolean cancelled;
+            @Override public void onAnimationCancel(android.animation.Animator a) {
+                cancelled = true;
+            }
+            @Override public void onAnimationEnd(android.animation.Animator a) {
+                if (cancelled) return;
+                field.setHint(text);
+                hintAnim = ValueAnimator.ofFloat(0f, 1f);
+                hintAnim.setDuration(220);
+                hintAnim.setInterpolator(MainActivity.EASE);
+                hintAnim.addUpdateListener(b -> field.setHintTextColor(Color.argb(Math.round(full * (float) b.getAnimatedValue()), 255, 255, 255)));
+                hintAnim.start();
+            }
+        });
+        hintAnim.start();
+    }
+
+    /** The dictation hint shows only on an empty field when not listening; suggestions only with words in it. */
+    void fieldChanged() {
+        boolean empty = field.length() == 0;
+        float to = empty && !listening ? 1f : 0f;
+        if (dictate.getAlpha() != to) dictate.animate().alpha(to).setDuration(150).setInterpolator(MainActivity.EASE).start();
+        if (empty) setHints(Collections.emptyList());
+    }
+
+    /** "Hold [mic] to dictate": the mic in a small grey disc, in the hint's grey. */
+    TextView dictateHint() {
+        TextView t = new TextView(this);
+        int d = u(19);
+        BitmapDrawable mic = new BitmapDrawable(getResources(), micDisc(d));
+        mic.setBounds(0, 0, d, d);
+        SpannableStringBuilder sb = new SpannableStringBuilder("Hold \u00a0 to dictate");
+        sb.setSpan(new ImageSpan(mic, android.os.Build.VERSION.SDK_INT >= 29 ? DynamicDrawableSpan.ALIGN_CENTER
+                : DynamicDrawableSpan.ALIGN_BASELINE), 5, 6, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        t.setText(sb);
+        t.setTextColor(HINT_COLOUR);
+        t.setTypeface(Ui.font(this, "semibold"));
+        Ui.textSize(t, 17);
+        return t;
+    }
+
+    /** A grey disc with a dark microphone in it (the remote's mic button, as tvOS draws it). */
+    static Bitmap micDisc(int s) {
+        Bitmap b = Bitmap.createBitmap(s, s, Bitmap.Config.ARGB_8888);
+        Canvas c = new Canvas(b);
+        Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+        float cx = s / 2f, base = s / 2f;
+        p.setColor(0x80FFFFFF);
+        c.drawCircle(cx, cx, base, p);
+        p.setColor(0xFF1C1C1E);
+        float w = base * 0.36f, h = base * 0.66f, top = cx - base * 0.56f;
+        RectF rect = new RectF(cx - w / 2, top, cx + w / 2, top + h);
+        c.drawRoundRect(rect, w / 2, w / 2, p);
+        p.setStyle(Paint.Style.STROKE);
+        p.setStrokeWidth(base * 0.11f);
+        p.setStrokeCap(Paint.Cap.ROUND);
+        float r = base * 0.34f;
+        rect.set(cx - r, top + h - r * 1.35f, cx + r, top + h + r * 0.65f);
+        c.drawArc(rect, 0, 180, false, p);
+        c.drawLine(cx, top + h + r * 0.65f, cx, cx + base * 0.58f, p);
+        return b;
+    }
+
+    /** The field with focus (OK opens the TV's own keyboard): its glass capsule shows faintly. */
+    void focusField(boolean f) {
+        if (fieldAnim != null) fieldAnim.cancel();
+        fieldAnim = ValueAnimator.ofFloat(fieldFocus, f ? 1f : 0f);
+        fieldAnim.setDuration(f ? 75 : 150);
+        fieldAnim.addUpdateListener(a -> {
+            fieldFocus = (float) a.getAnimatedValue();
+            paintBar();
+        });
+        fieldAnim.start();
+    }
+
+    /**
+     * The field's Liquid Glass capsule. At rest there's none, as on tvOS 26 (just the magnifier and
+     * the words); it appears while listening, with Siri's light flowing round it, and faintly while
+     * the field itself has focus.
+     */
+    LayerDrawable glassBar(int h) {
+        float r = h / 2f;  // half the field's height: a true capsule, as on tvOS
+        barBody = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
+                new int[]{0x30FFFFFF, 0x22FFFFFF, 0x2AFFFFFF});
+        barBody.setCornerRadius(r);
+        barSheen = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
                 new int[]{0x12FFFFFF, 0x00FFFFFF});
         // Only the top half: rounded on top with the bar's own radius, square below, so its
         // corners follow the bar's curve exactly instead of poking out.
-        sheen.setCornerRadii(new float[]{r, r, r, r, 0, 0, 0, 0});
-        barBody = new GradientDrawable();
-        barBody.setCornerRadius(r);
-        barBody.setColor(0x00FFFFFF);
-        barRim = new GradientDrawable();
-        barRim.setCornerRadius(r);
-        barRim.setColor(0);
-        barRim.setStroke(Math.max(1, u(0.6f)), 0x2EFFFFFF);
+        barSheen.setCornerRadii(new float[]{r, r, r, r, 0, 0, 0, 0});
         glow = new ListenGlow();
-        android.graphics.drawable.LayerDrawable l = new android.graphics.drawable.LayerDrawable(
-                new Drawable[]{body, barBody, sheen, barRim, glow});
-        l.setLayerInsetBottom(2, u(24));
+        LayerDrawable l = new LayerDrawable(new Drawable[]{barBody, barSheen, glow});
+        l.setLayerInsetBottom(1, h / 2);
+        paintBar();
         return l;
     }
 
-    GradientDrawable barBody;
+    GradientDrawable barBody, barSheen;
     ListenGlow glow;
     android.animation.ValueAnimator glowFlow;
+
+    void paintBar() {
+        int a = Math.round(255 * Math.max(barGlow, fieldFocus * 0.6f));
+        barBody.setAlpha(a);
+        barSheen.setAlpha(a);
+    }
 
     /** Cool blues and violets, as Siri's light on tvOS (never red). */
     static final int[] GLOW = {0xFF64D2FF, 0xFF7D7AFF, 0xFFBF5AF2, 0xFF7D7AFF, 0xFF64D2FF};
@@ -759,13 +1022,15 @@ public class SearchActivity extends Activity {
         android.graphics.LinearGradient shader;
         int shaderW;
         float level, flow;
+        /** The rim's line and each halo ring's width, worked out once rather than every frame. */
+        final float line = u(1.5f), step = u(1.1f);
 
         ListenGlow() {
             p.setStyle(Paint.Style.STROKE);
         }
 
         /** A stroke centred `out` outside the field's edge (inside when negative), on its exact curve. */
-        void ring(Canvas c, android.graphics.Rect b, float width, float out, int alpha) {
+        void ring(Canvas c, Rect b, float width, float out, int alpha) {
             float half = b.height() / 2f;
             p.setStrokeWidth(width);
             p.setAlpha(alpha);
@@ -776,7 +1041,7 @@ public class SearchActivity extends Activity {
 
         @Override public void draw(Canvas c) {
             if (level <= 0.002f) return;
-            android.graphics.Rect b = getBounds();
+            Rect b = getBounds();
             if (shader == null || shaderW != b.width()) {
                 shaderW = b.width();
                 shader = new android.graphics.LinearGradient(0, 0, shaderW * 0.55f, 0, GLOW, null,
@@ -785,9 +1050,8 @@ public class SearchActivity extends Activity {
             m.setTranslate(flow * shaderW * 1.1f, 0);
             shader.setLocalMatrix(m);
             p.setShader(shader);
-            // Light, not a shadow: three soft rings fading outwards, then the line on the rim itself
-            // (just inside it, following the capsule's curve exactly).
-            float line = u(1.5f), step = u(1.1f);
+            // Light, not a shadow: soft rings (HALO of them) fading outwards, then the line on the
+            // rim itself (just inside it, following the capsule's curve exactly).
             for (int k = HALO - 1; k >= 0; k--) {
                 float fall = 1f - k / (float) HALO;
                 ring(c, b, step, step * (k + 0.5f), Math.round(74 * level * fall * fall));
@@ -808,27 +1072,30 @@ public class SearchActivity extends Activity {
             glowFlow = android.animation.ValueAnimator.ofFloat(0f, 1f);
             glowFlow.setDuration(5200);
             glowFlow.setRepeatCount(android.animation.ValueAnimator.INFINITE);
-            glowFlow.setInterpolator(new android.view.animation.LinearInterpolator());
+            glowFlow.setInterpolator(new LinearInterpolator());
             glowFlow.addUpdateListener(a -> {
                 glow.flow = (float) a.getAnimatedValue();
                 glow.invalidateSelf();
             });
             glowFlow.start();
         }
+        // Words heard when the light starts going stay in place while it fades, even once listening
+        // is cancelled and the field gets its old words back: the waveform doesn't return over them.
+        boolean words = heard;
         barAnim = android.animation.ValueAnimator.ofFloat(barGlow, to);
         barAnim.setDuration(420);
         barAnim.setInterpolator(MainActivity.EASE);
-        android.animation.ArgbEvaluator ev = new android.animation.ArgbEvaluator();
         barAnim.addUpdateListener(a -> {
             barGlow = (float) a.getAnimatedValue();
-            // The glass rim gives way to the coloured light, so there's one clean edge.
-            barRim.setStroke(Math.max(1, u(0.6f)), (int) ev.evaluate(barGlow, 0x2EFFFFFF, 0x00FFFFFF));
+            // The capsule and its light come in together; the words give way to the waveform
+            // until the first words are heard, which then show in the field.
+            boolean h = heard || words;
             if (wave != null) {
-                wave.setAlpha(barGlow);
+                wave.setAlpha(h ? 0f : barGlow);
                 if (barGlow > 0f) wave.postInvalidateOnAnimation();
             }
-            field.setAlpha(1f - barGlow);
-            barBody.setColor((int) ev.evaluate(barGlow, 0x00FFFFFF, 0x1AFFFFFF));
+            field.setAlpha(h ? 1f : 1f - barGlow);
+            paintBar();
             glow.level = barGlow;
             glow.invalidateSelf();
         });
@@ -845,36 +1112,33 @@ public class SearchActivity extends Activity {
     /**
      * A tvOS-style dictation waveform across the field: thin rounded bars that rise and fall with
      * your voice. It moves gently on its own while listening (this TV's speech service doesn't
-     * always report loudness), louder when it hears you, and each recognised word gives it a lift.
+     * always report loudness), and louder when it hears you.
      */
     final class WaveView extends View {
         final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
         final android.graphics.Matrix m = new android.graphics.Matrix();
         android.graphics.LinearGradient shader;
         float[] h = new float[0];
-        float level, shown, kick, t;
+        float level, shown, t;
         long last;
+        /** A bar's width, worked out once rather than every frame. */
+        final float bw = Math.max(2f, u(2.2f));
 
         WaveView() {
             super(SearchActivity.this);
-        }
-
-        void kick() {
-            kick = 1f;
         }
 
         @Override protected void onDraw(Canvas c) {
             float w = getWidth(), ht = getHeight();
             if (w <= 0) return;
             // Timed by the clock, not by frames: the same pace however busy the TV is.
-            long now = android.os.SystemClock.uptimeMillis();
+            long now = SystemClock.uptimeMillis();
             float dt = last == 0 || now - last > 200 ? 1 / 60f : (now - last) / 1000f;
             last = now;
             t += dt;
-            kick *= (float) Math.pow(0.03, dt);              // a word's lift fades in about a second
             shown += (level - shown) * Math.min(1f, dt * 9f);
-            float energy = Math.min(1f, 0.16f + shown * 0.95f + kick * 0.45f);
-            float bw = Math.max(2f, u(2.2f)), gap = bw * 1.7f, span = w * 0.86f;
+            float energy = Math.min(1f, 0.16f + shown * 0.95f);
+            float gap = bw * 1.7f, span = w * 0.86f;
             int n = Math.max(8, (int) ((span + gap) / (bw + gap)));
             if (h.length != n) h = new float[n];
             float x0 = (w - (n * bw + (n - 1) * gap)) / 2f;
@@ -905,76 +1169,533 @@ public class SearchActivity extends Activity {
         }
     }
 
+    // ---------------------------------------------------------------- keyboard
+
+    /** The keyboard has slid away (focus is in the results). */
+    boolean slid;
+
     /**
-     * The round mic button: focus and listening ease its colours in with Apple's curve. It never
-     * grows past its own bounds, so nothing overlaps the field's edge.
+     * Focus into the results: the keyboard slides off to the left and the results over to fill the
+     * screen, as the Apple TV app's do (560 ms; translations only, so nothing is laid out again).
+     * Back out, they slide back. Away, the keyboard can't be found by the arrows, only by Left
+     * from the start of a row (showKeys).
      */
-    final class MicView extends View {
-        final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
-        final android.animation.ArgbEvaluator ev = new android.animation.ArgbEvaluator();
-        final RectF rect = new RectF();
-        float focusT, listenT;
-        android.animation.ValueAnimator focusAnim, listenAnim;
+    void slide(boolean away) {
+        if (slid == away) return;
+        slid = away;
+        keys.setFocusable(!away);
+        keys.animate().translationX(away ? -KEYS_W : 0).setDuration(560).setInterpolator(SLIDE).start();
+        results.animate().translationX(away ? 0 : KEYS_W).setDuration(560).setInterpolator(SLIDE).start();
+    }
 
-        MicView() {
-            super(SearchActivity.this);
-        }
+    /** To the keyboard, on the key last used. */
+    void showKeys() {
+        keys.setFocusable(true);
+        keys.requestFocus();
+    }
 
-        void animateFocus(boolean on) {
-            if (focusAnim != null) focusAnim.cancel();
-            focusAnim = android.animation.ValueAnimator.ofFloat(focusT, on ? 1f : 0f);
-            focusAnim.setDuration(on ? 300 : 220);
-            focusAnim.setInterpolator(MainActivity.EASE);
-            focusAnim.addUpdateListener(a -> {
-                focusT = (float) a.getAnimatedValue();
-                invalidate();
-            });
-            focusAnim.start();
-        }
+    /** Right from the keyboard: the suggestions beside its top rows, else the results. */
+    void rightOfKeys(int row) {
+        boolean pills = hintRow.getVisibility() == View.VISIBLE && hints.getChildCount() > 0;
+        View to = pills && row <= 1 ? hints.getChildAt(0) : entry();
+        if (to == null && pills) to = hints.getChildAt(0);
+        if (to != null) to.requestFocus();
+    }
 
-        void animateListening(boolean on) {
-            if (listenAnim != null) listenAnim.cancel();
-            listenAnim = android.animation.ValueAnimator.ofFloat(listenT, on ? 1f : 0f);
-            listenAnim.setDuration(380);
-            listenAnim.setInterpolator(MainActivity.EASE);
-            listenAnim.addUpdateListener(a -> {
-                listenT = (float) a.getAnimatedValue();
-                invalidate();
-            });
-            listenAnim.start();
-        }
+    /** The last result focused, to go back to from the keyboard. */
+    WeakReference<View> lastResult;
 
-        @Override
-        protected void onDraw(Canvas c) {
-            float cx = getWidth() / 2f, cy = getHeight() / 2f, max = Math.min(cx, cy);
-            float base = max * 0.76f;
-            int idle = 0x24FFFFFF;
-            int fill = (int) ev.evaluate(focusT, idle, Color.WHITE);
-            fill = (int) ev.evaluate(listenT, fill, 0xF2FFFFFF);
-            p.setStyle(Paint.Style.FILL);
-            p.setColor(fill);
-            c.drawCircle(cx, cy, base, p);
-            if (focusT < 1f && listenT < 1f) {  // glass rim on the resting button
-                p.setStyle(Paint.Style.STROKE);
-                p.setStrokeWidth(Math.max(1f, u(0.6f)));
-                p.setColor(Color.argb(Math.round(70 * (1f - Math.max(focusT, listenT))), 255, 255, 255));
-                c.drawCircle(cx, cy, base, p);
+    /** The result to move to from the keyboard: the last one you were on, else the first in view. */
+    View entry() {
+        View last = lastResult == null ? null : lastResult.get();
+        if (last != null && last.isAttachedToWindow() && isIn(last, grid)) return last;
+        Rect r = new Rect();
+        int top = scroll.getScrollY();
+        for (int i = 0; i < grid.getChildCount(); i++) {
+            View sec = grid.getChildAt(i);
+            if (!(sec instanceof ViewGroup) || sec.getBottom() <= top + u(40)) continue;
+            for (View f : sec.getFocusables(View.FOCUS_RIGHT)) {
+                f.getDrawingRect(r);
+                ((ViewGroup) sec).offsetDescendantRectToMyCoords(f, r);
+                if (r.left >= 0 && sec.getTop() + r.bottom > top) return f;
             }
-            int ink = (int) ev.evaluate(focusT, Color.WHITE, 0xFF111114);
-            ink = (int) ev.evaluate(listenT, ink, 0xFF111114);
-            p.setColor(ink);
-            p.setStyle(Paint.Style.FILL);
-            float w = base * 0.36f, h = base * 0.66f, top = cy - base * 0.56f;
-            rect.set(cx - w / 2, top, cx + w / 2, top + h);
-            c.drawRoundRect(rect, w / 2, w / 2, p);
-            p.setStyle(Paint.Style.STROKE);
-            p.setStrokeWidth(base * 0.11f);
-            p.setStrokeCap(Paint.Cap.ROUND);
-            float r = base * 0.34f;
-            rect.set(cx - r, top + h - r * 1.35f, cx + r, top + h + r * 0.65f);
-            c.drawArc(rect, 0, 180, false, p);
-            c.drawLine(cx, top + h + r * 0.65f, cx, cy + base * 0.58f, p);
         }
+        return null;
+    }
+
+    /**
+     * The Apple TV app's keyboard for a remote with arrow keys: six columns, a to z in order under a
+     * row choosing letters or numbers, then Space, Delete and Clear. One view that draws itself:
+     * the focused key is a white platter that glides from key to key (75 ms), fading away when the
+     * keyboard loses focus (150 ms) and back when it returns (75 ms). OK types; Delete repeats
+     * while held; the remote's number keys (and a real keyboard's letters) type too.
+     */
+    final class KeyGrid extends View {
+        final String[] abc = {"abcdef", "ghijkl", "mnopqr", "stuvwx", "yz"};
+        final String[] num = {"123456", "7890.,", "'&-:!?"};
+        static final int ROWS = 7;
+        /** The platter's corners are Apple's 20 px; the keys' own follow them, 6 px further in. */
+        final int pitch = u(36), key = u(32), grow = u(3), radius = u(10) - grow, pad = u(14), padBottom = u(26);
+        final int blur = u(12.5f), drop = u(10);
+        /** Pixels per design unit, looked up once rather than every frame it draws. */
+        final float unit = Ui.unit(SearchActivity.this);
+        final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG), ink = new Paint(Paint.ANTI_ALIAS_FLAG);
+        final Paint pic = new Paint(Paint.FILTER_BITMAP_FLAG);
+        final ArgbEvaluator ev = new ArgbEvaluator();
+        final Map<String, Bitmap> shadows = new HashMap<>();
+        final RectF cell = new RectF(), from = new RectF(), to = new RectF(), at = new RectF(), plate = new RectF();
+        final Path del = new Path();
+        final Paint.FontMetrics fm = new Paint.FontMetrics();
+        boolean digits;
+        /** The focused key (its row, and its place in that row), and the one before it. */
+        int row = 1, place, oldRow = -1, oldPlace;
+        /** The column up and down aim for, kept across short rows (z, then Delete, then z again). */
+        float want;
+        float move = 1f, shown, press;
+        ValueAnimator moveAnim, showAnim, pressAnim;
+
+        KeyGrid() {
+            super(SearchActivity.this);
+            setFocusable(true);
+            box(row, place, at);
+            from.set(at);
+            to.set(at);
+            ink.setTextAlign(Paint.Align.CENTER);
+        }
+
+        int wide() {
+            return 2 * pad + COLS * pitch - (pitch - key);
+        }
+
+        int tall() {
+            return pad + ROWS * pitch - (pitch - key) + padBottom;
+        }
+
+        String letters(int r) {
+            String[] set = digits ? num : abc;
+            return r - 1 < set.length ? set[r - 1] : "";
+        }
+
+        int keys(int r) {
+            return r == 0 ? 2 : r == ROWS - 1 ? 3 : letters(r).length();
+        }
+
+        /** Columns a key spans: the tabs three, Space, Delete and Clear two, letters one. */
+        int span(int r) {
+            return r == 0 ? 3 : r == ROWS - 1 ? 2 : 1;
+        }
+
+        void box(int r, int i, RectF out) {
+            float left = pad + i * span(r) * pitch, top = pad + r * pitch;
+            out.set(left, top, left + span(r) * pitch - (pitch - key), top + key);
+        }
+
+        float centre(int r, int i) {
+            return i * span(r) + span(r) / 2f - 0.5f;
+        }
+
+        /** The key in row r nearest the column wanted. */
+        int nearest(int r, float col) {
+            int best = 0;
+            for (int i = 1; i < keys(r); i++) if (Math.abs(centre(r, i) - col) < Math.abs(centre(r, best) - col)) best = i;
+            return best;
+        }
+
+        void go(int r, int i, boolean across) {
+            oldRow = row;
+            oldPlace = place;
+            from.set(at);
+            row = r;
+            place = i;
+            if (across) want = centre(r, i);
+            box(r, i, to);
+            if (moveAnim != null) moveAnim.cancel();
+            moveAnim = ValueAnimator.ofFloat(0f, 1f);
+            moveAnim.setDuration(75);
+            moveAnim.setInterpolator(FOCUS_OUT);
+            moveAnim.addUpdateListener(a -> {
+                move = (float) a.getAnimatedValue();
+                at.set(from.left + (to.left - from.left) * move, from.top + (to.top - from.top) * move,
+                        from.right + (to.right - from.right) * move, from.bottom + (to.bottom - from.bottom) * move);
+                invalidate();
+            });
+            moveAnim.start();
+        }
+
+        @Override protected void onFocusChanged(boolean f, int dir, Rect prev) {
+            super.onFocusChanged(f, dir, prev);
+            if (showAnim != null) showAnim.cancel();
+            showAnim = ValueAnimator.ofFloat(shown, f ? 1f : 0f);
+            showAnim.setDuration(f ? 75 : 150);
+            showAnim.setInterpolator(f ? FOCUS_IN : FOCUS_OUT);
+            showAnim.addUpdateListener(a -> {
+                shown = (float) a.getAnimatedValue();
+                invalidate();
+            });
+            showAnim.start();
+        }
+
+        /** A press sinks the platter halfway towards the key (80 ms), and it comes back on release. */
+        void pressed(boolean down) {
+            if (pressAnim != null) pressAnim.cancel();
+            pressAnim = ValueAnimator.ofFloat(press, down ? 1f : 0f);
+            pressAnim.setDuration(80);
+            pressAnim.setInterpolator(down ? FOCUS_OUT : FOCUS_IN);
+            pressAnim.addUpdateListener(a -> {
+                press = (float) a.getAnimatedValue();
+                invalidate();
+            });
+            pressAnim.start();
+        }
+
+        @Override public boolean onKeyDown(int k, KeyEvent e) {
+            switch (k) {
+                case KeyEvent.KEYCODE_DPAD_LEFT:
+                    if (place > 0) go(row, place - 1, true);
+                    return true;
+                case KeyEvent.KEYCODE_DPAD_RIGHT:
+                    if (place + 1 < keys(row)) go(row, place + 1, true);
+                    else rightOfKeys(row);
+                    return true;
+                case KeyEvent.KEYCODE_DPAD_UP: {
+                    int r = row - 1;
+                    while (r >= 0 && keys(r) == 0) r--;
+                    if (r < 0) field.requestFocus();
+                    else go(r, nearest(r, want), false);
+                    return true;
+                }
+                case KeyEvent.KEYCODE_DPAD_DOWN: {
+                    int r = row + 1;
+                    while (r < ROWS && keys(r) == 0) r++;
+                    if (r < ROWS) go(r, nearest(r, want), false);
+                    return true;
+                }
+                case KeyEvent.KEYCODE_DPAD_CENTER:
+                case KeyEvent.KEYCODE_ENTER:
+                case KeyEvent.KEYCODE_NUMPAD_ENTER:
+                    if (e.getRepeatCount() == 0) {
+                        pressed(true);
+                        type();
+                    } else if (row == ROWS - 1 && place == 1) {
+                        erase();  // Delete repeats while held
+                    }
+                    return true;
+                case KeyEvent.KEYCODE_DEL:
+                    erase();
+                    return true;
+                case KeyEvent.KEYCODE_SPACE:
+                    space();
+                    return true;
+                default:
+                    int ch = e.getUnicodeChar();
+                    if (ch > 0 && Character.isLetterOrDigit(ch)) {
+                        add(Character.toLowerCase((char) ch));
+                        return true;
+                    }
+                    return super.onKeyDown(k, e);
+            }
+        }
+
+        @Override public boolean onKeyUp(int k, KeyEvent e) {
+            if (k == KeyEvent.KEYCODE_DPAD_CENTER || k == KeyEvent.KEYCODE_ENTER || k == KeyEvent.KEYCODE_NUMPAD_ENTER) {
+                pressed(false);
+                return true;
+            }
+            return super.onKeyUp(k, e);
+        }
+
+        void type() {
+            if (row == 0) {
+                boolean d = place == 1;
+                if (d != digits) {
+                    digits = d;
+                    invalidate();
+                }
+            } else if (row == ROWS - 1) {
+                if (place == 0) space();
+                else if (place == 1) erase();
+                else field.getText().clear();
+            } else {
+                add(letters(row).charAt(place));
+            }
+        }
+
+        void add(char c) {
+            field.getText().append(c);
+            field.setSelection(field.length());
+        }
+
+        void space() {
+            Editable t = field.getText();
+            if (t.length() > 0 && t.charAt(t.length() - 1) != ' ') add(' ');
+        }
+
+        void erase() {
+            Editable t = field.getText();
+            if (t.length() > 0) t.delete(t.length() - 1, t.length());
+        }
+
+        /** The platter's soft shadow (Apple's: 20 px down, blurred 25, black at 30%), made once per size. */
+        Bitmap shadow(int w, int h) {
+            String k = w + "x" + h;
+            Bitmap b = shadows.get(k);
+            if (b == null) {
+                b = Bitmap.createBitmap(w + 2 * blur, h + 2 * blur + drop, Bitmap.Config.ARGB_8888);
+                Canvas c = new Canvas(b);
+                Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+                p.setColor(Color.BLACK);
+                p.setShadowLayer(blur, 0, drop, 0x4D000000);
+                RectF r = new RectF(blur, blur, blur + w, blur + h);
+                c.drawRoundRect(r, radius + grow, radius + grow, p);
+                p.clearShadowLayer();
+                p.setXfermode(new android.graphics.PorterDuffXfermode(android.graphics.PorterDuff.Mode.CLEAR));
+                c.drawRoundRect(r, radius + grow, radius + grow, p);
+                shadows.put(k, b);
+            }
+            return b;
+        }
+
+        /** How focused key (r, i) looks now: 1 for the one the platter is on, fading between keys. */
+        float lit(int r, int i) {
+            if (r == row && i == place) return shown * move;
+            if (r == oldRow && i == oldPlace) return shown * (1f - move);
+            return 0f;
+        }
+
+        @Override protected void onDraw(Canvas c) {
+            // The chosen set's tab, and Space, Delete and Clear, are grey caps.
+            fill.setColor(0x26FFFFFF);
+            box(0, digits ? 1 : 0, cell);
+            c.drawRoundRect(cell, radius, radius, fill);
+            fill.setColor(0x1AFFFFFF);
+            for (int i = 0; i < 3; i++) {
+                box(ROWS - 1, i, cell);
+                c.drawRoundRect(cell, radius, radius, fill);
+            }
+            // The focus platter, under the glyphs.
+            if (shown > 0f) {
+                float g = grow * (1f - 0.5f * press);
+                plate.set(at.left - g, at.top - g, at.right + g, at.bottom + g);
+                pic.setAlpha(Math.round(255 * shown));
+                Bitmap sh = shadow(Math.round(to.width() + 2 * grow), Math.round(to.height() + 2 * grow));
+                cell.set(plate.left - blur, plate.top - blur, plate.right + blur, plate.bottom + blur + drop);
+                c.drawBitmap(sh, null, cell, pic);
+                fill.setColor(Color.WHITE);
+                fill.setAlpha(Math.round(255 * shown));
+                c.drawRoundRect(plate, radius + g, radius + g, fill);
+            }
+            // Letters or numbers and symbols.
+            ink.setTypeface(Ui.font(SearchActivity.this, "regular"));
+            ink.setTextSize(22.5f * unit);
+            for (int r = 1; r < ROWS - 1; r++) {
+                String l = letters(r);
+                for (int i = 0; i < l.length(); i++) glyph(c, r, i, l, i, i + 1, 0xA6FFFFFF);
+            }
+            // The tabs: the chosen set white, the other grey.
+            ink.setTypeface(Ui.font(SearchActivity.this, "semibold"));
+            ink.setTextSize(14.5f * unit);
+            glyph(c, 0, 0, "abc", digits ? 0x80FFFFFF : Color.WHITE);
+            glyph(c, 0, 1, "123", digits ? Color.WHITE : 0x80FFFFFF);
+            ink.setTypeface(Ui.font(SearchActivity.this, "medium"));
+            ink.setTextSize(12.5f * unit);
+            glyph(c, ROWS - 1, 0, "Space", 0xD9FFFFFF);
+            glyph(c, ROWS - 1, 2, "Clear", 0xD9FFFFFF);
+            deleteKey(c);
+        }
+
+        void glyph(Canvas c, int r, int i, String s, int colour) {
+            glyph(c, r, i, s, 0, s.length(), colour);
+        }
+
+        void glyph(Canvas c, int r, int i, String s, int from, int to, int colour) {
+            box(r, i, cell);
+            ink.setColor(colourOf(r, i, colour));
+            ink.getFontMetrics(fm);
+            c.drawText(s, from, to, cell.centerX(), cell.centerY() - (fm.ascent + fm.descent) / 2f, ink);
+        }
+
+        /** A key's glyph colour: its own, turning dark as the platter comes onto it. */
+        int colourOf(int r, int i, int colour) {
+            float l = lit(r, i);
+            return l <= 0f ? colour : (int) ev.evaluate(l, colour, 0xFF111114);
+        }
+
+        /** ⌫: a tag pointing left with a cross in it. */
+        void deleteKey(Canvas c) {
+            box(ROWS - 1, 1, cell);
+            float h = 11f * unit, w = 16f * unit, l = cell.centerX() - w / 2, t = cell.centerY() - h / 2, tip = h * 0.45f;
+            del.rewind();
+            del.moveTo(l, t + h / 2);
+            del.lineTo(l + tip, t);
+            del.lineTo(l + w, t);
+            del.lineTo(l + w, t + h);
+            del.lineTo(l + tip, t + h);
+            del.close();
+            ink.setColor(colourOf(ROWS - 1, 1, 0xD9FFFFFF));
+            ink.setStyle(Paint.Style.STROKE);
+            ink.setStrokeWidth(1.4f * unit);
+            ink.setStrokeJoin(Paint.Join.ROUND);
+            ink.setStrokeCap(Paint.Cap.ROUND);
+            c.drawPath(del, ink);
+            float x = l + tip + (w - tip) / 2f, y = t + h / 2f, d = h * 0.2f;
+            c.drawLine(x - d, y - d, x + d, y + d, ink);
+            c.drawLine(x - d, y + d, x + d, y - d, ink);
+            ink.setStyle(Paint.Style.FILL);
+        }
+    }
+
+    // ---------------------------------------------------------------- suggestions
+
+    /** The suggestions showing, and what was typed when they were made. */
+    List<String> hinted = new ArrayList<>();
+    String hintedFor = "";
+
+    /**
+     * Up to five suggestions in one row directly under the field, as the Apple TV app shows them:
+     * the titles that match what's typed and, for a name, the person. Made from answers already
+     * here, so they cost no requests.
+     */
+    void suggestFrom(List<SearchBrain.Shelf> shelves) {
+        List<String> next = new ArrayList<>();
+        boolean titles = false;
+        for (SearchBrain.Shelf sh : shelves) {
+            if (sh.person != null) {
+                hint(next, sh.person);
+                continue;
+            }
+            if (titles || isApps(sh)) continue;
+            titles = true;
+            for (Result r : sh.items) if (SearchBrain.matchScore(lastQuery, r.title) >= 85) hint(next, r.title);
+        }
+        if (next.size() > 5) next = new ArrayList<>(next.subList(0, 5));
+        setHints(next);
+    }
+
+    static void hint(List<String> l, String s) {
+        String low = s.toLowerCase(Locale.UK);
+        if (!l.contains(low)) l.add(low);
+    }
+
+    /** New suggestions crossfade in (150 ms out, 200 ms in); the row is there only while it has some. */
+    void setHints(List<String> next) {
+        if (next.equals(hinted) && lastQuery.equals(hintedFor)) return;
+        hinted = new ArrayList<>(next);
+        hintedFor = lastQuery;
+        hints.animate().cancel();
+        if (next.isEmpty() || field.length() == 0 || hintRow.getVisibility() != View.VISIBLE) {
+            fillHints(next);
+            hints.setAlpha(0f);
+            hints.animate().alpha(1f).setDuration(200).start();
+            return;
+        }
+        hints.animate().alpha(0f).setDuration(150).withEndAction(() -> {
+            fillHints(hinted);
+            hints.animate().alpha(1f).setDuration(200).start();
+        }).start();
+    }
+
+    void fillHints(List<String> next) {
+        View f = getCurrentFocus();
+        int at = f != null && f.getParent() == hints ? hints.indexOfChild(f) : -1;
+        hints.removeAllViews();
+        for (String s : next) {
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, u(32));
+            if (hints.getChildCount() > 0) lp.leftMargin = u(10);
+            hints.addView(pill(s), lp);
+        }
+        boolean show = !next.isEmpty() && field.length() > 0;
+        hintRow.setVisibility(show ? View.VISIBLE : View.GONE);
+        hintRow.scrollTo(0, 0);
+        // A suggestion chosen stays chosen as the row changes under it.
+        if (at >= 0) {
+            if (show) hints.getChildAt(Math.min(at, hints.getChildCount() - 1)).requestFocus();
+            else showKeys();
+        }
+    }
+
+    /** Text whose colour changes without the text being laid out again (the rest of a suggestion). */
+    static final class Ink extends CharacterStyle implements UpdateAppearance {
+        int colour;
+
+        Ink(int colour) {
+            this.colour = colour;
+        }
+
+        @Override public void updateDrawState(TextPaint tp) {
+            tp.setColor(colour);
+        }
+    }
+
+    /** One suggestion: a magnifier and the words, the part typed in white and the rest at half. */
+    View pill(String s) {
+        Glass white = new Glass(u(16), u(0.6f), Glass.REGULAR);
+        TextView t = new TextView(this);
+        String typed = lastQuery.toLowerCase(Locale.UK).trim();
+        int from = typed.isEmpty() ? -1 : s.indexOf(typed);
+        SpannableString sp = new SpannableString(s);
+        List<Ink> rest = new ArrayList<>();
+        if (from >= 0) {
+            if (from > 0) {
+                Ink k = new Ink(0x80FFFFFF);
+                rest.add(k);
+                sp.setSpan(k, 0, from, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            }
+            if (from + typed.length() < s.length()) {
+                Ink k = new Ink(0x80FFFFFF);
+                rest.add(k);
+                sp.setSpan(k, from + typed.length(), s.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            }
+        }
+        t.setText(sp);
+        t.setTextColor(Color.WHITE);
+        t.setTypeface(Ui.font(this, "medium"));
+        // Apple's: Headline text and a 40 px magnifier, at most 500 px wide.
+        Ui.textSize(t, 19);
+        t.setGravity(Gravity.CENTER);
+        t.setSingleLine(true);
+        t.setMaxWidth(u(250));
+        t.setEllipsize(TextUtils.TruncateAt.END);
+        t.setPadding(u(12), 0, u(16), 0);
+        int g = u(20);
+        BitmapDrawable glyph = new BitmapDrawable(getResources(), Glyphs.get("magnifier", g, Color.WHITE));
+        glyph.setBounds(0, 0, g, g);
+        t.setCompoundDrawables(glyph, null, null, null);
+        t.setCompoundDrawablePadding(u(6));
+        t.setBackground(white);
+        t.setFocusable(true);
+        // The words darken with the plate as it fades, not ahead of it.
+        ArgbEvaluator ev = new ArgbEvaluator();
+        white.tint = f -> {
+            int on = (int) ev.evaluate(f, Color.WHITE, 0xFF111114);
+            glyph.setTint(on);
+            for (Ink k : rest) k.colour = (int) ev.evaluate(f, 0x80FFFFFF, 0x99111114);
+            t.setTextColor(on);
+        };
+        t.setOnFocusChangeListener((v, has) -> {
+            Glass.focus(white, has, 75, 150, FOCUS_IN, FOCUS_OUT);
+            // Drawn afresh at each size (no layer): the text recolours every frame of the fade.
+            Glass.lift(v, has, 1.06f, u(4), 1f, false, 160, FOCUS_OUT);
+        });
+        t.setOnClickListener(v -> setQuery(s));
+        t.setOnKeyListener((v, k, e) -> {
+            if (e.getAction() != KeyEvent.ACTION_DOWN) return false;
+            if (k == KeyEvent.KEYCODE_DPAD_DOWN) {
+                View to = entry();
+                if (to != null) to.requestFocus();
+                return true;
+            }
+            if (k == KeyEvent.KEYCODE_DPAD_LEFT || k == KeyEvent.KEYCODE_DPAD_RIGHT) {
+                // Along the suggestions; past the first, the keyboard; past the last, nothing
+                // (not a poster somewhere below).
+                boolean left = k == KeyEvent.KEYCODE_DPAD_LEFT;
+                View next = v.focusSearch(left ? View.FOCUS_LEFT : View.FOCUS_RIGHT);
+                if (next != null && next.getParent() == hints) return false;
+                if (left) showKeys();
+                return true;
+            }
+            return false;
+        });
+        return t;
     }
 
     // ---------------------------------------------------------------- search
@@ -983,86 +1704,140 @@ public class SearchActivity extends Activity {
     String lastQuery = "";
 
     void search(String q) {
+        if (isDestroyed()) return;
         lastQuery = q;
         int gen = ++generation;
-        // Popular Now from the last visit, at once; it's refreshed quietly behind.
-        if (q.isEmpty() && popular != null) show(popular);
-        if (!listening) setStatus(q.isEmpty() ? "" : "Searching\u2026");
-        searches.execute(() -> {
+        if (running != null) running.cancel(true);
+        boolean tile = fromTile;
+        fromTile = false;
+        if (q.isEmpty()) {
+            land(gen);
+            return;
+        }
+        running = searches.submit(() -> {
             List<SearchBrain.Shelf> shelves = new ArrayList<>();
-            String err = null;
+            boolean failed = false;
             try {
-                if (q.isEmpty()) {
-                    List<Result> all = brain.popularNow(), films = new ArrayList<>(), series = new ArrayList<>();
-                    for (Result r : all) ("tv".equals(r.type) ? series : films).add(r);
-                    if (!series.isEmpty()) shelves.add(new SearchBrain.Shelf("Popular Series", series));
-                    if (!films.isEmpty()) shelves.add(new SearchBrain.Shelf("Popular Films", films));
-                } else {
-                    // The top results go up as soon as they're known; More Like This and the rest
-                    // slide in under them when they arrive.
-                    shelves.addAll(brain.answer(q, early -> {
-                        if (gen != generation) return;
-                        List<SearchBrain.Shelf> first = withApps(q, early);
-                        ui.post(() -> {
-                            if (gen != generation) return;
-                            if (!listening && !first.isEmpty()) setStatus("");
-                            show(first);
-                        });
-                        searches.execute(() -> posters(gen, first));
-                    }));
-                }
-            } catch (Exception e) {
-                err = "Can\u2019t connect. Check your internet connection.";
-            }
-            if (gen != generation) return;
-            if (!q.isEmpty()) shelves = withApps(q, shelves);
-            if (gen != generation) return;
-            boolean shownFromMemory = q.isEmpty() && popular != null;
-            if (q.isEmpty() && !shelves.isEmpty()) popular = shelves;
-            String msg = err;
-            List<SearchBrain.Shelf> all = shelves;
-            if (!shownFromMemory) {
-                ui.post(() -> {
+                // The top results go up as soon as they're known; related titles and the rest
+                // slide in after them when they arrive.
+                shelves.addAll(brain.answer(q, early -> {
                     if (gen != generation) return;
-                    if (msg != null && all.isEmpty()) setStatus(msg);
-                    else if (!listening) setStatus(all.isEmpty() ? "No results for \u201c" + q + "\u201d" : "");
-                    show(all);
-                });
+                    List<SearchBrain.Shelf> first = mine(q, early, tile);
+                    if (gen != generation) return;
+                    ui.post(() -> {
+                        if (gen == generation) show(first);
+                    });
+                    try {
+                        searches.execute(() -> posters(gen, first));
+                    } catch (Exception e) {
+                        // the page has closed
+                    }
+                }, () -> gen != generation));
+            } catch (Exception e) {
+                failed = true;
             }
+            if (gen != generation) return;
+            shelves = mine(q, shelves, tile);
+            if (gen != generation) return;
+            List<SearchBrain.Shelf> all = shelves;
+            boolean offline = failed && all.isEmpty();
+            ui.post(() -> {
+                if (gen == generation) show(all, offline);
+            });
             posters(gen, all);
         });
     }
 
-    /** The apps that match, placed among the shelves: first when one is what was asked for. */
-    List<SearchBrain.Shelf> withApps(String q, List<SearchBrain.Shelf> in) {
+    /**
+     * The page before a search: Recently Searched and Browse at once, with Popular from the last
+     * visit; Popular is fetched again only when it's half an hour old. Pictures wait until the page
+     * has arrived, and are only made for what's on screen.
+     */
+    void land(int gen) {
+        // Within a visit Popular stays as first shown (fetched again behind it, it's for the next
+        // visit), so coming back to this page changes nothing under you but Recently Searched.
+        List<SearchBrain.Shelf> kept = landed.isEmpty() ? popular : landed;
+        show(kept == null ? new ArrayList<>() : kept);
+        boolean fresh = kept != null && System.currentTimeMillis() - popularAt < POPULAR_MS;
+        running = searches.submit(() -> {
+            List<SearchBrain.Shelf> got = kept;
+            if (!fresh) {
+                try {
+                    got = popularShelves();
+                } catch (Exception e) {
+                    got = kept;  // offline: what we had
+                }
+                if (gen != generation) return;
+                if (got != null && !got.isEmpty() && got != kept) {
+                    popular = got;
+                    popularAt = System.currentTimeMillis();
+                }
+                if (kept == null && got != null) {
+                    List<SearchBrain.Shelf> first = got;
+                    ui.post(() -> {
+                        if (gen == generation) show(first);
+                    });
+                }
+            }
+            long wait = createdAt + 700 - SystemClock.uptimeMillis();
+            if (wait > 0) {
+                try {
+                    Thread.sleep(wait);
+                } catch (InterruptedException e) {
+                    return;
+                }
+            }
+            if (gen != generation) return;
+            // Popular fetched again behind the one shown from memory isn't on screen: no pictures for it.
+            List<SearchBrain.Shelf> shown = kept != null ? kept : got;
+            List<SearchBrain.Shelf> onScreen = new ArrayList<>();
+            onScreen.add(new SearchBrain.Shelf(RECENTLY, recentTitles()));
+            if (shown != null) onScreen.addAll(shown);
+            browseArt(gen, shown);
+            posters(gen, onScreen);
+        });
+    }
+
+    List<SearchBrain.Shelf> popularShelves() throws Exception {
+        List<SearchBrain.Shelf> shelves = new ArrayList<>();
+        List<Result> all = brain.popularNow(), films = new ArrayList<>(), series = new ArrayList<>();
+        for (Result r : all) ("tv".equals(r.type) ? series : films).add(r);
+        if (!series.isEmpty()) shelves.add(new SearchBrain.Shelf("Popular Series", series));
+        if (!films.isEmpty()) shelves.add(new SearchBrain.Shelf("Popular Films", films));
+        return shelves;
+    }
+
+    /**
+     * Your own: the apps that match, placed where they belong among the shelves. From a service's
+     * Browse tile (tile), its titles are what's wanted, not its app.
+     */
+    List<SearchBrain.Shelf> mine(String q, List<SearchBrain.Shelf> in, boolean tile) {
         List<SearchBrain.Shelf> shelves = SearchBrain.copy(in);
-        String text = SearchBrain.read(q).text, key = text.isEmpty() ? q : text;
+        SearchBrain.Query read = SearchBrain.read(q);
+        String key = read.text.isEmpty() ? q : read.text;
         List<Result> apps = matchApps(key);
         if (!apps.isEmpty()) {
             // "netflix", "bbc": the app is what's wanted; otherwise apps come last.
-            boolean exact = SearchBrain.matchScore(key, apps.get(0).title) >= 85;
+            boolean exact = !tile && SearchBrain.matchScore(key, apps.get(0).title) >= 85;
             shelves.add(exact ? 0 : shelves.size(), new SearchBrain.Shelf("Apps", apps));
         }
         return shelves;
     }
 
-    /** Posters fill in as they arrive, in order, each fading into its placeholder. */
-    void posters(int gen, List<SearchBrain.Shelf> shelves) {
-        for (SearchBrain.Shelf sh : shelves) {
-            for (Result r : sh.items) {
-                if (gen != generation) return;
-                if (r.appBanner != null || r.poster == null) continue;
-                Bitmap bm = Suggestions.image(this, r.poster, "", u(150));
-                if (bm == null || r.appBanner != null) continue;
-                r.appBanner = new android.graphics.drawable.BitmapDrawable(getResources(), bm);
-                ui.post(() -> {
-                    if (r.art == null) return;
-                    r.art.setImageDrawable(r.appBanner);
-                    r.art.setImageAlpha(0);
-                    android.animation.ObjectAnimator.ofInt(r.art, "imageAlpha", 0, 255).setDuration(260).start();
-                });
+    /** The TV's apps (name and how to open them), read once a visit. */
+    List<Object[]> apps;
+
+    synchronized List<Object[]> apps() {
+        if (apps == null) {
+            apps = new ArrayList<>();
+            PackageManager pm = getPackageManager();
+            Intent main = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LEANBACK_LAUNCHER);
+            for (ResolveInfo r : pm.queryIntentActivities(main, 0)) {
+                if (r.activityInfo.packageName.equals(getPackageName())) continue;
+                apps.add(new Object[]{String.valueOf(r.loadLabel(pm)), r});
             }
         }
+        return apps;
     }
 
     /** Installed apps whose name contains the query. */
@@ -1070,221 +1845,688 @@ public class SearchActivity extends Activity {
         List<Result> out = new ArrayList<>();
         PackageManager pm = getPackageManager();
         String lq = q.toLowerCase(Locale.UK);
-        Intent main = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LEANBACK_LAUNCHER);
-        for (ResolveInfo r : pm.queryIntentActivities(main, 0)) {
-            String label = String.valueOf(r.loadLabel(pm));
+        for (Object[] app : apps()) {
+            String label = (String) app[0];
             boolean hit = label.toLowerCase(Locale.UK).contains(lq) || SearchBrain.matchScore(q, label) >= 85;
-            if (!hit || r.activityInfo.packageName.equals(getPackageName())) continue;
+            if (!hit) continue;
+            ResolveInfo r = (ResolveInfo) app[1];
             Result a = new Result();
             a.title = label;
             a.type = "app";
-            a.appLaunch = pm.getLeanbackLaunchIntentForPackage(r.activityInfo.packageName);
+            a.appLaunch = Suggestions.launchIntent(this, r.activityInfo.packageName);
+            if (a.appLaunch == null) continue;
             a.appBanner = r.activityInfo.loadBanner(pm);
             if (a.appBanner == null) a.appBanner = r.loadIcon(pm);
-            if (a.appLaunch != null && out.size() < COLS) out.add(a);
+            out.add(a);
+            if (out.size() >= COLS) break;
         }
         return out;
     }
 
-    // ---------------------------------------------------------------- results grid
+    // ---------------------------------------------------------------- pictures
+
+    /**
+     * Posters ready to show, by address: handed to the graphics chip when made, and kept within
+     * 16 MB, so returning to a search or the page before one shows them at once.
+     */
+    static final android.util.LruCache<String, Bitmap> POSTERS = new android.util.LruCache<String, Bitmap>(16 << 20) {
+        @Override protected int sizeOf(String k, Bitmap b) {
+            return b.getWidth() * b.getHeight() * 4;
+        }
+    };
+    /** Each poster's frosted band (its bottom, blurred small), made before the poster went to the graphics chip. */
+    static final android.util.LruCache<String, Bitmap> BANDS = new android.util.LruCache<>(160);
+    static final Set<String> DECODING = ConcurrentHashMap.newKeySet();
+
+    /** A picture's views, waiting for it to arrive. */
+    static final class Slot {
+        final ImageView art;
+        final View cap;
+        final Sec sec;
+
+        Slot(ImageView art, View cap, Sec sec) {
+            this.art = art;
+            this.cap = cap;
+            this.sec = sec;
+        }
+    }
+
+    final Map<String, List<Slot>> waiting = new HashMap<>();
+
+    void await(String url, ImageView art, View cap, Sec s) {
+        if (url == null) return;
+        List<Slot> l = waiting.get(url);
+        if (l == null) waiting.put(url, l = new ArrayList<>());
+        l.add(new Slot(art, cap, s));
+    }
+
+    /** Posters fill in as they arrive, in order, each fading into its placeholder. */
+    void posters(int gen, List<SearchBrain.Shelf> shelves) {
+        for (SearchBrain.Shelf sh : shelves) {
+            for (Result r : sh.items) {
+                if (gen != generation) return;
+                String url = r.poster;
+                if (url == null || "app".equals(r.type) || POSTERS.get(url) != null || !DECODING.add(url)) continue;
+                try {
+                    Bitmap bm = Suggestions.image(this, url, "", u(150));
+                    if (bm == null) continue;
+                    // The band is made now: once the poster is on the graphics chip, it can't be read.
+                    Bitmap band = band(bm);
+                    Bitmap shown = Suggestions.onGpu(bm);
+                    POSTERS.put(url, shown);
+                    if (band != null) BANDS.put(url, band);
+                    ui.post(() -> fill(url, shown, band));
+                } finally {
+                    DECODING.remove(url);
+                }
+            }
+        }
+    }
+
+    /** The bottom 28% of a poster, blurred small: stretched, it's the frosted band under a focused title. */
+    static Bitmap band(Bitmap bm) {
+        int w = bm.getWidth(), h = bm.getHeight(), top = h * 72 / 100;
+        if (w < 8 || h - top < 4) return null;
+        Bitmap strip = Bitmap.createBitmap(bm, 0, top, w, h - top);
+        Bitmap b = Ui.blur(strip, Math.max(8, w / 10), Math.max(4, (h - top) / 10), 2, 2);
+        if (strip != bm) strip.recycle();
+        return b;
+    }
+
+    void fill(String url, Bitmap bm, Bitmap band) {
+        if (isDestroyed()) return;
+        List<Slot> l = waiting.remove(url);
+        if (l == null) return;
+        long now = SystemClock.uptimeMillis();
+        for (Slot s : l) {
+            s.art.setImageBitmap(bm);
+            if (s.cap != null) s.cap.setBackground(frost(band));
+            // In a shelf rising as one picture it's simply there: a fade would make the whole
+            // picture be drawn again every frame.
+            if (s.sec != null && s.sec.riseAt > 0 && now - s.sec.riseAt < 600) continue;
+            s.art.setImageAlpha(0);
+            ObjectAnimator a = ObjectAnimator.ofInt(s.art, "imageAlpha", 0, 255);
+            a.setDuration(240);
+            a.setInterpolator(new LinearInterpolator());
+            a.start();
+        }
+    }
+
+    /** The band behind a focused poster's caption: its art blurred (until it arrives, plain dark), dimmed for the words. */
+    Drawable frost(Bitmap band) {
+        Drawable base = band == null ? new ColorDrawable(0xE01C1C1E) : new BitmapDrawable(getResources(), band);
+        return new LayerDrawable(new Drawable[]{base, new ColorDrawable(0x59000000)});
+    }
+
+    // ---------------------------------------------------------------- results
 
     /** The shelves on screen now. */
     List<SearchBrain.Shelf> showing = new ArrayList<>();
 
-    static boolean same(SearchBrain.Shelf a, SearchBrain.Shelf b) {
-        if (!a.heading.equals(b.heading) || a.items.size() != b.items.size()) return false;
-        for (int k = 0; k < a.items.size(); k++) if (!a.items.get(k).title.equals(b.items.get(k).title)) return false;
+    /** A shelf on screen: its results and the views that show them. */
+    static final class Sec {
+        LinearLayout view;
+        TextView heading;
+        /** Recently Searched, with its compact cards. */
+        boolean recent;
+        /** A shelf that scrolls sideways, or (grid) rows of six. */
+        HorizontalScrollView hs;
+        LinearLayout row;
+        boolean grid;
+        final List<Result> items = new ArrayList<>();
+        int built, firstBuild, w, gap;
+        /** When its rise starts (uptime ms; 0 when it doesn't rise), and its stagger. */
+        long riseAt, riseDelay;
+        ObjectAnimator scroller;
+        int scrollTo = -1;
+    }
+
+    static boolean isApps(SearchBrain.Shelf sh) {
+        return !sh.items.isEmpty() && "app".equals(sh.items.get(0).type);
+    }
+
+    /** a shows everything b does, in the same order (and maybe more after it). */
+    static boolean startsWith(SearchBrain.Shelf a, SearchBrain.Shelf b) {
+        if (!a.heading.equals(b.heading) || a.items.size() < b.items.size()) return false;
+        for (int k = 0; k < b.items.size(); k++) {
+            Result x = a.items.get(k), y = b.items.get(k);
+            if (!x.title.equals(y.title) || !TextUtils.equals(x.year, y.year)) return false;
+        }
         return true;
     }
 
-    /** The new shelves hold every one showing, in the same order, and more: only those need adding. */
-    boolean grows(List<SearchBrain.Shelf> next) {
-        if (showing.isEmpty() || next.size() <= showing.size() || lastQuery.isEmpty()) return false;
-        int p = 0;
-        for (SearchBrain.Shelf sh : next) if (p < showing.size() && same(showing.get(p), sh)) p++;
-        return p == showing.size();
+    /** Results that arrive while the page is still arriving wait for it: after its first frame, until enterEnd (uptime ms). */
+    boolean entering;
+    long enterEnd;
+    /** The Popular shelves on the page before a search. */
+    List<SearchBrain.Shelf> landed = new ArrayList<>();
+    Runnable pendingShow;
+    /** Focus goes to the first result when they come (a spoken search, the TV keyboard's Search). */
+    boolean jump;
+    /** The search is a Browse tile's (Netflix): its titles come first, and its app goes last. */
+    boolean fromTile;
+    int rmsCount;
+    float noiseFloor;
+    View firstCard;
+
+    void show(List<SearchBrain.Shelf> shelves) {
+        show(shelves, false);
     }
 
     /**
-     * Results as tvOS shelves: a heading over a row that scrolls sideways. Top Results, More
-     * Like This and Apps for a search; Popular Films and Popular Series before one.
+     * Results as tvOS shelves: a heading over a row that scrolls sideways (a single shelf of
+     * results is a grid). Top Results, someone's work and Apps for a search;
+     * Recently Searched, Browse, Popular Series and Popular Films before one. Nothing found is
+     * said in their place (failed: it couldn't connect).
      */
-    boolean entering;
-    Runnable pendingShow;
-
-    void show(List<SearchBrain.Shelf> shelves) {
+    void show(List<SearchBrain.Shelf> data, boolean failed) {
+        if (isDestroyed()) return;
         ui.removeCallbacks(pendingShow);
-        if (entering && !shelves.isEmpty()) {
-            pendingShow = () -> show(shelves);
-            ui.postDelayed(pendingShow, Math.max(0, createdAt + 660 - android.os.SystemClock.uptimeMillis()));
+        long now = SystemClock.uptimeMillis();
+        if (entering && !data.isEmpty() && now < enterEnd) {
+            pendingShow = () -> show(data, failed);
+            ui.postDelayed(pendingShow, enterEnd - now);
             return;
         }
-        if (!lastQuery.isEmpty() && shelves.size() == showing.size() && !shelves.isEmpty()) {
-            boolean all = true;
-            for (int i = 0; i < shelves.size(); i++) all &= same(showing.get(i), shelves.get(i));
-            if (all) return;  // already showing exactly these
-        }
-        if (grows(shelves)) {
-            // More Like This arriving under Top Results: the shelves already there stay as they
-            // are (nothing jumps or blinks) and the new ones slide in where they belong.
-            int[] delay = {0};
-            int at = 0, p = 0;
-            List<Result> added = new ArrayList<>();
-            for (SearchBrain.Shelf sh : shelves) {
-                if (p < showing.size() && same(showing.get(p), sh)) {
-                    p++;
-                    at++;
-                    continue;
-                }
-                markDupes(sh);
-                shelf(sh.heading, sh.items, delay, at++);
-                added.addAll(sh.items);
-            }
-            showing = new ArrayList<>(shelves);
-            prepareAmbient(added);
+        if (lastQuery.isEmpty()) landed = data;
+        List<SearchBrain.Shelf> shelves = new ArrayList<>(lastQuery.isEmpty() ? landing(data) : data);
+        shelves.removeIf(sh -> sh.items.isEmpty());
+        if (!lastQuery.isEmpty()) suggestFrom(shelves);
+        if (extend(shelves)) {
+            jumpIn();
             return;
         }
+        boolean hadFocus = grid.hasFocus();
         showing = new ArrayList<>(shelves);
         grid.removeAllViews();
-        grid.setLayoutTransition(null);
+        waiting.clear();
+        tiles.clear();
         firstCard = null;
-        if (lastQuery.isEmpty()) recentRow();
+        lastResult = null;
+        if (vScroll != null) vScroll.cancel();
+        ui.removeCallbacks(vStart);
+        scroll.scrollTo(0, 0);
+        vTarget = 0;
+        // One shelf of results fills the screen as a grid, as Apple's does.
+        int found = 0;
+        for (SearchBrain.Shelf sh : shelves) if (!isApps(sh)) found++;
+        boolean asGrid = !lastQuery.isEmpty() && found == 1;
         int[] delay = {0};
         List<Result> all = new ArrayList<>();
         for (SearchBrain.Shelf sh : shelves) {
             markDupes(sh);
-            shelf(sh.heading, sh.items, delay, -1);
+            section(sh, delay, -1, asGrid && !isApps(sh));
             all.addAll(sh.items);
         }
-        scroll.scrollTo(0, 0);
+        if (!lastQuery.isEmpty() && shelves.isEmpty()) nothingFound(failed);
         // Backgrounds are got ready for results; before a search they load as you move to one.
         if (!lastQuery.isEmpty()) prepareAmbient(all);
-        if (!all.isEmpty() && !listening) setStatus("");
-        // The background follows the top result straight away (focus may still be on the mic after
-        // a voice search), and clears when there's nothing to show.
+        // The background follows the top result once typing pauses (each letter's top result isn't
+        // fetched and decoded on the way), and clears when there's nothing to show.
         Result first = null;
-        for (Result r : all) if (!"app".equals(r.type)) { first = r; break; }
+        for (Result r : all) if (!"app".equals(r.type)) {
+            first = r;
+            break;
+        }
+        ui.removeCallbacks(ambientTop);
         if (first != null && !lastQuery.isEmpty()) {
-            ambientFor(first);
-            // A spoken search: straight to its top result, ready to open with OK.
-            if (spoken && firstCard != null) firstCard.requestFocus();
+            Result top = first;
+            ambientTop = () -> ambientFor(top);
+            ui.postDelayed(ambientTop, 400);
         } else {
             ambientFor = null;
             ambient.animate().cancel();
             ambient.animate().alpha(0f).setDuration(300).setInterpolator(MainActivity.EASE).start();
         }
-        spoken = false;
+        // Focus was on a card that's gone: the new first one, or (nothing found) the keyboard, never
+        // the empty page itself.
+        if (hadFocus && (!jump || firstCard == null)) {
+            if (firstCard != null) firstCard.requestFocus();
+            else showKeys();
+        }
+        jumpIn();
+    }
+
+    void jumpIn() {
+        if (jump && firstCard != null) firstCard.requestFocus();
+        jump = false;
+    }
+
+    /**
+     * New results that keep every shelf on screen, in the same order, each starting with what it
+     * shows now (related titles after Top Results, someone's work arriving): only what's new is
+     * added, so nothing on screen jumps or blinks. Recently Searched with a title opened since
+     * (at its front now) is made again on its own, so coming back from a title keeps your place.
+     */
+    boolean extend(List<SearchBrain.Shelf> next) {
+        if (showing.isEmpty() || grid.getChildCount() != showing.size()) return false;
+        // A lone shelf is a grid: with another beside it, the page is laid out again as rows.
+        int found = 0;
+        for (SearchBrain.Shelf sh : next) if (!isApps(sh)) found++;
+        for (int i = 0; found > 1 && i < grid.getChildCount(); i++) if (((Sec) grid.getChildAt(i).getTag()).grid) return false;
+        int[] match = new int[next.size()];
+        boolean[] again = new boolean[next.size()];
+        int p = 0;
+        for (int i = 0; i < next.size(); i++) {
+            SearchBrain.Shelf sh = next.get(i), was = p < showing.size() ? showing.get(p) : null;
+            again[i] = was != null && !startsWith(sh, was) && RECENTLY.equals(sh.heading) && RECENTLY.equals(was.heading);
+            match[i] = was != null && (again[i] || startsWith(sh, was)) ? p++ : -1;
+        }
+        if (p < showing.size()) return false;
+        int[] delay = {0};
+        List<Result> added = new ArrayList<>();
+        for (int i = 0; i < next.size(); i++) {
+            SearchBrain.Shelf sh = next.get(i);
+            markDupes(sh);
+            if (match[i] >= 0 && !again[i]) {
+                Sec s = (Sec) grid.getChildAt(i).getTag();
+                if (sh.items.size() <= s.items.size()) continue;
+                List<Result> more = new ArrayList<>(sh.items.subList(s.items.size(), sh.items.size()));
+                queue(s, more, 0);
+                added.addAll(more);
+            } else {
+                section(sh, delay, i, false);
+                added.addAll(sh.items);
+                if (again[i]) replaced((Sec) grid.getChildAt(i + 1).getTag(), (Sec) grid.getChildAt(i).getTag());
+            }
+        }
+        showing = new ArrayList<>(next);
+        if (!added.isEmpty() && !lastQuery.isEmpty()) prepareAmbient(added);
+        return true;
+    }
+
+    /**
+     * A shelf made again (now) in place of the one just after it (old), which goes. Focus in the old
+     * one follows its title to the new one (the title just opened is at the front now), else goes
+     * to the new one's first card; it moves before the old shelf goes, so it never lands elsewhere.
+     */
+    void replaced(Sec old, Sec now) {
+        View first = focusable(now.row.getChildAt(0));
+        View f = old.view.hasFocus() ? getCurrentFocus() : null;
+        if (f != null) {
+            int k = old.row.indexOfChild(f);
+            Result was = k >= 0 && k < old.items.size() ? old.items.get(k) : null;
+            View to = first;
+            for (int j = 0; was != null && j < now.row.getChildCount(); j++) {
+                Result r = now.items.get(j);
+                if (r.title.equals(was.title) && TextUtils.equals(r.year, was.year)) to = focusable(now.row.getChildAt(j));
+            }
+            if (to != null) to.requestFocus();
+        }
+        if (firstCard != null && isIn(firstCard, old.view)) firstCard = first;
+        grid.removeView(old.view);
     }
 
     /** Titles sharing a name in a shelf show their year (The Office, 2001 and 2005). */
     static void markDupes(SearchBrain.Shelf sh) {
-        java.util.Map<String, Integer> n = new java.util.HashMap<>();
+        Map<String, Integer> n = new HashMap<>();
         for (Result r : sh.items) n.merge(SearchBrain.norm(r.title), 1, Integer::sum);
         for (Result r : sh.items) r.dupe = n.get(SearchBrain.norm(r.title)) > 1;
     }
 
-    /** The search came from the microphone (results take focus). */
-    boolean spoken;
-    int rmsCount;
-    float noiseFloor;
-    View firstCard;
-
-    void shelf(String heading, List<Result> items, int[] delay, int index) {
-        if (items.isEmpty()) return;
-        LinearLayout section = new LinearLayout(this);
-        section.setOrientation(LinearLayout.VERTICAL);
-        section.setClipChildren(false);
-        TextView h = new TextView(this);
-        h.setText(heading);
-        h.setTextColor(0xE6FFFFFF);
-        h.setTypeface(Ui.font(this, "semibold"));
-        Ui.textSize(h, 15);
-        LinearLayout.LayoutParams hl = new LinearLayout.LayoutParams(-2, -2);
-        hl.leftMargin = u(48);
-        section.addView(h, hl);
-
-        android.widget.HorizontalScrollView hs = new android.widget.HorizontalScrollView(this);
-        hs.setHorizontalScrollBarEnabled(false);
-        hs.setClipChildren(false);
-        hs.setClipToPadding(false);
-        hs.setPadding(u(48), u(16), u(48), 0);  // room for the lift at either end and on top
-        LinearLayout row = new LinearLayout(this);
-        row.setClipChildren(false);
-        hs.addView(row);
-        int gap = u(22);
-        int w = (Ui.screen(this).x - 2 * u(48) - (COLS - 1) * gap) / COLS;
-        // The cards on screen now; the rest follow a few at a time over the next frames, so a
-        // page of results never stalls a frame on building eighty cards at once.
-        int now = Math.min(items.size(), COLS + 1);
-        for (int i = 0; i < now; i++) {
-            View card = card(items.get(i), w);
-            if (firstCard == null || grid.getChildCount() == 0 && i == 0) firstCard = ((ViewGroup) card).getChildAt(0);
-            row.addView(card, cardParams(w, gap, i));
-        }
-        for (int from = now; from < items.size(); from += COLS) {
-            int a = from, b = Math.min(items.size(), from + COLS);
-            ui.post(() -> {
-                if (!row.isAttachedToWindow()) return;  // replaced by newer results meanwhile
-                for (int i = a; i < b; i++) row.addView(card(items.get(i), w), cardParams(w, gap, i));
-            });
-        }
-        section.addView(hs, new LinearLayout.LayoutParams(-1, -2));
-        LinearLayout.LayoutParams sl = new LinearLayout.LayoutParams(-1, -2);
-        sl.bottomMargin = u(18);
-        grid.addView(section, index < 0 ? grid.getChildCount() : index, sl);
-        // New results rise in shelf by shelf, each moving as one picture. While the page itself is
-        // still fading in they're simply there, so its arrival stays smooth.
-        if (android.os.SystemClock.uptimeMillis() - createdAt > 700) {
-            section.setAlpha(0f);
-            section.setTranslationY(u(14));
-            section.animate().alpha(1f).translationY(0).setStartDelay(Math.min(delay[0]++, 4) * 70L).setDuration(460)
-                    .setInterpolator(MainActivity.EASE).withLayer().start();
-        }
-    }
-
-    static LinearLayout.LayoutParams cardParams(int w, int gap, int i) {
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(w, -2);
-        if (i > 0) lp.leftMargin = gap;
-        return lp;
-    }
-
-    /** Scrolls so the whole shelf holding v (heading to the title under the poster) is on screen. */
-    void keepInView(View v) {
-        View section = v;
-        while (section != null && section.getParent() != grid) {
-            section = section.getParent() instanceof View ? (View) section.getParent() : null;
-        }
-        if (section == null) return;
-        int visible = scroll.getHeight() - scroll.getPaddingTop() - scroll.getPaddingBottom();
-        int top = section.getTop() - u(6), bottom = section.getBottom();
-        int y = scroll.getScrollY();
-        if (bottom - y > visible) y = bottom - visible;
-        if (top < y) y = top;
-        if (y != scroll.getScrollY()) scroll.smoothScrollTo(0, Math.max(0, y));
-    }
-
-    View card(Result r, int w) {
-        boolean app = "app".equals(r.type);
-        int h = app ? w * 3 / 5 : w * 3 / 2;
+    /** "No Results", as Apple says it, centred where the results would be. */
+    void nothingFound(boolean failed) {
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
-        box.setClipChildren(false);
+        box.setGravity(Gravity.CENTER_HORIZONTAL);
+        box.addView(text(failed ? "Can\u2019t Connect" : "No Results", 24, "display", Color.WHITE));
+        TextView m = text(failed ? "Check your internet connection and try again."
+                : "There were no results for \u201c" + lastQuery + "\u201d. Please try a new search.", 14.5f, "regular", 0x80FFFFFF);
+        m.setGravity(Gravity.CENTER);
+        m.setMaxWidth(u(600));
+        LinearLayout.LayoutParams ml = new LinearLayout.LayoutParams(-2, -2);
+        ml.topMargin = u(8);
+        box.addView(m, ml);
+        // As wide as the space beside the keyboard, so it's centred in what you can see.
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(Ui.screen(this).x - KEYS_W, -2);
+        lp.topMargin = u(80);
+        grid.addView(box, lp);
+    }
 
-        ImageView art = new ImageView(this);
-        art.setScaleType(ImageView.ScaleType.CENTER_CROP);
-        art.setFocusable(true);
-        GradientDrawable ph = new GradientDrawable();
-        ph.setColor(0xFF2A2A30);
-        ph.setCornerRadius(u(10));
-        art.setBackground(ph);
-        if (r.appBanner != null) art.setImageDrawable(r.appBanner);
-        r.art = art;
-        int radius = u(10);
-        art.setOutlineProvider(new ViewOutlineProvider() {
+    TextView text(String s, float size, String weight, int colour) {
+        TextView t = new TextView(this);
+        t.setText(s);
+        t.setTextColor(colour);
+        t.setTypeface(Ui.font(this, weight));
+        Ui.textSize(t, size);
+        return t;
+    }
+
+    static ViewOutlineProvider round(int radius) {
+        return new ViewOutlineProvider() {
             @Override public void getOutline(View v, Outline o) {
                 o.setRoundRect(0, 0, v.getWidth(), v.getHeight(), radius);
             }
+        };
+    }
+
+    /**
+     * One shelf: its heading (Apple's: 31 px bold at half white, white while the shelf has focus),
+     * then its cards. Shelves added after the page has arrived rise in, staggered.
+     */
+    void section(SearchBrain.Shelf sh, int[] delay, int index, boolean asGrid) {
+        LinearLayout v = new LinearLayout(this);
+        v.setOrientation(LinearLayout.VERTICAL);
+        v.setClipChildren(false);
+        Sec s = new Sec();
+        s.view = v;
+        s.recent = RECENTLY.equals(sh.heading);
+        s.grid = asGrid;
+        s.gap = u(20);
+        // Apple's six-column grid: 260 x 390 posters, 40 px apart, 80 px in from the edges.
+        s.w = (Ui.screen(this).x - 2 * u(40) - (COLS - 1) * s.gap) / COLS;
+        v.setTag(s);
+        s.heading = text(sh.heading, 15.5f, "display", Color.WHITE);
+        s.heading.setAlpha(0.5f);
+        LinearLayout.LayoutParams hl = new LinearLayout.LayoutParams(-2, -2);
+        hl.leftMargin = u(40);
+        v.addView(s.heading, hl);
+        if (!asGrid) {
+            s.hs = new HorizontalScrollView(this) {
+                // The row scrolls as the TV app's do (scrollRow), not by Android's own nudging,
+                // which ignores the padding and cut the far tiles' lift off at the screen's edge.
+                @Override protected int computeScrollDeltaToGetChildRectOnScreen(Rect r) {
+                    return 0;
+                }
+            };
+            s.hs.setHorizontalScrollBarEnabled(false);
+            s.hs.setClipChildren(false);
+            s.hs.setClipToPadding(false);
+            s.hs.setPadding(u(40), u(17), u(40), 0);  // room for the lift at either end and on top
+            s.row = new LinearLayout(this);
+            s.row.setClipChildren(false);
+            s.row.setTag(ROW);
+            s.hs.addView(s.row);
+            v.addView(s.hs, new LinearLayout.LayoutParams(-1, -2));
+        }
+        LinearLayout.LayoutParams sl = new LinearLayout.LayoutParams(-1, -2);
+        sl.bottomMargin = s.recent ? u(13) : u(28);
+        grid.addView(v, index < 0 ? grid.getChildCount() : index, sl);
+        // New results rise in shelf by shelf. While the page itself is still fading in they're
+        // simply there, so its arrival stays smooth.
+        boolean rises = SystemClock.uptimeMillis() - createdAt > 700;
+        s.riseDelay = Math.min(delay[0]++, 4) * 70L;
+        if (rises) s.riseAt = SystemClock.uptimeMillis() + s.riseDelay;
+        s.firstBuild = sh.items.size();
+        if (rises && asGrid) rise(s.heading, s.riseDelay, 0.5f);
+        queue(s, sh.items, asGrid ? COLS : COLS + 1);
+        if (rises && !asGrid) rise(v, s.riseDelay, 1f);
+    }
+
+    /**
+     * Rises into place as one picture. Started after the posts that build its cards, so what moves
+     * doesn't change under it.
+     */
+    void rise(View v, long delay, float to) {
+        v.setAlpha(0f);
+        v.setTranslationY(u(14));
+        ui.post(() -> {
+            // Focus already in it (a spoken search jumps to the first result): its card is lifting,
+            // so no single picture, which would be drawn again every frame; and a grid's heading
+            // rises to full white, not back to half.
+            View shelf = v.getParent() instanceof View ? (View) v.getParent() : null;
+            boolean focused = v.hasFocus() || shelf != null && shelf.hasFocus();
+            android.view.ViewPropertyAnimator a = v.animate().alpha(focused ? 1f : to).translationY(0)
+                    .setStartDelay(delay).setDuration(460).setInterpolator(MainActivity.EASE);
+            if (!v.hasFocus()) a.withLayer();
+            a.start();
         });
+    }
+
+    /**
+     * Adds results to a shelf: the cards on screen at once (atOnce), the rest a row at a time over
+     * the next frames, so a page of results never stalls a frame on building eighty cards at once.
+     */
+    void queue(Sec s, List<Result> rs, int atOnce) {
+        s.items.addAll(rs);
+        int now = Math.min(rs.size(), atOnce);
+        build(s, rs.subList(0, now));
+        for (int from = now; from < rs.size(); from += COLS) {
+            List<Result> part = new ArrayList<>(rs.subList(from, Math.min(rs.size(), from + COLS)));
+            ui.post(() -> {
+                if (s.view.getParent() != grid) return;  // replaced by newer results meanwhile
+                build(s, part);
+            });
+        }
+    }
+
+    void build(Sec s, List<Result> rs) {
+        for (Result r : rs) {
+            int i = s.built++;
+            View card = card(s, r);
+            if (firstCard == null) firstCard = focusable(card);
+            LinearLayout row = s.row;
+            int at = i;
+            if (s.grid) {
+                at = i % COLS;
+                row = at == 0 ? gridRow(s, i / COLS) : (LinearLayout) s.view.getChildAt(s.view.getChildCount() - 1);
+            }
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(s.recent ? u(280) : s.w, -2);
+            if (at > 0) lp.leftMargin = s.gap;
+            row.addView(card, lp);
+        }
+    }
+
+    /** A row of a grid: the first two rise with the shelf, later ones (and ones added after) just appear. */
+    LinearLayout gridRow(Sec s, int n) {
+        LinearLayout row = new LinearLayout(this);
+        row.setClipChildren(false);
+        row.setTag(ROW);
+        row.setPadding(u(40), u(17), u(40), 0);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
+        lp.bottomMargin = u(12);
+        s.view.addView(row, lp);
+        if (s.riseAt > 0 && n < 2 && n * COLS < s.firstBuild) rise(row, s.riseDelay + n * 70L, 1f);
+        return row;
+    }
+
+    /** Marks a row of cards (a shelf's, or one of a grid's), for rowOf. */
+    static final Object ROW = new Object();
+
+    /** The row a card is in; null outside the shelves. */
+    static View rowOf(View v) {
+        for (View p = v; p != null; p = p.getParent() instanceof View ? (View) p.getParent() : null) {
+            if (p.getTag() == ROW) return p;
+        }
+        return null;
+    }
+
+    static View focusable(View card) {
+        ArrayList<View> l = new ArrayList<>();
+        card.addFocusables(l, View.FOCUS_DOWN);
+        return l.isEmpty() ? null : l.get(0);
+    }
+
+    View card(Sec s, Result r) {
+        if (s.recent) return recentCard(s, r);
+        if ("browse".equals(r.type)) return tile(s, r);
+        if ("app".equals(r.type)) return appCard(s, r);
+        return poster(s, r);
+    }
+
+    /** A card took or lost focus: its shelf's heading, the background, and scrolling to keep it in view. */
+    void focused(Sec s, View card, Result r, boolean f) {
+        headingFocus(s, f);
+        if (!f) return;
+        if (r != null) ambientFor(r);
+        scrollRow(s, card);
+        keepInView(card);
+    }
+
+    void headingFocus(Sec s, boolean f) {
+        if (f) {
+            s.heading.animate().alpha(1f).setDuration(85).setInterpolator(FOCUS_IN).start();
+            return;
+        }
+        // Moving along the shelf, focus leaves one card for the next: only a shelf really left dims.
+        ui.post(() -> {
+            if (!s.view.hasFocus()) s.heading.animate().alpha(0.5f).setDuration(230).setInterpolator(FOCUS_OUT).start();
+        });
+    }
+
+    /** Lifts (or lowers) a card with the Apple TV app's focus timing. */
+    static void lift(View v, boolean f, float scale, float z) {
+        v.animate().scaleX(f ? scale : 1f).scaleY(f ? scale : 1f).translationZ(f ? z : 0)
+                .setDuration(f ? 85 : 230).setInterpolator(f ? FOCUS_IN : FOCUS_OUT).start();
+    }
+
+    /**
+     * A card's glass sheen and rim fading in or out with its focus. Each fade stops the last: after
+     * a quick Right and Left, a fade out still running would otherwise end the sheen at nothing.
+     */
+    static void sheen(Drawable sheen, boolean f) {
+        ObjectAnimator a = ObjectAnimator.ofInt(sheen, "alpha", sheen.getAlpha(), f ? 255 : 0);
+        a.setAutoCancel(true);
+        a.setDuration(f ? 85 : 230);
+        a.start();
+    }
+
+    /** Where OK went down, for its release; a long hold that has acted (held). */
+    View pressed;
+    boolean held;
+
+    /**
+     * OK on a card, the Apple TV app's way: it sinks halfway back on the press and comes up on the
+     * release, then opens. Holding it for a second runs `hold` instead (when there is one). Left
+     * from the first card of a row goes back to the keyboard.
+     */
+    boolean cardKey(View v, View card, float scale, int k, KeyEvent e, Runnable open, Runnable hold) {
+        if (k == KeyEvent.KEYCODE_DPAD_LEFT || k == KeyEvent.KEYCODE_DPAD_RIGHT) {
+            if (e.getAction() != KeyEvent.ACTION_DOWN) return false;
+            // Along the row as usual. At its ends Android would look anywhere that way, and find
+            // another row's tiles scrolled out of sight: Left goes back to the keyboard instead,
+            // and Right stays put, as on tvOS.
+            boolean left = k == KeyEvent.KEYCODE_DPAD_LEFT;
+            View next = v.focusSearch(left ? View.FOCUS_LEFT : View.FOCUS_RIGHT);
+            if (next != null && rowOf(next) == rowOf(v)) return false;
+            if (left) showKeys();
+            return true;
+        }
+        if (k != KeyEvent.KEYCODE_DPAD_CENTER && k != KeyEvent.KEYCODE_ENTER && k != KeyEvent.KEYCODE_NUMPAD_ENTER) return false;
+        if (e.getAction() == KeyEvent.ACTION_DOWN) {
+            if (e.getRepeatCount() == 0) {
+                pressed = v;
+                held = false;
+                sink(card, scale, true, null);
+            } else if (hold != null && !held && pressed == v && e.getEventTime() - e.getDownTime() >= 1000) {
+                held = true;
+                hold.run();
+            }
+            return true;
+        }
+        if (e.getAction() == KeyEvent.ACTION_UP) {
+            boolean go = pressed == v && !held;
+            pressed = null;
+            if (!held) sink(card, scale, false, go ? open : null);
+            held = false;
+            return true;
+        }
+        return false;
+    }
+
+    static void sink(View v, float scale, boolean down, Runnable then) {
+        float to = down ? 1f + (scale - 1f) / 2f : scale;
+        v.animate().scaleX(to).scaleY(to).setDuration(80).setInterpolator(down ? FOCUS_OUT : FOCUS_IN)
+                .withEndAction(then).start();
+    }
+
+    /** What a poster's caption says (tvOS: "TV Show · Thriller"): what it is, its main genre, and one score. */
+    static String caption(Result r, boolean score) {
+        StringBuilder sb = new StringBuilder();
+        if (r.role != null) {
+            // An actor's or director's work: when, and who they played.
+            sb.append(r.year == null ? "" : r.year);
+            if (!r.role.isEmpty() && !"Director".equals(r.role)) sb.append(sb.length() > 0 ? " \u00b7 " : "").append("as ").append(r.role);
+            return sb.toString();
+        }
+        sb.append("tv".equals(r.type) ? "Series" : "Film");
+        for (String g : r.genres) {
+            String n = Suggestions.JW_GENRE_NAMES.get(g);
+            if (n == null) continue;
+            sb.append(" \u00b7 ").append(n);
+            break;
+        }
+        if (r.dupe && r.year != null && !r.year.isEmpty()) sb.append(" \u00b7 ").append(r.year);
+        if (score) {
+            String sc = r.tomato >= 0 ? ratings(0, r.tomato, r.certified) : ratings(r.imdb, -1, false);
+            if (!sc.isEmpty()) sb.append(" \u00b7 ").append(sc);
+        }
+        return sb.toString();
+    }
+
+    /**
+     * A poster, as tvOS 26's TV app shows it: just the art at rest. Focused, it grows by 40 px
+     * (85 ms in, 230 ms out), gains a glass sheen and rim, and its bottom becomes a frosted band
+     * (the art's own bottom, blurred) carrying the title and "Series · Crime".
+     */
+    View poster(Sec s, Result r) {
+        int w = s.w, h = w * 3 / 2, radius = u(10);
+        FrameLayout box = new FrameLayout(this);
+        ImageView art = new ImageView(this);
+        art.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        art.setFocusable(true);
+        art.setBackgroundColor(0xFF2A2A30);
+        GradientDrawable sheen = new GradientDrawable(GradientDrawable.Orientation.TL_BR,
+                new int[]{0x40FFFFFF, 0x0AFFFFFF, 0x00FFFFFF});
+        sheen.setCornerRadius(radius);
+        sheen.setStroke(Math.max(1, u(0.6f)), 0x55FFFFFF);
+        sheen.setAlpha(0);
+        art.setForeground(sheen);
+        box.addView(art, new FrameLayout.LayoutParams(w, h));
+
+        LinearLayout cap = new LinearLayout(this) {
+            @Override public boolean hasOverlappingRendering() {
+                return false;  // only its band and words: fading it needs no extra layer
+            }
+        };
+        cap.setOrientation(LinearLayout.VERTICAL);
+        cap.setGravity(Gravity.CENTER);
+        cap.setPadding(u(8), 0, u(8), u(2));
+        cap.setAlpha(0f);
+        TextView name = text(r.title, 12.5f, "medium", Color.WHITE);
+        TextView sub = text(caption(r, true), 11.5f, "regular", 0x80FFFFFF);
+        for (TextView t : new TextView[]{name, sub}) {
+            t.setSingleLine(true);
+            t.setEllipsize(TextUtils.TruncateAt.END);
+            t.setGravity(Gravity.CENTER_HORIZONTAL);
+            t.setShadowLayer(u(2), 0, u(1), 0x66000000);
+            cap.addView(t, new LinearLayout.LayoutParams(-1, -2));
+        }
+        showIcons(sub);
+        box.addView(cap, new FrameLayout.LayoutParams(-1, h * 28 / 100, Gravity.BOTTOM));
+        Bitmap ready = r.poster == null ? null : POSTERS.get(r.poster);
+        if (ready != null) {
+            art.setImageBitmap(ready);
+            cap.setBackground(frost(BANDS.get(r.poster)));
+        } else {
+            cap.setBackground(frost(null));
+            await(r.poster, art, cap, s);
+        }
+        // The band follows the corners: the whole card is cut to its rounded shape.
+        box.setOutlineProvider(round(radius));
+        box.setClipToOutline(true);
+        art.setOnFocusChangeListener((v, f) -> {
+            lift(box, f, 1.1f, u(14));
+            sheen(sheen, f);
+            cap.animate().alpha(f ? 1f : 0f).setDuration(f ? 85 : 230).setInterpolator(f ? FOCUS_IN : FOCUS_OUT).start();
+            focused(s, box, r, f);
+        });
+        art.setOnKeyListener((v, k, e) -> cardKey(v, box, 1.1f, k, e, () -> open(r), null));
+        return box;
+    }
+
+    /** An app's banner, its name under it as it takes focus. */
+    View appCard(Sec s, Result r) {
+        int w = s.w, h = w * 3 / 5, radius = u(10);
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setClipChildren(false);
+        ImageView art = new ImageView(this);
+        art.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        art.setFocusable(true);
+        art.setBackgroundColor(0xFF2A2A30);
+        art.setImageDrawable(r.appBanner);
+        art.setOutlineProvider(round(radius));
         art.setClipToOutline(true);
         GradientDrawable sheen = new GradientDrawable(GradientDrawable.Orientation.TL_BR,
                 new int[]{0x40FFFFFF, 0x0AFFFFFF, 0x00FFFFFF});
@@ -1293,90 +2535,442 @@ public class SearchActivity extends Activity {
         sheen.setAlpha(0);
         art.setForeground(sheen);
         box.addView(art, new LinearLayout.LayoutParams(w, h));
-
-        TextView name = new TextView(this);
-        name.setText(r.title);
-        name.setTextColor(Color.WHITE);
-        name.setTypeface(Ui.font(this, "medium"));
+        TextView name = text(r.title, 12.5f, "medium", Color.WHITE);
         name.setSingleLine(true);
-        name.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        name.setEllipsize(TextUtils.TruncateAt.END);
         name.setGravity(Gravity.CENTER_HORIZONTAL);
-        Ui.textSize(name, 11);
         name.setAlpha(0f);
         LinearLayout.LayoutParams nl = new LinearLayout.LayoutParams(w, -2);
         nl.topMargin = u(12);
         box.addView(name, nl);
-
-        TextView sub = new TextView(this);
-        StringBuilder sb = new StringBuilder();
-        if (app) sb.append("App");
-        else if (r.role != null) {
-            // An actor's or director's work: when, and who they played.
-            sb.append(r.year == null ? "" : r.year);
-            if (!r.role.isEmpty() && !"Director".equals(r.role)) sb.append(sb.length() > 0 ? " \u00b7 " : "").append("as ").append(r.role);
-        } else {
-            if (r.dupe && r.year != null && !r.year.isEmpty()) sb.append(r.year);
-            String sc = ratings(r.imdb, r.tomato, r.certified);
-            if (!sc.isEmpty()) sb.append(sb.length() > 0 ? " \u00b7 " : "").append(sc);
-            for (Suggestions.Item it : r.offers) {
-                if (sb.length() > 0) sb.append(" · ");
-                sb.append(it.provider().name);
-            }
-            if (r.offers.isEmpty() ) sb.append(sb.length() > 0 ? " · " : "").append(r.rentBuy ? "Rent or Buy" : "Not Streaming");
-        }
-        sub.setText(sb);
-        showIcons(sub);
-        sub.setTextColor(0x8CFFFFFF);
-        sub.setTypeface(Ui.font(this, "regular"));
-        sub.setSingleLine(true);
-        sub.setEllipsize(android.text.TextUtils.TruncateAt.END);
-        sub.setGravity(Gravity.CENTER_HORIZONTAL);
-        Ui.textSize(sub, 9);
-        sub.setAlpha(0f);
-        box.addView(sub, new LinearLayout.LayoutParams(w, -2));
-
         art.setOnFocusChangeListener((v, f) -> {
-            float s = f ? 1.1f : 1f;
-            art.setPivotX(w / 2f);
-            art.setPivotY(h / 2f);
-            art.animate().scaleX(s).scaleY(s).translationZ(f ? u(14) : 0).setDuration(f ? 340 : 260)
-                    .setInterpolator(f ? MainActivity.LIFT : MainActivity.EASE).start();
-            // Glass sheen across the focused poster, fading rather than switching.
-            android.animation.ObjectAnimator.ofInt(sheen, "alpha", sheen.getAlpha(), f ? 255 : 0)
-                    .setDuration(f ? 300 : 220).start();
-            if (f) {
-                ambientFor(r);
-                keepInView(box);
-            }
-            name.animate().alpha(f ? 1f : 0f).translationY(f ? u(3) : 0).setDuration(260)
-                    .setInterpolator(MainActivity.EASE).start();
-            sub.animate().alpha(f ? 1f : 0f).translationY(f ? u(3) : 0).setDuration(260)
-                    .setInterpolator(MainActivity.EASE).start();
+            lift(art, f, 1.1f, u(14));
+            sheen(sheen, f);
+            name.animate().alpha(f ? 1f : 0f).translationY(f ? u(3) : 0).setDuration(f ? 85 : 230)
+                    .setInterpolator(f ? FOCUS_IN : FOCUS_OUT).start();
+            focused(s, box, null, f);
         });
-        art.setOnClickListener(v -> open(r));
+        art.setOnKeyListener((v, k, e) -> cardKey(v, art, 1.1f, k, e, () -> open(r), null));
         return box;
     }
+
+    // ---------------------------------------------------------------- recently searched
+
+    SharedPreferences prefs() {
+        return getSharedPreferences("search", MODE_PRIVATE);
+    }
+
+    /**
+     * Recently Searched, as Apple keeps it: the titles opened from Search (not what was typed),
+     * newest first, ten at most, each for thirty days, on this TV only.
+     */
+    List<Result> recentTitles() {
+        List<Result> out = new ArrayList<>();
+        long cut = System.currentTimeMillis() - RECENT_MS;
+        try {
+            JSONArray a = new JSONArray(prefs().getString("titles", "[]"));
+            for (int i = 0; i < a.length() && out.size() < RECENT; i++) {
+                JSONObject o = a.getJSONObject(i);
+                if (o.optLong("at") < cut) continue;
+                Result r = new Result();
+                r.id = o.optString("id", null);
+                r.title = o.optString("title");
+                r.type = o.optString("type", "movie");
+                r.year = o.optString("year");
+                r.poster = o.optString("poster", null);
+                r.backdrop = o.optString("backdrop", null);
+                r.tmdbId = o.optInt("tmdbId");
+                String g = o.optString("genre");
+                if (!g.isEmpty()) r.genres.add(g);
+                out.add(r);
+            }
+        } catch (Exception ignored) {
+            // nothing kept yet, or unreadable: start again
+        }
+        return out;
+    }
+
+    Set<String> recentIds() {
+        Set<String> ids = new HashSet<>();
+        for (Result r : recentTitles()) if (r.id != null) ids.add(r.id);
+        return ids;
+    }
+
+    static boolean sameTitle(Result r, JSONObject o) {
+        if (r.id != null && r.id.equals(o.optString("id", null))) return true;
+        return SearchBrain.norm(r.title).equals(SearchBrain.norm(o.optString("title"))) && TextUtils.equals(r.year, o.optString("year"));
+    }
+
+    /** A title opened from Search goes to the front of Recently Searched. */
+    void remember(Result r) {
+        if (r.title == null) return;
+        try {
+            JSONArray old = new JSONArray(prefs().getString("titles", "[]")), a = new JSONArray();
+            a.put(new JSONObject().put("id", r.id).put("title", r.title).put("type", r.type).put("year", r.year)
+                    .put("poster", r.poster).put("backdrop", r.backdrop).put("tmdbId", r.tmdbId)
+                    .put("genre", r.genres.isEmpty() ? null : r.genres.get(0)).put("at", System.currentTimeMillis()));
+            for (int i = 0; i < old.length() && a.length() < RECENT; i++) {
+                JSONObject o = old.getJSONObject(i);
+                if (!sameTitle(r, o)) a.put(o);
+            }
+            prefs().edit().putString("titles", a.toString()).apply();
+        } catch (Exception ignored) {
+            // not kept this time
+        }
+        brain.recent = recentIds();
+    }
+
+    /** Holding OK on a Recently Searched title takes it off the list; its card fades away. */
+    void forget(Sec s, View card, Result r) {
+        try {
+            JSONArray old = new JSONArray(prefs().getString("titles", "[]")), a = new JSONArray();
+            for (int i = 0; i < old.length(); i++) if (!sameTitle(r, old.getJSONObject(i))) a.put(old.getJSONObject(i));
+            prefs().edit().putString("titles", a.toString()).apply();
+        } catch (Exception ignored) {
+            // it stays
+        }
+        brain.recent = recentIds();
+        s.items.remove(r);
+        for (SearchBrain.Shelf sh : showing) if (RECENTLY.equals(sh.heading)) sh.items.remove(r);
+        // Focus moves on at once: to the next title, else the one before, else the shelf below.
+        int at = s.row.indexOfChild(card);
+        View next = s.row.getChildAt(at + 1) != null ? s.row.getChildAt(at + 1) : s.row.getChildAt(at - 1);
+        View below = grid.getChildAt(grid.indexOfChild(s.view) + 1);
+        if (next == null && below != null) next = focusable(below);
+        if (next != null) next.requestFocus();
+        else showKeys();
+        card.setFocusable(false);
+        card.animate().alpha(0f).setDuration(200).withEndAction(() -> {
+            s.row.removeView(card);
+            if (s.row.getChildCount() > 0) {
+                ((LinearLayout.LayoutParams) s.row.getChildAt(0).getLayoutParams()).leftMargin = 0;
+                s.row.requestLayout();
+                return;
+            }
+            // That was the last: the shelf goes.
+            showing.removeIf(sh -> RECENTLY.equals(sh.heading));
+            grid.removeView(s.view);
+        }).start();
+    }
+
+    /**
+     * A Recently Searched title as Apple's compact search card: the poster small at the left, the
+     * title and "Series · Crime" beside it, on a faint platter that brightens with focus.
+     */
+    View recentCard(Sec s, Result r) {
+        LinearLayout card = new LinearLayout(this);
+        card.setGravity(Gravity.CENTER_VERTICAL);
+        card.setPadding(u(10), u(10), u(10), u(10));
+        card.setFocusable(true);
+        GradientDrawable plate = new GradientDrawable();
+        plate.setColor(0x1AFFFFFF);
+        plate.setCornerRadius(u(15));
+        card.setBackground(plate);
+        ImageView thumb = new ImageView(this);
+        thumb.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        thumb.setBackgroundColor(0xFF2A2A30);
+        thumb.setOutlineProvider(round(u(5)));
+        thumb.setClipToOutline(true);
+        Bitmap ready = r.poster == null ? null : POSTERS.get(r.poster);
+        if (ready != null) thumb.setImageBitmap(ready);
+        else await(r.poster, thumb, null, s);
+        card.addView(thumb, new LinearLayout.LayoutParams(u(40), u(60)));
+        LinearLayout words = new LinearLayout(this);
+        words.setOrientation(LinearLayout.VERTICAL);
+        TextView t = text(r.title, 14.5f, "medium", Color.WHITE);
+        t.setMaxLines(2);
+        t.setEllipsize(TextUtils.TruncateAt.END);
+        words.addView(t);
+        TextView m = text(caption(r, false), 11.5f, "regular", 0x80FFFFFF);
+        m.setSingleLine(true);
+        m.setEllipsize(TextUtils.TruncateAt.END);
+        words.addView(m);
+        LinearLayout.LayoutParams wl = new LinearLayout.LayoutParams(0, -2, 1f);
+        wl.leftMargin = u(10);
+        card.addView(words, wl);
+        ArgbEvaluator ev = new ArgbEvaluator();
+        ValueAnimator[] glow = {null};
+        int[] now = {0x1AFFFFFF};
+        card.setOnFocusChangeListener((v, f) -> {
+            lift(card, f, 1.071f, u(6));
+            if (glow[0] != null) glow[0].cancel();
+            glow[0] = ValueAnimator.ofFloat(0f, 1f);
+            int from = now[0], to = f ? 0x33FFFFFF : 0x1AFFFFFF;
+            glow[0].setDuration(f ? 85 : 230);
+            glow[0].addUpdateListener(a -> {
+                now[0] = (int) ev.evaluate((float) a.getAnimatedValue(), from, to);
+                plate.setColor(now[0]);
+            });
+            glow[0].start();
+            focused(s, card, r, f);
+        });
+        card.setOnKeyListener((v, k, e) -> cardKey(v, card, 1.071f, k, e, () -> open(r), () -> forget(s, card, r)));
+        return card;
+    }
+
+    // ---------------------------------------------------------------- browse
+
+    /** Browse's genres: what they're called and JustWatch's code for each. */
+    static final String[][] GENRE_TILES = {{"Comedies", "cmy"}, {"Dramas", "drm"}, {"Thrillers", "trl"},
+            {"Crime", "crm"}, {"Documentaries", "doc"}, {"Sci-Fi", "scf"}, {"Horror", "hrr"}, {"Romance", "rma"}};
+    /** Each genre tile's picture: a popular title's poster, blurred to colour and light. */
+    static final Map<String, Bitmap> TILE_ART = new ConcurrentHashMap<>();
+    /** Your services, and their banners (by package), from the last look. */
+    static volatile List<Suggestions.Provider> services = Collections.emptyList();
+    static final Map<String, Bitmap> BANNERS = new ConcurrentHashMap<>();
+    /** The genre tiles on screen, waiting for their pictures. */
+    final Map<String, ImageView> tiles = new HashMap<>();
+
+    /** The page before a search: Recently Searched (when there are any), Browse, then Popular. */
+    List<SearchBrain.Shelf> landing(List<SearchBrain.Shelf> popular) {
+        List<SearchBrain.Shelf> out = new ArrayList<>();
+        out.add(new SearchBrain.Shelf(RECENTLY, recentTitles()));
+        List<Result> browse = new ArrayList<>();
+        for (String[] g : GENRE_TILES) {
+            Result r = new Result();
+            r.type = "browse";
+            r.title = g[0];
+            r.genre = g[1];
+            browse.add(r);
+        }
+        for (Suggestions.Provider p : services) {
+            Result r = new Result();
+            r.type = "browse";
+            r.title = p.name;
+            r.service = p;
+            browse.add(r);
+        }
+        out.add(new SearchBrain.Shelf(BROWSE, browse));
+        out.addAll(popular);
+        return out;
+    }
+
+    /** Looks up your services and their banners; Browse gains their tiles. */
+    void findServices() {
+        SharedPreferences kept = prefs();
+        if (kept.contains("recent")) kept.edit().remove("recent").apply();  // the old list of typed searches
+        List<Suggestions.Provider> mine = brain.mine();
+        PackageManager pm = getPackageManager();
+        int bw = u(110), bh = u(62);
+        for (Suggestions.Provider p : mine) {
+            if (BANNERS.containsKey(p.pkg)) continue;
+            Drawable d = null;
+            try {
+                Intent launch = Suggestions.launchIntent(this, p.pkg);
+                if (launch != null) d = pm.getActivityBanner(launch);
+                if (d == null) d = pm.getApplicationBanner(p.pkg);
+            } catch (Exception ignored) {
+                // no banner: the name alone
+            }
+            if (d == null) continue;
+            Bitmap b = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888);
+            d.setBounds(0, 0, bw, bh);
+            d.draw(new Canvas(b));
+            BANNERS.put(p.pkg, Suggestions.onGpu(b));
+        }
+        if (mine.equals(services)) return;
+        services = mine;
+        ui.post(() -> {
+            if (!isDestroyed() && lastQuery.isEmpty()) show(landed);
+        });
+    }
+
+    /** The genre tiles' pictures, from Popular's posters (each tile a different one), blurred small. */
+    void browseArt(int gen, List<SearchBrain.Shelf> pop) {
+        if (pop == null) return;
+        Set<String> used = new HashSet<>();
+        for (String[] g : GENRE_TILES) {
+            if (gen != generation) return;
+            if (TILE_ART.containsKey(g[1])) continue;
+            Result pick = null;
+            for (SearchBrain.Shelf sh : pop) {
+                for (Result r : sh.items) {
+                    if (r.poster != null && r.genres.contains(g[1]) && used.add(r.poster)) {
+                        pick = r;
+                        break;
+                    }
+                }
+                if (pick != null) break;
+            }
+            if (pick == null) continue;
+            Bitmap small = Suggestions.image(this, pick.poster, "", 40);
+            if (small == null) continue;
+            Bitmap soft = Suggestions.onGpu(Ui.blur(small, 26, 39, 2, 2));
+            small.recycle();
+            TILE_ART.put(g[1], soft);
+            String code = g[1];
+            ui.post(() -> {
+                ImageView v = tiles.get(code);
+                if (v == null || isDestroyed()) return;
+                v.setImageBitmap(soft);
+                v.setImageAlpha(0);
+                ObjectAnimator a = ObjectAnimator.ofInt(v, "imageAlpha", 0, 255);
+                a.setDuration(240);
+                a.setInterpolator(new LinearInterpolator());
+                a.start();
+            });
+        }
+    }
+
+    /**
+     * A Browse tile, as tvOS 26's: a 2:3 tile with its name inside the art, and no caption. A
+     * genre's art is a popular title of that genre blurred to its colours (it's not that title);
+     * a service's is its banner on a dark platter. OK browses it.
+     */
+    View tile(Sec s, Result r) {
+        int w = s.w, h = w * 3 / 2, radius = u(10);
+        FrameLayout box = new FrameLayout(this);
+        box.setFocusable(true);
+        ImageView art = new ImageView(this);
+        art.setScaleType(ImageView.ScaleType.FIT_XY);
+        if (r.service != null) {
+            art.setBackgroundColor(0xFF1C1C1E);
+            box.addView(art, new FrameLayout.LayoutParams(w, h));
+            Bitmap banner = BANNERS.get(r.service.pkg);
+            if (banner != null) {
+                ImageView logo = new ImageView(this);
+                logo.setImageBitmap(banner);
+                logo.setOutlineProvider(round(u(5)));
+                logo.setClipToOutline(true);
+                box.addView(logo, new FrameLayout.LayoutParams(u(110), u(62), Gravity.CENTER));
+            }
+        } else {
+            art.setBackground(new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
+                    new int[]{0xFF2C2C2E, 0xFF1C1C1E}));
+            Bitmap b = TILE_ART.get(r.genre);
+            if (b != null) art.setImageBitmap(b);
+            else tiles.put(r.genre, art);
+            art.setForeground(new ColorDrawable(0x66000000));
+            box.addView(art, new FrameLayout.LayoutParams(w, h));
+        }
+        View shade = new View(this);
+        shade.setBackground(new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, new int[]{0x00000000, 0xB3000000}));
+        box.addView(shade, new FrameLayout.LayoutParams(-1, h / 2, Gravity.BOTTOM));
+        TextView label = text(r.title, 15.5f, "display", Color.WHITE);
+        label.setMaxLines(2);
+        FrameLayout.LayoutParams ll = new FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM | Gravity.START);
+        ll.leftMargin = ll.bottomMargin = ll.rightMargin = u(9);
+        box.addView(label, ll);
+        GradientDrawable sheen = new GradientDrawable(GradientDrawable.Orientation.TL_BR,
+                new int[]{0x40FFFFFF, 0x0AFFFFFF, 0x00FFFFFF});
+        sheen.setCornerRadius(radius);
+        sheen.setStroke(Math.max(1, u(0.6f)), 0x55FFFFFF);
+        sheen.setAlpha(0);
+        box.setForeground(sheen);
+        box.setOutlineProvider(round(radius));
+        box.setClipToOutline(true);
+        box.setOnFocusChangeListener((v, f) -> {
+            lift(box, f, 1.1f, u(14));
+            sheen(sheen, f);
+            focused(s, box, null, f);
+        });
+        box.setOnKeyListener((v, k, e) -> cardKey(v, box, 1.1f, k, e, () -> {
+            jump = true;
+            fromTile = true;
+            setQuery(r.title);
+        }, null));
+        return box;
+    }
+
+    // ---------------------------------------------------------------- scrolling
+
+    /**
+     * A row scrolls as the TV app's do: focus walks across the tiles in view, and the row moves
+     * only when the next would come within 80 px of the edge, then just enough, on Apple's scroll
+     * curve. A new press retargets it from wherever it is.
+     */
+    void scrollRow(Sec s, View card) {
+        HorizontalScrollView hs = s.hs;
+        if (hs == null) return;  // a grid row doesn't scroll
+        // Focused as soon as it was made (a jump to the first result, a title's new place in a
+        // shelf made again): with no size yet the sums below would scroll the row off its start.
+        if (!card.isLaidOut()) return;
+        int edge = u(40);
+        int left = card.getLeft() + hs.getPaddingLeft(), right = left + card.getWidth();
+        int max = Math.max(0, s.row.getWidth() + hs.getPaddingLeft() + hs.getPaddingRight() - hs.getWidth());
+        // Measured from where the row is going, when it's already on its way.
+        boolean moving = s.scroller != null && s.scroller.isRunning();
+        int x = moving ? s.scrollTo : hs.getScrollX(), w = hs.getWidth(), target = x;
+        if (right > x + w - edge) target = right - (w - edge);
+        else if (left < x + edge) target = left - edge;
+        target = Math.max(0, Math.min(max, target));
+        if (target == x) return;
+        if (s.scroller != null) s.scroller.cancel();
+        s.scrollTo = target;
+        s.scroller = ObjectAnimator.ofInt(hs, "scrollX", target);
+        s.scroller.setDuration(700);
+        s.scroller.setInterpolator(SCROLL);
+        s.scroller.start();
+    }
+
+    ObjectAnimator vScroll;
+    int vTarget;
+    Runnable vStart = () -> { };
+
+    /** Scrolls so the whole shelf (or grid row) holding v, heading to the bottom of its cards, is on screen. */
+    void keepInView(View v) {
+        View section = v;
+        while (section != null && section.getParent() != grid) {
+            section = section.getParent() instanceof View ? (View) section.getParent() : null;
+        }
+        if (section == null) return;
+        int top = section.getTop() - u(6), bottom = section.getBottom();
+        Sec s = (Sec) section.getTag();
+        if (s != null && s.grid) {
+            View row = v;
+            while (row.getParent() != section) row = (View) row.getParent();
+            // The first row keeps its heading in view; the others scroll row by row.
+            if (((ViewGroup) section).indexOfChild(row) > 1) top = section.getTop() + row.getTop();
+            bottom = section.getTop() + row.getBottom();
+        }
+        int visible = scroll.getHeight() - scroll.getPaddingTop() - scroll.getPaddingBottom();
+        int y = vScroll != null && vScroll.isRunning() ? vTarget : scroll.getScrollY();
+        if (bottom - y > visible) y = bottom - visible;
+        if (top < y) y = top;
+        glide(Math.max(0, y));
+    }
+
+    /**
+     * Scrolls the page to y on Apple's curve, starting a few frames after the focus change, so the
+     * lift leads and the page follows.
+     */
+    void glide(int y) {
+        boolean moving = vScroll != null && vScroll.isRunning();
+        if (y == (moving ? vTarget : scroll.getScrollY())) return;
+        vTarget = y;
+        ui.removeCallbacks(vStart);
+        vStart = () -> {
+            if (vScroll != null) vScroll.cancel();
+            vScroll = ObjectAnimator.ofInt(scroll, "scrollY", y);
+            vScroll.setDuration(700);
+            vScroll.setInterpolator(SCROLL);
+            vScroll.start();
+        };
+        ui.postDelayed(vStart, 50);
+    }
+
+    // ---------------------------------------------------------------- background
 
     ImageView ambient;
     volatile String ambientFor;
 
     /**
-     * Backgrounds ready to show, by picture address, prepared as soon as results appear: under
-     * 2 MB each, so ten stay light on the TV's memory.
+     * Backgrounds ready to show, by picture address, prepared as results appear: under 2 MB each,
+     * so ten stay light on the TV's memory.
      */
     static final android.util.LruCache<String, Bitmap> AMBIENT = new android.util.LruCache<>(10);
-    final ExecutorService ambientIo = java.util.concurrent.Executors.newSingleThreadExecutor();
+    final ExecutorService ambientIo = Executors.newSingleThreadExecutor();
     /** The focused title's picture, never queued behind the ones being got ready. */
-    final ExecutorService ambientNow = java.util.concurrent.Executors.newSingleThreadExecutor();
+    final ExecutorService ambientNow = Executors.newSingleThreadExecutor();
 
     /**
      * The picture behind a result: the studio's full-size key art (TMDB) when there is one, else
-     * JustWatch's 1920 px backdrop, at 1280 px with a light blur, so it's smooth, never blocky.
+     * JustWatch's 1920 px backdrop, opened at two thirds of the screen's width (1280 px), so the
+     * scaling softens it a little and it's never blocky.
      */
     Bitmap ambientArt(Result r, String url) {
         Bitmap b = AMBIENT.get(url);
         if (b != null) return b;
-        long t0 = android.os.SystemClock.uptimeMillis();
         String art = r == null || r.tmdbId <= 0 ? null : Suggestions.tmdbBackdrop(this, r.type, r.tmdbId);
         // Two thirds of the screen's width: drawn full screen, the smooth scaling gives it the
         // lightest softness, with no blurring to do and half the memory.
@@ -1384,19 +2978,34 @@ public class SearchActivity extends Activity {
         Bitmap src = art == null ? null : Suggestions.screenImage(this, art, full);
         if (src == null) src = Suggestions.screenImage(this, url, full);
         if (src == null) return null;
-        AMBIENT.put(url, src);
-        android.util.Log.i("SearchBg", (art != null ? "tmdb " : "jw ") + r.title + " " + src.getWidth() + "px in "
-                + (android.os.SystemClock.uptimeMillis() - t0) + "ms");
+        if (!isDestroyed()) AMBIENT.put(url, src);  // not kept in Home's process once Search has gone
         return src;
     }
 
-    /** Gets every shown result's background ready, first ones first. */
+    /** The first few results' backgrounds, waiting to be got ready until focus settles. */
+    List<Result> ambientTodo;
+
+    /**
+     * Gets the first four results' backgrounds ready, once nothing has changed for 600 ms: each is
+     * a big picture to decode, which would take time from the rows moving. The rest load as you
+     * move to them.
+     */
     void prepareAmbient(List<Result> rs) {
+        if (isDestroyed()) return;
         List<Result> todo = new ArrayList<>();
         for (Result r : rs) {
             String u = r.backdrop != null ? r.backdrop : r.poster;
-            if (u != null && AMBIENT.get(u) == null && todo.size() < 10) todo.add(r);
+            if (u != null && !"app".equals(r.type) && AMBIENT.get(u) == null && todo.size() < 4) todo.add(r);
         }
+        ambientTodo = todo.isEmpty() ? null : todo;
+        ui.removeCallbacks(ambientBatch);
+        if (ambientTodo != null) ui.postDelayed(ambientBatch, 600);
+    }
+
+    final Runnable ambientBatch = () -> {
+        List<Result> todo = ambientTodo;
+        ambientTodo = null;
+        if (todo == null || isDestroyed()) return;
         int gen = generation;
         ambientIo.execute(() -> {
             for (Result r : todo) {
@@ -1406,9 +3015,10 @@ public class SearchActivity extends Activity {
                 ambientArt(r, u);
             }
         });
-    }
+    };
 
     void ambientFor(Result r) {
+        if (isDestroyed()) return;
         String url = r.backdrop != null ? r.backdrop : r.poster;
         if (url == null || url.equals(ambientFor)) return;
         ambientFor = url;
@@ -1425,10 +3035,11 @@ public class SearchActivity extends Activity {
         ambientRun = () -> ambientNow.execute(() -> {
             if (!url.equals(ambientFor)) return;  // focus has moved on
             // The studio's full-size key art (TMDB) when there is one, else JustWatch's 1920 px
-            // picture: crisp at the screen's own width, under the page's dark shade.
+            // picture, opened at two thirds of the screen's width and drawn full screen under the
+            // page's dark shade.
             Bitmap bm = ambientArt(r, url);
             ui.post(() -> {
-                if (bm == null || !url.equals(ambientFor)) return;
+                if (bm == null || !url.equals(ambientFor) || isDestroyed()) return;
                 ambient.animate().cancel();
                 ambient.animate().alpha(0f).setDuration(180).setInterpolator(MainActivity.EASE).withEndAction(() -> {
                     ambient.setImageBitmap(bm);
@@ -1436,112 +3047,44 @@ public class SearchActivity extends Activity {
                 }).start();
             });
         });
-        ui.post(ambientRun);
+        // Not while the row glides and the card lifts: a big picture to decode would take frames
+        // from them. Moving on before then cancels it.
+        ui.postDelayed(ambientRun, 300);
     }
 
-    Runnable ambientRun = () -> { };
+    Runnable ambientRun = () -> { }, ambientTop = () -> { };
 
-    // ---------------------------------------------------------------- recent searches
-
-    static final int RECENT = 6;
-
-    /** Searches that led somewhere, newest first, kept on this TV only. */
-    List<String> recents() {
-        List<String> out = new ArrayList<>();
-        for (String q : getSharedPreferences("search", MODE_PRIVATE).getString("recent", "").split("\n")) {
-            if (!q.trim().isEmpty()) out.add(q);
-        }
-        return out;
-    }
-
-    void remember(String q) {
-        if (q == null || q.trim().isEmpty()) return;
-        List<String> l = recents();
-        for (int i = l.size() - 1; i >= 0; i--) if (l.get(i).equalsIgnoreCase(q.trim())) l.remove(i);
-        l.add(0, q.trim());
-        while (l.size() > RECENT) l.remove(l.size() - 1);
-        getSharedPreferences("search", MODE_PRIVATE).edit().putString("recent", String.join("\n", l)).apply();
-    }
-
-    /** Recent searches as glass pills above Popular Now: one press searches again. */
-    void recentRow() {
-        List<String> l = recents();
-        if (l.isEmpty()) return;
-        LinearLayout row = new LinearLayout(this);
-        row.setClipChildren(false);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-        TextView label = new TextView(this);
-        label.setText("Recent Searches");
-        label.setTextColor(0x99FFFFFF);
-        label.setTypeface(Ui.font(this, "semibold"));
-        Ui.textSize(label, 12);
-        LinearLayout.LayoutParams ll = new LinearLayout.LayoutParams(-2, -2);
-        ll.rightMargin = u(14);
-        row.addView(label, ll);
-        for (String q : l) {
-            Glass white = new Glass(u(16), u(0.6f), Glass.REGULAR);
-            TextView pill = new TextView(this);
-            pill.setText(q);
-            pill.setTextColor(Color.WHITE);
-            pill.setTypeface(Ui.font(this, "medium"));
-            Ui.textSize(pill, 12);
-            pill.setGravity(Gravity.CENTER);
-            pill.setPadding(u(16), 0, u(16), 0);
-            pill.setBackground(white);
-            pill.setFocusable(true);
-            // The text darkens with the plate as it fades, not ahead of it.
-            android.animation.ArgbEvaluator ev = new android.animation.ArgbEvaluator();
-            white.tint = f -> pill.setTextColor((int) ev.evaluate(f, Color.WHITE, 0xFF111114));
-            pill.setOnFocusChangeListener((v, has) -> {
-                Glass.focus(white, has);
-                Glass.lift(v, has, 1.08f, u(6));
-                if (has) keepInView(v);
-            });
-            pill.setOnClickListener(v -> {
-                field.setText(q);
-                field.setSelection(field.length());
-                ui.removeCallbacks(debounced);
-                search(q);
-            });
-            LinearLayout.LayoutParams pl = new LinearLayout.LayoutParams(-2, u(32));
-            pl.rightMargin = u(10);
-            row.addView(pill, pl);
-        }
-        row.setPadding(u(48), u(4), u(48), u(4));
-        LinearLayout.LayoutParams rl = new LinearLayout.LayoutParams(-1, -2);
-        rl.bottomMargin = u(22);
-        grid.addView(row, rl);
-    }
+    // ---------------------------------------------------------------- opening
 
     /** An app opens; a show or film opens its page, with the synopsis and every way to watch it. */
     void open(Result r) {
-        remember(lastQuery);
         if (r.appLaunch != null) {
             Suggestions.start(this, r.appLaunch);
             return;
         }
         if (r.id == null && r.tmdbId > 0) {
+            // (Remembered once found, as the title its page is for, not twice.)
             // An actor's film from TMDB: find it on JustWatch for its page (where to watch it).
-            setStatus("Opening\u2026");
             io.execute(() -> {
                 Result found = brain.resolve(r);
                 ui.post(() -> {
-                    setStatus("");
+                    if (isDestroyed()) return;  // left meanwhile: no page popping up over somewhere else
                     if (found != null) {
                         found.backdrop = r.backdrop != null ? r.backdrop : found.backdrop;
                         open(found);
                     } else {
-                        field.setText(r.title);
-                        ui.removeCallbacks(debounced);
-                        search(r.title);
+                        setQuery(r.title);
                     }
                 });
             });
             return;
         }
+        remember(r);
+        opened = true;
         startActivity(new Intent(this, DetailActivity.class).addFlags(Intent.FLAG_ACTIVITY_NO_USER_ACTION)
                 .putExtra("id", r.id).putExtra("title", r.title)
-                .putExtra("backdrop", r.backdrop));
+                .putExtra("backdrop", r.backdrop)
+                .putExtra("tmdb", r.tmdbId).putExtra("type", r.type));
         overridePendingTransition(R.anim.page_in, R.anim.hold);
     }
 }

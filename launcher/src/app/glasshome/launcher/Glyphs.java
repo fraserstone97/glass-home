@@ -6,7 +6,7 @@ import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.RectF;
 
-/** SF Symbols\u2013style line glyphs for Control Center, drawn in code (no image assets). */
+/** SF Symbols\u2013style glyphs for Control Centre, Settings and Home's drawn cards, drawn in code (no image assets). */
 final class Glyphs {
     private Glyphs() { }
 
@@ -28,15 +28,23 @@ final class Glyphs {
                 c.drawArc(r, -60, 300, false, p);
                 c.drawLine(m, s * 0.1f, m, s * 0.48f, p);
                 break;
-            case "wifi":
-                for (int i = 0; i < 3; i++) {
-                    float rad = s * (0.16f + 0.15f * i);
-                    r.set(m - rad, s * 0.78f - rad, m + rad, s * 0.78f + rad);
+            case "wifi": {  // two heavy arcs over a rounded wedge, like SF Symbols' wifi
+                float cy = s * 0.8f;
+                p.setStrokeWidth(s * 0.1f);
+                for (float rad : new float[]{s * 0.5f, s * 0.306f}) {
+                    r.set(m - rad, cy - rad, m + rad, cy + rad);
                     c.drawArc(r, -135, 90, false, p);
                 }
                 p.setStyle(Paint.Style.FILL);
-                c.drawCircle(m, s * 0.78f, s * 0.06f, p);
+                p.setPathEffect(new android.graphics.CornerPathEffect(s * 0.03f));
+                r.set(m - s * 0.16f, cy - s * 0.16f, m + s * 0.16f, cy + s * 0.16f);
+                path.moveTo(m, cy);
+                path.arcTo(r, -135, 90);
+                path.close();
+                c.drawPath(path, p);
+                p.setPathEffect(null);
                 break;
+            }
             case "bluetooth":  // the rune
                 p.setStrokeWidth(s * 0.075f);
                 path.moveTo(s * 0.3f, s * 0.32f);
@@ -59,10 +67,10 @@ final class Glyphs {
                 c.drawPath(path, p);
                 c.drawLine(s * 0.36f, s * 0.84f, s * 0.64f, s * 0.84f, p);
                 break;
-            case "sparkles":  // screen saver
+            case "sparkles":  // screen saver: SF's big star at the lower right, two small ones above it
                 p.setStyle(Paint.Style.FILL);
-                for (float[] st : new float[][]{{0.42f, 0.5f, 0.3f}, {0.74f, 0.26f, 0.14f}, {0.74f, 0.74f, 0.1f}}) {
-                    float cx = s * st[0], cy = s * st[1], k = s * st[2], w = k * 0.22f;
+                for (float[] st : new float[][]{{0.558f, 0.64f, 0.306f}, {0.282f, 0.363f, 0.15f}, {0.485f, 0.145f, 0.09f}}) {
+                    float cx = s * st[0], cy = s * st[1], k = s * st[2], w = k * 0.25f;
                     path.reset();
                     path.moveTo(cx, cy - k);
                     path.quadTo(cx + w, cy - w, cx + k, cy);
@@ -168,10 +176,11 @@ final class Glyphs {
                 path.close();
                 c.drawPath(path, p);
                 break;
-            case "timer":
-                c.drawCircle(m, m, s * 0.34f, p);
-                c.drawLine(m, m, m - s * 0.12f, m - s * 0.14f, p);
-                c.drawLine(m, s * 0.16f, m, s * 0.24f, p);
+            case "timer":  // a ring open at the upper left, a stem down from its top, the hand pointing up-left
+                r.set(m - s * 0.34f, m - s * 0.34f, m + s * 0.34f, m + s * 0.34f);
+                c.drawArc(r, -95, 323, false, p);
+                c.drawLine(m, s * 0.165f, m, s * 0.3f, p);  // its round end flush with the ring's top
+                c.drawLine(m, m, m - s * 0.17f, m - s * 0.165f, p);
                 break;
             case "gamepad":
                 r.set(s * 0.08f, s * 0.3f, s * 0.92f, s * 0.74f);
@@ -188,13 +197,38 @@ final class Glyphs {
                 c.drawCircle(s * 0.74f, m + s * 0.06f, s * 0.035f, p);
                 p.setXfermode(null);
                 break;
-            case "gear":
+            case "gear": {  // gearshape.fill: eight broad, tapering teeth on a disc and a plain hole
                 p.setStyle(Paint.Style.FILL);
-                MainActivity.drawGear(c, m, m, s * 0.3f, color, 0x00000000);
-                Paint hole = new Paint(Paint.ANTI_ALIAS_FLAG);
-                hole.setXfermode(new android.graphics.PorterDuffXfermode(android.graphics.PorterDuff.Mode.CLEAR));
-                c.drawCircle(m, m, s * 0.13f, hole);
+                path.addCircle(m, m, s * 0.27f, Path.Direction.CW);
+                Path part = new Path();
+                for (int i = 0; i < 8; i++) {
+                    double a = Math.toRadians(-90 + 45 * i);
+                    float dx = (float) Math.cos(a), dy = (float) Math.sin(a);
+                    float r0 = s * 0.238f, w0 = s * 0.094f, r1 = s * 0.36f, w1 = s * 0.058f;
+                    part.reset();
+                    part.moveTo(m + dx * r0 - dy * w0, m + dy * r0 + dx * w0);
+                    part.lineTo(m + dx * r1 - dy * w1, m + dy * r1 + dx * w1);
+                    part.lineTo(m + dx * r1 + dy * w1, m + dy * r1 - dx * w1);
+                    part.lineTo(m + dx * r0 + dy * w0, m + dy * r0 - dx * w0);
+                    part.close();
+                    path.op(part, Path.Op.UNION);
+                }
+                part.reset();
+                part.addCircle(m, m, s * 0.12f, Path.Direction.CW);
+                path.op(part, Path.Op.DIFFERENCE);
+                p.setPathEffect(new android.graphics.CornerPathEffect(s * 0.02f));
+                c.drawPath(path, p);
+                p.setPathEffect(null);
                 break;
+            }
+            case "magnifier": {  // magnifyingglass: a ring and a slightly heavier handle at 45 degrees (Search)
+                float cx = s * 0.42f, rad = s * 0.32f, e = rad * 0.7071f;
+                p.setStrokeWidth(s * 0.08f);
+                c.drawCircle(cx, cx, rad, p);
+                p.setStrokeWidth(s * 0.095f);
+                c.drawLine(cx + e, cx + e, s * 0.89f, s * 0.89f, p);
+                break;
+            }
             case "input":  // a screen with an arrow coming in from the left (Inputs)
                 r.set(s * 0.3f, s * 0.2f, s * 0.88f, s * 0.8f);
                 path.moveTo(s * 0.3f, s * 0.36f);
@@ -256,21 +290,25 @@ final class Glyphs {
                 c.drawRoundRect(r, s * 0.035f, s * 0.035f, p);
                 break;
             }
-            case "house": {  // Home Screen: a solid house with eaves and an arched door, like SF Symbols' house.fill
+            case "house": {  // Home Screen, like SF Symbols' house.fill: a roof line over the body, a chimney, a square door
+                p.setStrokeWidth(s * 0.081f);
+                path.moveTo(s * 0.086f, s * 0.466f);
+                path.lineTo(m, s * 0.151f);
+                path.lineTo(s * 0.914f, s * 0.466f);
+                c.drawPath(path, p);
                 p.setStyle(Paint.Style.FILL);
-                p.setPathEffect(new android.graphics.CornerPathEffect(s * 0.05f));
+                c.drawRect(s * 0.757f, s * 0.19f, s * 0.815f, s * 0.376f, p);
                 Path h = new Path();
-                h.moveTo(m, s * 0.13f);
-                h.lineTo(s * 0.91f, s * 0.49f);
-                h.lineTo(s * 0.79f, s * 0.49f);
-                h.lineTo(s * 0.79f, s * 0.87f);
-                h.lineTo(s * 0.21f, s * 0.87f);
-                h.lineTo(s * 0.21f, s * 0.49f);
-                h.lineTo(s * 0.09f, s * 0.49f);
+                h.moveTo(s * 0.194f, s * 0.489f);
+                h.lineTo(m, s * 0.241f);
+                h.lineTo(s * 0.806f, s * 0.489f);
+                h.lineTo(s * 0.806f, s * 0.891f);
+                h.lineTo(s * 0.194f, s * 0.891f);
                 h.close();
                 Path door = new Path();
-                door.addRoundRect(new RectF(s * 0.42f, s * 0.61f, s * 0.58f, s * 0.95f), s * 0.07f, s * 0.07f, Path.Direction.CW);
+                door.addRect(s * 0.41f, s * 0.589f, s * 0.59f, s * 0.832f, Path.Direction.CW);
                 h.op(door, Path.Op.DIFFERENCE);
+                p.setPathEffect(new android.graphics.CornerPathEffect(s * 0.03f));
                 c.drawPath(h, p);
                 p.setPathEffect(null);
                 break;

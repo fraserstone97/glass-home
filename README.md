@@ -31,19 +31,23 @@ Android 7 or newer.
 - **Search that understands you.** Type, or hold the mic button and ask the way you'd ask a
   person: *slow horses*, *films like Inception*, *comedies with Will Ferrell*, *films directed by
   Greta Gerwig*, *documentaries about space*, *80s films*, *kids films*, *what's new on Netflix*,
-  *Christmas films*. Answers come as tvOS shelves (Top Results, More Like This, an actor's or
+  *Christmas films*. Answers come as tvOS shelves (Top Results with related titles, an actor's or
   director's work, what's trending in a genre), kept to what UK viewers watch and can watch, with
-  IMDb and Rotten Tomatoes scores. Voice uses Google's speech service, not Gemini, and a glow runs
-  round the search field while it listens. Every result opens a title page with the synopsis,
-  cast, ratings, a Watch button and *How to Watch*: every UK service that streams, rents or sells
-  it, with prices. (Actors, directors and subjects need the free TMDB key below.)
+  IMDb and Rotten Tomatoes scores. The keyboard sits on the left as on tvOS, and the titles you
+  open are kept under Recently Searched. Voice uses Google's speech service, not Gemini, and a glow
+  runs round the search field while it listens. Every result opens a title page with the
+  synopsis, cast, ratings, a Watch button and *How to Watch*: every UK service that streams, rents
+  or sells it, labelled the way Apple labels them (*Stream* for a subscription you may or may not
+  have, *Free with ads*, add-on channels as add-ons, rental and purchase prices). (Actors,
+  directors and subjects need the free TMDB key below.)
 - **Remote buttons that work.** Netflix, Prime Video, YouTube and Quick Settings, from any screen.
 - **Apple's aerials as the screen saver.** 92 of Apple TV's aerial films in 4K, shuffled with no
-  repeats, dissolving from one to the next. Press Up to see where you are.
-- **Weather** from the Met Office (or Open-Meteo, MET Norway, wttr.in) in the corner.
+  repeats, dissolving from one to the next. Press Up to see where you are, Right for the next one.
+- **Weather** from the Met Office (or Open-Meteo, MET Norway, wttr.in) in the corner, with
+  Apple's multicolour icons that follow day and night, and the next hours and 5 days a click away.
 - **Settings that look the part**: everything from the dock order to the screen saver's timing, in
   tvOS-style pages.
-- **Light and fast.** About 1 MB, plain Java with no libraries, tuned frame by frame on a
+- **Light and fast.** About 2 MB, plain Java with no libraries, tuned frame by frame on a
   mid-range TV.
 - **No accounts, no tracking.** The only network calls are JustWatch (recommendations), TMDB
   (artwork, optional), your weather source and Apple's video server (the screen saver).

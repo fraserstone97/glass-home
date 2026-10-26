@@ -28,7 +28,8 @@ if [ -n "${APP_NAME:-}" ]; then
     RES=build/res
 fi
 "$BT/aapt2" compile --dir "$RES" -o build/res.zip
-"$BT/aapt2" link -o build/unsigned.apk -I "$JAR" --manifest AndroidManifest.xml \
+# Fonts stored uncompressed (-0 ttf), so they load straight from the APK without inflating them.
+"$BT/aapt2" link -o build/unsigned.apk -I "$JAR" --manifest AndroidManifest.xml -0 ttf \
     -A assets --java build/gen --min-sdk-version 24 --target-sdk-version 34 \
     --version-code "${VERSION_CODE:-1}" --version-name "${VERSION_NAME:-1.0}" build/res.zip
 
