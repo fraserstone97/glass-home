@@ -2707,10 +2707,13 @@ public class SearchActivity extends Activity {
                 if (pick != null) break;
             }
             if (pick == null) continue;
-            Bitmap small = Suggestions.image(this, pick.poster, "", 40);
-            if (small == null) continue;
-            Bitmap soft = Suggestions.onGpu(Ui.blur(small, 26, 39, 2, 2));
-            small.recycle();
+            // A still from the title, sharp, cropped to the tile, as Apple's Browse tiles are: scenes,
+            // not posters, so the genre's name never sits on top of a title's own lettering. Wide
+            // enough that its height fills the 2:3 tile; the poster only when there's no still.
+            Bitmap full = pick.backdrop != null ? Suggestions.image(this, pick.backdrop, "", u(360)) : null;
+            if (full == null) full = Suggestions.image(this, pick.poster, "", u(150));
+            if (full == null) continue;
+            Bitmap soft = Suggestions.onGpu(full);
             TILE_ART.put(g[1], soft);
             String code = g[1];
             ui.post(() -> {
@@ -2728,8 +2731,8 @@ public class SearchActivity extends Activity {
 
     /**
      * A Browse tile, as tvOS 26's: a 2:3 tile with its name inside the art, and no caption. A
-     * genre's art is a popular title of that genre blurred to its colours (it's not that title);
-     * a service's is its banner on a dark platter. OK browses it.
+     * genre's art is a still from a popular title of that genre; a service's is its banner on a
+     * dark platter. OK browses it.
      */
     View tile(Sec s, Result r) {
         int w = s.w, h = w * 3 / 2, radius = u(10);
@@ -2754,7 +2757,7 @@ public class SearchActivity extends Activity {
             Bitmap b = TILE_ART.get(r.genre);
             if (b != null) art.setImageBitmap(b);
             else tiles.put(r.genre, art);
-            art.setForeground(new ColorDrawable(0x66000000));
+            art.setScaleType(ImageView.ScaleType.CENTER_CROP);
             box.addView(art, new FrameLayout.LayoutParams(w, h));
         }
         View shade = new View(this);
