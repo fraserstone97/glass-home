@@ -89,7 +89,7 @@ public class SettingsActivity extends Activity {
     // tvOS-style pages: the main list opens a page per section; Back returns to the main list.
     static final String ROOT = "root", SHELF = "Top Shelf",
             INPUTS = "Inputs", WEATHER = "Weather", HOME = "Home Screen",
-            PERMS = "Permissions", ABOUT = "About", SAVER = "Screen Saver";
+            PERMS = "Permissions", ABOUT = "About", SAVER = "Screen Saver", JELLYFIN = "Jellyfin";
     /** A list of choices opened from a row (a page of its own). */
     static final String CHOICE = "choice";
 
@@ -192,6 +192,7 @@ public class SettingsActivity extends Activity {
             case WEATHER: pageWeather(); break;
             case HOME: pageHome(); break;
             case SAVER: pageSaver(); break;
+            case JELLYFIN: pageJellyfin(); break;
             case PERMS: pagePermissions(); break;
             case ABOUT: pageAbout(); break;
             default: pageRoot(); break;
@@ -533,6 +534,7 @@ public class SettingsActivity extends Activity {
             case WEATHER: grad = new int[]{0xFF5AC8FA, 0xFF2D6BD8}; glyph = null; break;
             case HOME: grad = new int[]{0xFF30D158, 0xFF1E9E48}; glyph = "house"; break;
             case SAVER: grad = new int[]{0xFF5E5CE6, 0xFF2C2A8C}; glyph = "sparkles"; break;
+            case JELLYFIN: grad = new int[]{0xFFAA5CC3, 0xFF00A4DC}; glyph = "mediaplayer"; break;
             case PERMS: grad = new int[]{0xFF8E8E93, 0xFF48484A}; glyph = "shield"; break;
             default: grad = new int[]{0xFF8E8E93, 0xFF3A3A3C}; glyph = "gear"; break;
         }
@@ -558,6 +560,7 @@ public class SettingsActivity extends Activity {
         nav(WEATHER, null);
         nav(HOME, null);
         nav(SAVER, null);
+        nav(JELLYFIN, null);
         nav(PERMS, () -> {
             int missing = (Perms.hasLocation(this) ? 0 : 1)
                     + (SleepReceiver.canSleep(this) || !Perms.adminSupported(this) ? 0 : 1) + (Perms.isDefaultHome(this) ? 0 : 1);
@@ -722,6 +725,108 @@ public class SettingsActivity extends Activity {
             n.setPadding(u(18), u(10), u(18), 0);
             list.addView(n);
         }
+    }
+
+    // ---------------------------------------------------------------- Jellyfin
+
+    /** Busy finding the server, or syncing with it: said in place, in the row's value. */
+    boolean searching, syncing;
+
+    /** Your Jellyfin server: found on the network, signed in with Quick Connect. */
+    void pageJellyfin() {
+        row("Server", () -> Jellyfin.server(this).isEmpty() ? (searching ? "Searching…" : "None Found")
+                : Jellyfin.name(this) + "  ·  " + Jellyfin.server(this).replace("http://", ""), this::findServer);
+        if (Jellyfin.connected(this)) {
+            row("Library", () -> syncing ? "Syncing…" : syncState(), this::syncNow);
+            if (Jellyfin.prefs(this).getBoolean(Jellyfin.K_REJECTED, false)) {
+                row("Sign In Again", () -> qcCode == null ? "" : qcCode, this::quickConnect);
+            }
+            row("Sign Out", null, () -> {
+                Jellyfin.disconnect(this);
+                show(JELLYFIN, 0, null);
+            });
+        } else {
+            row("Sign In with Quick Connect", () -> qcCode == null ? "" : qcCode, this::quickConnect);
+        }
+        if (Jellyfin.server(this).isEmpty()) findServer();
+    }
+
+    String qcCode;
+
+    /** When the shelf last came from the server, or why it couldn't. */
+    String syncState() {
+        android.content.SharedPreferences p = Jellyfin.prefs(this);
+        if (p.getBoolean(Jellyfin.K_REJECTED, false)) return "Sign In Needed";
+        long synced = p.getLong(Jellyfin.K_SYNCED, 0), tried = p.getLong(Jellyfin.K_TRIED, 0);
+        if (synced == 0) return tried == 0 ? "Not Synced Yet" : "Server Not Reachable";
+        String when = "Synced " + ago(synced);
+        return tried > synced + 60_000L ? "Server Asleep · " + when : when;
+    }
+
+    static String ago(long t) {
+        long m = (System.currentTimeMillis() - t) / 60_000L;
+        long h = m / 60, d = m / 1440;
+        return m < 1 ? "Just Now" : m < 60 ? m + (m == 1 ? " Minute" : " Minutes") + " Ago"
+                : h < 48 ? h + (h == 1 ? " Hour" : " Hours") + " Ago" : d + " Days Ago";
+    }
+
+    void syncNow() {
+        if (syncing) return;
+        syncing = true;
+        new Thread(() -> {
+            Jellyfin.refresh(this);
+            runOnUiThread(() -> {
+                syncing = false;
+                refreshAll();
+            });
+        }).start();
+    }
+
+    void findServer() {
+        if (searching) return;
+        searching = true;
+        refreshAll();
+        new Thread(() -> {
+            Jellyfin.discover(this);
+            runOnUiThread(() -> {
+                searching = false;
+                refreshAll();
+            });
+        }).start();
+    }
+
+    /** Shows a code to approve in Jellyfin (Profile > Quick Connect), and waits up to five minutes. */
+    void quickConnect() {
+        new Thread(() -> {
+            if (Jellyfin.server(this).isEmpty()) Jellyfin.discover(this);
+            String[] qc = Jellyfin.quickConnectStart(this);
+            if (qc == null) {
+                runOnUiThread(() -> Perms.alert(this, "Quick Connect Is Off",
+                        "Turn on Quick Connect in Jellyfin’s Dashboard first."));
+                return;
+            }
+            runOnUiThread(() -> {
+                qcCode = qc[0];
+                refreshAll();
+                Perms.alert(this, "Enter " + qc[0].substring(0, 3) + " " + qc[0].substring(3) + " in Jellyfin",
+                        "In Jellyfin on your phone or computer: your profile › Quick Connect, then enter this code.");
+            });
+            for (int i = 0; i < 100; i++) {
+                try {
+                    Thread.sleep(3000);
+                } catch (InterruptedException e) {
+                    return;
+                }
+                if (Jellyfin.quickConnectPoll(this, qc[1])) {
+                    Jellyfin.refresh(this);
+                    runOnUiThread(() -> {
+                        qcCode = null;
+                        if (JELLYFIN.equals(page) && !isDestroyed()) show(JELLYFIN, 0, null);
+                    });
+                    return;
+                }
+            }
+        }).start();
     }
 
     // ---------------------------------------------------------------- screen saver

@@ -78,6 +78,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 /**
  * tvOS-style Search, laid out as the Apple TV app lays it out for a remote with arrow keys: the
@@ -151,6 +152,8 @@ public class SearchActivity extends Activity {
         double imdb;
         int tomato = -1;
         boolean certified, rentBuy;
+        /** The same title in your Jellyfin library, when it's there. */
+        String jellyfin;
         /** Where it was made (ISO codes), for keeping loose matches to what UK viewers watch. */
         final List<String> countries = new ArrayList<>();
         int tmdbId, votes;
@@ -1889,6 +1892,11 @@ public class SearchActivity extends Activity {
             land(gen);
             return;
         }
+        // Your library is asked at once, beside the services, and only once for both answers.
+        SearchBrain.Query read = SearchBrain.read(q);
+        String key = read.text.isEmpty() ? q : read.text;
+        libFor.keySet().retainAll(Collections.singleton(key));
+        lookUp(key);
         running = searches.submit(() -> {
             List<SearchBrain.Shelf> shelves = new ArrayList<>();
             boolean failed = false;
@@ -1897,7 +1905,7 @@ public class SearchActivity extends Activity {
                 // slide in after them when they arrive.
                 shelves.addAll(brain.answer(q, early -> {
                     if (gen != generation) return;
-                    List<SearchBrain.Shelf> first = mine(q, early, tile);
+                    List<SearchBrain.Shelf> first = mine(q, early, true, tile);
                     if (gen != generation) return;
                     ui.post(() -> {
                         if (gen == generation) show(first);
@@ -1912,7 +1920,7 @@ public class SearchActivity extends Activity {
                 failed = true;
             }
             if (gen != generation) return;
-            shelves = mine(q, shelves, tile);
+            shelves = mine(q, shelves, false, tile);
             if (gen != generation) return;
             List<SearchBrain.Shelf> all = shelves;
             boolean offline = failed && all.isEmpty();
@@ -1982,13 +1990,24 @@ public class SearchActivity extends Activity {
     }
 
     /**
-     * Your own: the apps that match, placed where they belong among the shelves. From a service's
-     * Browse tile (tile), its titles are what's wanted, not its app.
+     * Your own: the library's copies and the apps that match, placed where they belong among the
+     * shelves. The early answer waits only briefly for the library, so a sleeping server never holds
+     * the first shelves back (the final one waits longer). From a service's Browse tile (tile), its
+     * titles are what's wanted, not its app.
      */
-    List<SearchBrain.Shelf> mine(String q, List<SearchBrain.Shelf> in, boolean tile) {
+    List<SearchBrain.Shelf> mine(String q, List<SearchBrain.Shelf> in, boolean early, boolean tile) {
         List<SearchBrain.Shelf> shelves = SearchBrain.copy(in);
         SearchBrain.Query read = SearchBrain.read(q);
         String key = read.text.isEmpty() ? q : read.text;
+        List<Result> lib = library(key, read.year, shelves, early ? 200 : 3000);
+        if (!lib.isEmpty()) {
+            // Your own copy first when it's what was asked for (Avatar); after the top results
+            // when it's only close to it (Dune: Part Two, for "dune").
+            double best = 0, top = 0;
+            for (Result r : lib) best = Math.max(best, SearchBrain.matchScore(key, r.title));
+            if (!shelves.isEmpty() && !shelves.get(0).items.isEmpty()) top = SearchBrain.matchScore(key, shelves.get(0).items.get(0).title);
+            shelves.add(best >= top || shelves.isEmpty() ? 0 : 1, new SearchBrain.Shelf("In Your Library", lib));
+        }
         List<Result> apps = matchApps(key);
         if (!apps.isEmpty()) {
             // "netflix", "bbc": the app is what's wanted; otherwise apps come last.
@@ -1996,6 +2015,62 @@ public class SearchActivity extends Activity {
             shelves.add(exact ? 0 : shelves.size(), new SearchBrain.Shelf("Apps", apps));
         }
         return shelves;
+    }
+
+    /** Library lookups by what was asked, each started once (the early and final answers share it). */
+    final Map<String, Future<List<String[]>>> libFor = new ConcurrentHashMap<>();
+
+    Future<List<String[]>> lookUp(String key) {
+        return libFor.computeIfAbsent(key, k -> searches.submit(() -> Jellyfin.search(this, k)));
+    }
+
+    /**
+     * Your Jellyfin library in the results: a title that's also on the services is marked (and
+     * moves to the front); one that's only in your library is added at the front. Waits up to
+     * `wait` ms for it.
+     */
+    List<Result> library(String q, int year, List<SearchBrain.Shelf> shelves, long wait) {
+        List<Result> front = new ArrayList<>();
+        List<String[]> mine;
+        try {
+            mine = lookUp(q).get(wait, TimeUnit.MILLISECONDS);
+        } catch (Exception e) {
+            return front;  // slow or away: the services alone this time
+        }
+        if (mine.isEmpty()) return front;
+        List<Result> rest = shelves.isEmpty() ? new ArrayList<>() : shelves.get(0).items;
+        for (String[] m : mine) {
+            if (SearchBrain.matchScore(q, m[1]) < 60) continue;
+            int y = Suggestions.parseInt(m[2]);
+            if (year > 0 && y > 0 && Math.abs(y - year) > 1) continue;  // "dune 2021": not Part Two
+            Result same = null;
+            for (Result r : rest) {
+                int ry = Suggestions.parseInt(r.year == null ? "" : r.year);
+                if (SearchBrain.norm(r.title).equals(SearchBrain.norm(m[1])) && (y == 0 || ry == 0 || Math.abs(y - ry) <= 1)) {
+                    same = r;
+                    break;
+                }
+            }
+            if (same != null) {
+                rest.remove(same);
+            } else {
+                same = new Result();
+                same.title = m[1];
+                same.year = y > 0 ? String.valueOf(y) : "";
+                same.type = m[3];
+            }
+            same.jellyfin = m[0];
+            if (same.id == null) libraryArt(same);
+            front.add(same);
+        }
+        if (!shelves.isEmpty() && shelves.get(0).items.isEmpty()) shelves.remove(0);
+        return front;
+    }
+
+    /** A title only in your library: its pictures from there. */
+    void libraryArt(Result r) {
+        r.poster = Jellyfin.poster(this, r.jellyfin);
+        r.backdrop = Jellyfin.server(this) + "/Items/" + r.jellyfin + "/Images/Backdrop?maxWidth=1920&quality=90";
     }
 
     /** The TV's apps (name and how to open them), read once a visit. */
@@ -2182,7 +2257,7 @@ public class SearchActivity extends Activity {
 
     /**
      * Results as tvOS shelves: a heading over a row that scrolls sideways (a single shelf of
-     * results is a grid). Top Results, someone's work and Apps for a search;
+     * results is a grid). Your Library, Top Results, someone's work and Apps for a search;
      * Recently Searched and the Browse grid before one. Nothing found is
      * said in their place (failed: it couldn't connect).
      */
@@ -2745,6 +2820,7 @@ public class SearchActivity extends Activity {
             break;
         }
         if (r.dupe && r.year != null && !r.year.isEmpty()) sb.append(" \u00b7 ").append(r.year);
+        if (r.jellyfin != null) sb.append(" \u00b7 In Your Library");
         return sb.toString();
     }
 
@@ -2874,9 +2950,11 @@ public class SearchActivity extends Activity {
                 r.year = o.optString("year");
                 r.poster = o.optString("poster", null);
                 r.backdrop = o.optString("backdrop", null);
+                r.jellyfin = o.optString("jellyfin", null);
                 r.tmdbId = o.optInt("tmdbId");
                 String g = o.optString("genre");
                 if (!g.isEmpty()) r.genres.add(g);
+                if (r.id == null && r.jellyfin != null) libraryArt(r);
                 out.add(r);
             }
         } catch (Exception ignored) {
@@ -2901,8 +2979,10 @@ public class SearchActivity extends Activity {
         if (r.title == null) return;
         try {
             JSONArray old = new JSONArray(prefs().getString("titles", "[]")), a = new JSONArray();
+            boolean library = r.id == null && r.jellyfin != null;  // its pictures' addresses aren't kept
             a.put(new JSONObject().put("id", r.id).put("title", r.title).put("type", r.type).put("year", r.year)
-                    .put("poster", r.poster).put("backdrop", r.backdrop).put("tmdbId", r.tmdbId)
+                    .put("poster", library ? null : r.poster).put("backdrop", library ? null : r.backdrop)
+                    .put("jellyfin", r.jellyfin).put("tmdbId", r.tmdbId)
                     .put("genre", r.genres.isEmpty() ? null : r.genres.get(0)).put("at", System.currentTimeMillis()));
             for (int i = 0; i < old.length() && a.length() < RECENT; i++) {
                 JSONObject o = old.getJSONObject(i);
@@ -3521,6 +3601,12 @@ public class SearchActivity extends Activity {
             Suggestions.start(this, r.appLaunch);
             return;
         }
+        if (r.id == null && r.jellyfin != null) {  // only in your library: straight to it in Wholphin
+            remember(r);
+            opened = true;
+            Jellyfin.play(this, r.jellyfin);
+            return;
+        }
         if (r.id == null && r.tmdbId > 0) {
             // (Remembered once found, as the title its page is for, not twice.)
             // An actor's film from TMDB: find it on JustWatch for its page (where to watch it).
@@ -3548,7 +3634,7 @@ public class SearchActivity extends Activity {
         opened = true;
         startActivity(new Intent(this, DetailActivity.class).addFlags(Intent.FLAG_ACTIVITY_NO_USER_ACTION)
                 .putExtra("id", r.id).putExtra("title", r.title)
-                .putExtra("backdrop", r.backdrop)
+                .putExtra("backdrop", r.backdrop).putExtra("jellyfin", r.jellyfin)
                 .putExtra("tmdb", r.tmdbId).putExtra("type", r.type));
         overridePendingTransition(R.anim.page_in, R.anim.hold);
     }

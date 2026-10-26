@@ -890,7 +890,7 @@ public class DetailActivity extends Activity {
     }
 
     /**
-     * The one main button, as Apple's: Watch on the best free service you have;
+     * The one main button, as Apple's: your own copy; else Watch on the best free service you have;
      * else Open in the service or store you have (you may not subscribe, so it doesn't promise
      * to play: you buy, rent, subscribe or add the channel there); else Get the app that streams it.
      */
@@ -898,6 +898,8 @@ public class DetailActivity extends Activity {
     volatile boolean elsewhere;
 
     View primary(List<Offer> offers) {
+        String mine = getIntent().getStringExtra("jellyfin");
+        if (mine != null) return pill("▶  Play from Your Library", v -> Jellyfin.play(this, mine));
         // Ranked: anything free comes before a subscription.
         for (Offer o : offers) {
             if (o.installed && (o.free || o.ads || o.subscription)) {

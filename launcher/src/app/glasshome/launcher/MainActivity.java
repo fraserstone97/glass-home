@@ -582,10 +582,15 @@ public class MainActivity extends Activity {
         firstTick = true;
         handler.removeCallbacks(this.weatherTick);
         handler.post(this.weatherTick);
+        // Your library's shelf stays current (what's new on your server):
+        // checked shortly after Home returns, then every ten minutes while it's in front.
+        firstLibraryTick = true;
+        handler.removeCallbacks(this.jellyfinTick);
+        handler.postDelayed(this.jellyfinTick, 1500);
     };
 
-    /** The next weather check is the first since Home came back. */
-    boolean firstTick;
+    /** The next weather and library checks are the first since Home came back. */
+    boolean firstTick, firstLibraryTick;
 
     /**
      * Whether to reach for the internet now. Straight after a return or a wake (fresh) only a
@@ -597,6 +602,15 @@ public class MainActivity extends Activity {
         return netState == 2 || (!fresh && netState == 1);
     }
 
+    final Runnable jellyfinTick = new Runnable() {
+        @Override public void run() {
+            boolean fresh = firstLibraryTick;
+            firstLibraryTick = false;
+            if (online(fresh) && Jellyfin.connected(MainActivity.this)) jellyfinShelf();
+            handler.postDelayed(this, 10 * 60_000L);
+        }
+    };
+
     @Override
     protected void onPause() {
         super.onPause();
@@ -604,6 +618,7 @@ public class MainActivity extends Activity {
         handler.removeCallbacks(resumeWork);
         handler.removeCallbacks(heroAdvance);
         handler.removeCallbacks(weatherTick);
+        handler.removeCallbacks(jellyfinTick);
         handler.removeCallbacks(idleRunnable);
         if (idle) exitIdle();
     }
@@ -1436,6 +1451,8 @@ public class MainActivity extends Activity {
             TV_SETTINGS, "com.android.vending", "com.mitv.dream",
             // Their own banners crowd the logo and the name; as on Apple TV, the icon on its colour.
             "com.spotify.tv.android", "org.videolan.vlc",
+            // Wholphin: its glossy cube alone, without the word beside it.
+            "com.github.damontecres.wholphin",
             // Prime Video's banner is a soft 320 px picture; its icon is a vector, sharp at any size.
             "com.amazon.amazonvideo.livingroom",
             // TCL's own players have plain banners with the name printed on them.
@@ -1772,6 +1789,9 @@ public class MainActivity extends Activity {
         } else if ("com.amazon.amazonvideo.livingroom".equals(e.pkg)) { // Prime Video: its own blue
             top = lighten(0xFF0578FF, 0.07f);
             bottom = lighten(0xFF0578FF, -0.06f);
+        } else if ("com.github.damontecres.wholphin".equals(e.pkg)) { // Wholphin: deep indigo into violet
+            top = 0xFF3A2A8C;
+            bottom = 0xFF120B33;
         } else if ("org.videolan.vlc".equals(e.pkg)) {   // VLC: its white cone on orange, as on Apple TV
             top = 0xFFF8A00A;
             bottom = 0xFFE35C00;
@@ -1792,7 +1812,14 @@ public class MainActivity extends Activity {
         }
         String drawn = "com.tcl.ui_mediaCenter".equals(e.pkg) ? "mediaplayer" : "com.tcl.gallery".equals(e.pkg) ? "photos"
                 : "org.videolan.vlc".equals(e.pkg) ? "vlc" : null;
-        boolean colour = "com.android.vending".equals(e.pkg);
+        boolean colour = "com.android.vending".equals(e.pkg) || "com.github.damontecres.wholphin".equals(e.pkg);
+        if ("com.github.damontecres.wholphin".equals(e.pkg)) {
+            // A soft glow in the cube's own blue-violet, behind where it sits.
+            p.setShader(new RadialGradient(w / 2f, h / 2f, h * 0.62f, new int[]{0x887A5CFF, 0x223E7BFF, 0x00000000},
+                    new float[]{0f, 0.55f, 1f}, Shader.TileMode.CLAMP));
+            c.drawRect(0, 0, w, h, p);
+            p.setShader(null);
+        }
         // Cards that trim and fit their glyph draw it large first and shrink it, so it stays crisp.
         int gs = "com.amazon.amazonvideo.livingroom".equals(e.pkg) ? h * 2 : TVOS_CARD_PKGS.contains(e.pkg) ? h : (int) (h * 0.5f);
         Bitmap glyph = drawn != null ? Glyphs.get(drawn, (int) (h * ("vlc".equals(drawn) ? 0.66f : 0.58f)), Color.WHITE)
@@ -1827,7 +1854,8 @@ public class MainActivity extends Activity {
         }
         if (glyph != null && "com.amazon.amazonvideo.livingroom".equals(e.pkg)) glyph = oneLine(glyph);
         if (glyph != null && drawn == null && TVOS_CARD_PKGS.contains(e.pkg)) {
-            float fit = "com.amazon.amazonvideo.livingroom".equals(e.pkg) ? 1.12f : 0.58f;
+            float fit = "com.amazon.amazonvideo.livingroom".equals(e.pkg) ? 1.12f
+                    : "com.github.damontecres.wholphin".equals(e.pkg) ? 0.66f : 0.58f;
             glyph = fitGlyph(glyph, (int) (h * fit));
         }
         if (glyph != null && "com.spotify.tv.android".equals(e.pkg)) {
@@ -2611,7 +2639,7 @@ public class MainActivity extends Activity {
         boolean shelf = Suggestions.showRecs(this) && Suggestions.ready(this);
         if (!shelf) {
             heroItems = new ArrayList<>();
-            shelfPkg = null;  // no app's own shelf left for a refresh to bring back
+            shelfPkg = null;  // no app's own shelf left to refresh (Wholphin's) and bring it back
             shelfView.setFocusable(false);
             noShelf();
             reportDrawn();  // no carousel: Home is complete with its dock
@@ -2717,7 +2745,8 @@ public class MainActivity extends Activity {
         // Top Shelf turned off: no app's titles either (their saved shelves are still on disk).
         if (!Suggestions.showRecs(this) || !Suggestions.ready(this)) return;
         String pkg = dock && a != null ? a.pkg : null;
-        List<Suggestions.Item> own = pkg == null ? null : Suggestions.forService(this, pkg);
+        List<Suggestions.Item> own = pkg == null ? null : Jellyfin.WHOLPHIN.equals(pkg) ? jellyfinShelf()
+                : Suggestions.forService(this, pkg);
         if (own == null || own.size() < 2) pkg = null;
         if (java.util.Objects.equals(pkg, shelfPkg)) return;
         shelfPkg = pkg;
@@ -2727,6 +2756,33 @@ public class MainActivity extends Activity {
         setHeroItems(next);
         heroDissolve = false;
     }
+
+    /** Wholphin's shelf: your Jellyfin server's titles, saved copy at once, refreshed when stale. */
+    List<Suggestions.Item> jellyfinShelf() {
+        List<Suggestions.Item> l = Jellyfin.cached(this);
+        if (Jellyfin.connected(this) && Jellyfin.stale(this) && !jellyfinLoading) {
+            jellyfinLoading = true;
+            // Jellyfin's own lane: the carousel's artwork never queues behind a server that
+            // doesn't answer (its connect timeout, then a search for it).
+            Jellyfin.BACKGROUND.execute(() -> {
+                List<Suggestions.Item> fresh = Jellyfin.refresh(this);
+                Jellyfin.cached(this);  // the new shelf read here, not when Wholphin is next focused
+                handler.post(() -> {
+                    jellyfinLoading = false;
+                    if (fresh != null && fresh.size() > 1 && Jellyfin.WHOLPHIN.equals(shelfPkg)) {
+                        heroDissolve = true;
+                        setHeroItems(fresh);
+                        heroDissolve = false;
+                    } else if (fresh != null && fresh.size() > 1 && shelfPkg == null) {
+                        handler.post(shelfUpdate);  // first fetch: show it if Wholphin is in focus
+                    }
+                });
+            });
+        }
+        return l;
+    }
+
+    boolean jellyfinLoading;
 
     /** setHeroItems is switching between shelves: dissolve, no slide. */
     boolean heroDissolve;
@@ -3236,7 +3292,9 @@ public class MainActivity extends Activity {
         heroBtnText.setText(p != null && !installed(p.pkg) ? "Get " + p.name : "\u25B6  Open");
         // The service's own app icon as its badge.
         Drawable appIcon = null;
-        String badge = p != null ? p.pkg : null;
+        boolean mine = it.link != null && it.link.startsWith("wholphin://");
+        if (mine) heroBtnText.setText("\u25B6  Play");
+        String badge = mine ? Jellyfin.WHOLPHIN : p != null ? p.pkg : null;
         if (badge != null && installed(badge)) appIcon = badgeIcon(badge);
         heroProvider.setImageDrawable(appIcon);
         heroProvider.setVisibility(appIcon == null ? View.GONE : View.VISIBLE);
@@ -3556,10 +3614,18 @@ public class MainActivity extends Activity {
     long okDownAt;
 
     void openHeroItem(Suggestions.Item it) {
-        Suggestions.Provider p = it.provider();
-        String pkg = p != null && installed(p.pkg) ? p.pkg : null;
-        Suggestions.open(this, it);
-        if (pkg == null) return;  // its Play Store page (or nothing): not an app to come back from
+        String pkg;
+        if (it.link != null && it.link.startsWith("wholphin://")) {
+            // Your own library: straight to the title's page in Wholphin.
+            if (!Suggestions.start(this, new Intent(Intent.ACTION_VIEW, android.net.Uri.parse(it.link))
+                    .setPackage(Jellyfin.WHOLPHIN).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))) return;
+            pkg = Jellyfin.WHOLPHIN;
+        } else {
+            Suggestions.Provider p = it.provider();
+            pkg = p != null && installed(p.pkg) ? p.pkg : null;
+            Suggestions.open(this, it);
+            if (pkg == null) return;  // its Play Store page (or nothing): not an app to come back from
+        }
         // Like an app opened from its card: Home's refresh waits for the return animation, and
         // pressing Home in the app comes back to that app's card (the one that played the title),
         // else to the dock app whose shelf it was on. A return's fallback still waiting would
@@ -4285,6 +4351,11 @@ public class MainActivity extends Activity {
             // Its banner and icon are loaded with its card, several apps at once (drawCard).
             e.from = ri;
             e.iconRes = ri.getIconResource();
+            if (Jellyfin.WHOLPHIN.equals(e.pkg)) {
+                // Its main screen's icon is its banner (cube and name); the app icon is the cube alone.
+                e.icon = ai.applicationInfo.loadIcon(pm);
+                e.iconRes = ai.applicationInfo.icon;
+            }
             e.bannerRes = leanback ? ai.getBannerResource() : 0;
             e.system = (ai.applicationInfo.flags & ApplicationInfo.FLAG_SYSTEM) != 0;
             e.launch = new Intent(Intent.ACTION_MAIN).addCategory(category).setComponent(cn)
@@ -4615,6 +4686,7 @@ public class MainActivity extends Activity {
         if (readNet() && resumed) {
             Weather.refresh(this, true, this::updateWeather);
             loadHero(true);
+            if (Jellyfin.connected(this)) jellyfinShelf();
         }
     }
 
