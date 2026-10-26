@@ -3629,6 +3629,25 @@ public class MainActivity extends Activity {
             if (switcher != null && switcher.sel != was) Clicks.move(this, 0.5f, fastMove);
             return used || super.dispatchKeyEvent(ev);
         }
+        if (moveIndex >= 0) {
+            // A card being moved has the arrows, OK and Back before anything else: a menu or
+            // focus left behind (one closing as move mode began) can't keep them from it.
+            if (menuLayer != null) closeMenu();
+            View mf = getCurrentFocus();
+            if (moveIndex < tiles.size() && mf != tiles.get(moveIndex)) focusIndex(moveIndex, false);
+            boolean first = ev.getRepeatCount() == 0;
+            switch (k) {
+                case KeyEvent.KEYCODE_DPAD_LEFT:   if (down) moveTo(moveIndex - 1, first); return true;
+                case KeyEvent.KEYCODE_DPAD_RIGHT:  if (down) moveTo(moveIndex + 1, first); return true;
+                case KeyEvent.KEYCODE_DPAD_UP:     if (down) moveTo(moveIndex - COLS, first); return true;
+                case KeyEvent.KEYCODE_DPAD_DOWN:   if (down) moveTo(moveIndex + COLS, first); return true;
+                case KeyEvent.KEYCODE_DPAD_CENTER:
+                case KeyEvent.KEYCODE_ENTER:
+                case KeyEvent.KEYCODE_BACK:
+                case KeyEvent.KEYCODE_ESCAPE:      if (down) endMove(); return true;
+                default: return super.dispatchKeyEvent(ev);
+            }
+        }
         if (forecastLayer != null && menuLayer == null) {
             int pk = ev.getKeyCode();
             boolean pd = ev.getAction() == KeyEvent.ACTION_DOWN;
@@ -3658,21 +3677,6 @@ public class MainActivity extends Activity {
         View cf = getCurrentFocus();
         if (cf != null && !inside(cf, root)) return super.dispatchKeyEvent(ev);
         if (heroKeys(ev)) return true;
-
-        if (moveIndex >= 0) {
-            boolean first = ev.getRepeatCount() == 0;
-            switch (k) {
-                case KeyEvent.KEYCODE_DPAD_LEFT:   if (down) moveTo(moveIndex - 1, first); return true;
-                case KeyEvent.KEYCODE_DPAD_RIGHT:  if (down) moveTo(moveIndex + 1, first); return true;
-                case KeyEvent.KEYCODE_DPAD_UP:     if (down) moveTo(moveIndex - COLS, first); return true;
-                case KeyEvent.KEYCODE_DPAD_DOWN:   if (down) moveTo(moveIndex + COLS, first); return true;
-                case KeyEvent.KEYCODE_DPAD_CENTER:
-                case KeyEvent.KEYCODE_ENTER:
-                case KeyEvent.KEYCODE_BACK:
-                case KeyEvent.KEYCODE_ESCAPE:      if (down) endMove(); return true;
-                default: return super.dispatchKeyEvent(ev);
-            }
-        }
         if (k == KeyEvent.KEYCODE_MENU) {
             // Only a press that started here, as with Back: the release of a Menu that woke the
             // screen saver isn't one.
@@ -4798,6 +4802,7 @@ public class MainActivity extends Activity {
         // The card never went down: focus simply returns to it, with no lift or glare replayed.
         snapFocus = true;
         if (menuReturnFocus != null && menuReturnFocus.isAttachedToWindow()) menuReturnFocus.requestFocus();
+        else focusIndex(focusedIndex, false);  // its card was redrawn meanwhile: focus never stays in the menu
         snapFocus = false;
         menuReturnFocus = null;
         scanAfter(250);  // after the chosen row's action, and once the menu has faded
@@ -4814,6 +4819,7 @@ public class MainActivity extends Activity {
     // ---------------------------------------------------------------- move mode
 
     void startMove(int index) {
+        closeMenu();
         moveIndex = index;
         handler.removeCallbacks(heroAdvance);
         focusIndex(index);

@@ -63,6 +63,13 @@ final class AerialPlayer {
     static final PathInterpolator EASE = new PathInterpolator(0.25f, 0.1f, 0.25f, 1f);
     /** Load the next clip this long before the current one ends; dissolve over the last XFADE. */
     static final int PRELOAD = 20000, XFADE = 2200, FADE = 1400, PREPARE_TIMEOUT = 30000;
+    /**
+     * A session's first fade up from black: quicker than the fades between clips, and easing out
+     * so most of the picture is there at once, as the screen saver has already waited for its
+     * first frame (the TV's 4K decoder takes a second or more to start).
+     */
+    static final int OPEN_FADE = 700;
+    static final PathInterpolator EASE_OUT = new PathInterpolator(0f, 0f, 0.2f, 1f);
     /** Right's dissolve: quicker, as it answers a button. */
     static final int SKIP_XFADE = 1000;
     /**
@@ -610,7 +617,7 @@ final class AerialPlayer {
             live = d;
             skipping = false;
             curtain.animate().cancel();
-            curtain.animate().alpha(0f).setDuration(FADE).setInterpolator(EASE)
+            curtain.animate().alpha(0f).setDuration(OPEN_FADE).setInterpolator(EASE_OUT)
                     .withEndAction(() -> curtain.setVisibility(View.GONE)).start();
             handler.removeCallbacks(tick);
             handler.post(tick);
