@@ -13,8 +13,12 @@ final class Glyphs {
     static Bitmap get(String name, int s, int color) {
         Bitmap b = Bitmap.createBitmap(s, s, Bitmap.Config.ARGB_8888);
         Canvas c = new Canvas(b);
+        // Drawn solid and faded once as a whole: in a see-through colour, every place two strokes
+        // meet (a magnifier's handle on its ring) would be painted twice and show darker.
+        int alpha = android.graphics.Color.alpha(color);
+        if (alpha < 255) c.saveLayerAlpha(null, alpha);
         Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
-        p.setColor(color);
+        p.setColor(color | 0xFF000000);
         p.setStyle(Paint.Style.STROKE);
         p.setStrokeWidth(s * 0.085f);
         p.setStrokeCap(Paint.Cap.ROUND);
@@ -222,10 +226,10 @@ final class Glyphs {
                 break;
             }
             case "magnifier": {  // magnifyingglass, as SF draws it: one even, weighty stroke, a big ring and a short handle (Search)
-                float cx = s * 0.41f, rad = s * 0.3f, e = rad * 0.7071f;
-                p.setStrokeWidth(s * 0.09f);
+                float cx = s * 0.4f, rad = s * 0.3f, w = s * 0.09f, e = (rad + w * 0.5f) * 0.7071f;
+                p.setStrokeWidth(w);
                 c.drawCircle(cx, cx, rad, p);
-                c.drawLine(cx + e, cx + e, s * 0.86f, s * 0.86f, p);
+                c.drawLine(cx + e, cx + e, s * 0.87f, s * 0.87f, p);
                 break;
             }
             case "input":  // a screen with an arrow coming in from the left (Inputs)
@@ -437,6 +441,7 @@ final class Glyphs {
             default:
                 break;
         }
+        if (alpha < 255) c.restore();
         return b;
     }
 }

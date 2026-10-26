@@ -257,9 +257,10 @@ public class SearchActivity extends Activity {
         root.setBackground(bg);
         int sw = Ui.screen(this).x;
 
-        // The Apple TV app's field: 139 px down and 85 px tall.
-        int fieldTop = u(69.5f), fieldH = u(42.5f);
-        HEADER = u(125.5f);
+        // The Apple TV app's field is 139 px down, under its sidebar's pill; with no pill above it
+        // here, it sits 48 px higher, with everything under it. 85 px tall, as Apple's.
+        int fieldTop = u(45.5f), fieldH = u(42.5f);
+        HEADER = u(101.5f);
         KEYS_W = u(256);
         // Behind everything, as on tvOS: the focused title's artwork, soft and dim.
         ambient = new ImageView(this);
