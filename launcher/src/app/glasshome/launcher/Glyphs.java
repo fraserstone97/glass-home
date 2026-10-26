@@ -221,12 +221,11 @@ final class Glyphs {
                 p.setPathEffect(null);
                 break;
             }
-            case "magnifier": {  // magnifyingglass: a ring and a slightly heavier handle at 45 degrees (Search)
-                float cx = s * 0.42f, rad = s * 0.32f, e = rad * 0.7071f;
-                p.setStrokeWidth(s * 0.08f);
+            case "magnifier": {  // magnifyingglass, as SF draws it: one even, weighty stroke, a big ring and a short handle (Search)
+                float cx = s * 0.41f, rad = s * 0.3f, e = rad * 0.7071f;
+                p.setStrokeWidth(s * 0.09f);
                 c.drawCircle(cx, cx, rad, p);
-                p.setStrokeWidth(s * 0.095f);
-                c.drawLine(cx + e, cx + e, s * 0.89f, s * 0.89f, p);
+                c.drawLine(cx + e, cx + e, s * 0.86f, s * 0.86f, p);
                 break;
             }
             case "input":  // a screen with an arrow coming in from the left (Inputs)

@@ -346,8 +346,9 @@ public class SearchActivity extends Activity {
         col.addView(bar, barLp);
 
         ImageView glass = new ImageView(this);
-        glass.setImageBitmap(Glyphs.get("magnifier", u(27), 0x66FFFFFF));
-        bar.addView(glass, new LinearLayout.LayoutParams(u(27), u(27)));
+        // The magnifier a little taller than the words' capitals, in the hint's grey.
+        glass.setImageBitmap(Glyphs.get("magnifier", u(25), 0x66FFFFFF));
+        bar.addView(glass, new LinearLayout.LayoutParams(u(25), u(25)));
 
         field = new EditText(this);
         field.setBackground(null);
@@ -356,8 +357,10 @@ public class SearchActivity extends Activity {
         field.setTextColor(0x80FFFFFF);  // Apple's typed words are half white, the hint 30%
         field.setHintTextColor(HINT_COLOUR);
         field.setHint(HINT);
-        field.setTypeface(Ui.font(this, "display"));
-        Ui.textSize(field, 28);
+        // Apple's Title 2 (57 px bold) in SF. Inter is wider and heavier at the same size, so a touch
+        // smaller and semibold reads as the same size and weight.
+        field.setTypeface(Ui.font(this, "semibold"));
+        Ui.textSize(field, 26);
         field.setImeOptions(EditorInfo.IME_ACTION_SEARCH);
         field.setOnEditorActionListener((v, a, e) -> {
             // The phone-style keyboard's Search: it goes, and the results take focus when they come.
