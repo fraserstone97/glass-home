@@ -97,7 +97,7 @@ public class SearchActivity extends Activity {
     /** Recently Searched, as Apple keeps it: ten titles, each for thirty days. */
     static final int RECENT = 10;
     static final long RECENT_MS = 30L * 24 * 60 * 60 * 1000;
-    /** Popular from the last visit is shown without asking again for half an hour. */
+    /** What's popular (it picks the Browse tiles' pictures) is asked for again after half an hour. */
     static final long POPULAR_MS = 30 * 60 * 1000L;
 
     /** The Apple TV app's lockup focus: in over 85 ms (ease in), out over 230 ms (ease out). */
@@ -125,7 +125,7 @@ public class SearchActivity extends Activity {
     LinearLayout hints;
     LinearLayout grid;
     ScrollView scroll;
-    /** Popular from the last visit, kept while Glass Home is running, and when it was fetched. */
+    /** What's popular, kept while Glass Home is running, and when it was fetched. */
     static List<SearchBrain.Shelf> popular;
     static long popularAt;
     SearchBrain brain;
@@ -1663,13 +1663,13 @@ public class SearchActivity extends Activity {
     }
 
     /**
-     * The page before a search: Recently Searched and Browse at once, with Popular from the last
-     * visit; Popular is fetched again only when it's half an hour old. Pictures wait until the page
-     * has arrived, and are only made for what's on screen.
+     * The page before a search, as Apple's: Recently Searched and the Browse grid, at once. What's
+     * popular, which picks Browse's pictures, is fetched again only when it's half an hour old.
+     * Pictures wait until the page has arrived.
      */
     void land(int gen) {
-        // Within a visit Popular stays as first shown (fetched again behind it, it's for the next
-        // visit), so coming back to this page changes nothing under you but Recently Searched.
+        // Within a visit Browse keeps its first pictures (popular fetched again behind it is for the
+        // next visit), so coming back to this page changes nothing under you but Recently Searched.
         List<SearchBrain.Shelf> kept = landed.isEmpty() ? popular : landed;
         show(kept == null ? new ArrayList<>() : kept);
         boolean fresh = kept != null && System.currentTimeMillis() - popularAt < POPULAR_MS;
@@ -1702,11 +1702,10 @@ public class SearchActivity extends Activity {
                 }
             }
             if (gen != generation) return;
-            // Popular fetched again behind the one shown from memory isn't on screen: no pictures for it.
+            // Popular fetched again behind the one from memory is for the next visit's pictures.
             List<SearchBrain.Shelf> shown = kept != null ? kept : got;
             List<SearchBrain.Shelf> onScreen = new ArrayList<>();
             onScreen.add(new SearchBrain.Shelf(RECENTLY, recentTitles()));
-            if (shown != null) onScreen.addAll(shown);
             browseArt(gen, shown);
             posters(gen, onScreen);
         });
@@ -1930,7 +1929,7 @@ public class SearchActivity extends Activity {
     /**
      * Results as tvOS shelves: a heading over a row that scrolls sideways (a single shelf of
      * results is a grid). Top Results, someone's work and Apps for a search;
-     * Recently Searched, Browse, Popular Series and Popular Films before one. Nothing found is
+     * Recently Searched and the Browse grid before one. Nothing found is
      * said in their place (failed: it couldn't connect).
      */
     void show(List<SearchBrain.Shelf> data, boolean failed) {
@@ -1969,7 +1968,9 @@ public class SearchActivity extends Activity {
         List<Result> all = new ArrayList<>();
         for (SearchBrain.Shelf sh : shelves) {
             markDupes(sh);
-            section(sh, delay, -1, asGrid && !isApps(sh));
+            // Before a search, Browse is Apple's grid of tiles, under Recently Searched's row.
+            boolean browse = lastQuery.isEmpty() && BROWSE.equals(sh.heading);
+            section(sh, delay, -1, browse || asGrid && !isApps(sh));
             all.addAll(sh.items);
         }
         if (!lastQuery.isEmpty() && shelves.isEmpty()) nothingFound(failed);
@@ -2655,7 +2656,7 @@ public class SearchActivity extends Activity {
             browse.add(r);
         }
         out.add(new SearchBrain.Shelf(BROWSE, browse));
-        out.addAll(popular);
+        // Nothing else, as Apple's: what's popular only chooses the Browse tiles' pictures.
         return out;
     }
 
@@ -2760,14 +2761,18 @@ public class SearchActivity extends Activity {
             art.setScaleType(ImageView.ScaleType.CENTER_CROP);
             box.addView(art, new FrameLayout.LayoutParams(w, h));
         }
-        View shade = new View(this);
-        shade.setBackground(new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, new int[]{0x00000000, 0xB3000000}));
-        box.addView(shade, new FrameLayout.LayoutParams(-1, h / 2, Gravity.BOTTOM));
-        TextView label = text(r.title, 15.5f, "display", Color.WHITE);
-        label.setMaxLines(2);
-        FrameLayout.LayoutParams ll = new FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM | Gravity.START);
-        ll.leftMargin = ll.bottomMargin = ll.rightMargin = u(9);
-        box.addView(label, ll);
+        // A genre's name sits in its art; a service's logo is its name, so it has no caption.
+        if (r.service == null) {
+            View shade = new View(this);
+            shade.setBackground(new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, new int[]{0x00000000, 0xB3000000}));
+            box.addView(shade, new FrameLayout.LayoutParams(-1, h / 2, Gravity.BOTTOM));
+            TextView label = text(r.title, 15.5f, "display", Color.WHITE);
+            label.setMaxLines(2);
+            FrameLayout.LayoutParams ll = new FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM | Gravity.START);
+            ll.leftMargin = ll.bottomMargin = ll.rightMargin = u(9);
+            box.addView(label, ll);
+        }
+        box.setContentDescription(r.title);
         GradientDrawable sheen = new GradientDrawable(GradientDrawable.Orientation.TL_BR,
                 new int[]{0x40FFFFFF, 0x0AFFFFFF, 0x00FFFFFF});
         sheen.setCornerRadius(radius);
