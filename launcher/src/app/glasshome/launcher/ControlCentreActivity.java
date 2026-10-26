@@ -157,14 +157,15 @@ public class ControlCentreActivity extends Activity {
         MainActivity home = MainActivity.live.get();
         if (home != null) home.statusRow(false);
 
-        // Grows out of the gear's corner as the forecast does out of its pill (the Apple TV app's
-        // menus: from 0.35 of its size, fading up, easeOut 380 ms; the shade over 400 ms, linear),
-        // a frame after the window's first draw so the setup work doesn't eat its opening frames.
+        // Grows out of the gear's corner as the forecast does out of its pill, fading up, a little
+        // quicker (300 ms) and from a little larger (0.45) so its first frames, the costly ones,
+        // move less; on a curve that does most of the growing early and settles softly. A frame
+        // after the window's first draw, so the setup work doesn't eat its opening frames.
         shade.setAlpha(0f);
         sheet.setPivotX(sheetWidth());
         sheet.setPivotY(0);
-        sheet.setScaleX(0.35f);
-        sheet.setScaleY(0.35f);
+        sheet.setScaleX(0.45f);
+        sheet.setScaleY(0.45f);
         sheet.setAlpha(0f);
         root.post(() -> root.postOnAnimation(() -> {
             // Closed before it began (a second press in its first frames): fading up now would
@@ -177,8 +178,8 @@ public class ControlCentreActivity extends Activity {
                 root.getLocationOnScreen(at);
                 ((MainActivity.LiquidGlass) sheet.getBackground()).fixedLoc = new int[]{at[0] + sheet.getLeft(), at[1] + sheet.getTop()};
             }
-            shade.animate().alpha(1f).setDuration(400).setInterpolator(new android.view.animation.LinearInterpolator()).start();
-            slide(sheet.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(380).setInterpolator(MainActivity.EASE_OUT_QUAD)).start();
+            shade.animate().alpha(1f).setDuration(300).setInterpolator(new android.view.animation.LinearInterpolator()).start();
+            slide(sheet.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(300).setInterpolator(OPEN)).start();
         }));
     }
 
@@ -245,6 +246,9 @@ public class ControlCentreActivity extends Activity {
         overridePendingTransition(0, 0);
     }
 
+    /** Opening: quick to start, a long soft settle. */
+    static final android.view.animation.PathInterpolator OPEN = new android.view.animation.PathInterpolator(0.25f, 0.8f, 0.25f, 1f);
+
     /** Back into its corner as it fades, as the forecast goes back into its pill (210 ms). */
     void close() {
         if (closing) return;
@@ -252,7 +256,7 @@ public class ControlCentreActivity extends Activity {
         MainActivity home = MainActivity.live.get();
         if (home != null) home.statusRow(true);
         shade.animate().alpha(0f).setDuration(100).setInterpolator(new android.view.animation.LinearInterpolator()).start();
-        slide(sheet.animate().alpha(0f).scaleX(0.35f).scaleY(0.35f).setDuration(210).setInterpolator(MainActivity.EASE_OUT_QUAD))
+        slide(sheet.animate().alpha(0f).scaleX(0.45f).scaleY(0.45f).setDuration(210).setInterpolator(MainActivity.EASE_OUT_QUAD))
                 .withEndAction(this::finish).start();
     }
 
