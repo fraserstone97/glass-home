@@ -332,7 +332,7 @@ public class SearchActivity extends Activity {
         col.setOrientation(LinearLayout.VERTICAL);
         col.setPadding(0, fieldTop, 0, u(18));
         col.setClipChildren(false);
-        col.setClipToPadding(false);  // the listening glow reaches above the field
+        col.setClipToPadding(false);
         col.setBackground(new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
                 new int[]{0xF0000000, 0xD9000000, 0x00000000}));
 
@@ -389,13 +389,14 @@ public class SearchActivity extends Activity {
         });
         LinearLayout.LayoutParams fLp = new LinearLayout.LayoutParams(0, -1, 1f);
         fLp.leftMargin = u(10);
-        // The words and, while listening, a waveform in their place (as tvOS dictation does); the
-        // dictation hint at the right.
+        // The words, and at the right the dictation hint or, while listening, a small waveform in
+        // its place. The field itself doesn't change: tvOS dictation shows the words as they're
+        // heard, with no listening screen of its own.
         FrameLayout fieldBox = new FrameLayout(this);
         fieldBox.addView(field, new FrameLayout.LayoutParams(-1, -1));
         wave = new WaveView();
         wave.setAlpha(0f);
-        FrameLayout.LayoutParams wLp = new FrameLayout.LayoutParams(-1, u(26), Gravity.CENTER_VERTICAL);
+        FrameLayout.LayoutParams wLp = new FrameLayout.LayoutParams(u(150), u(26), Gravity.END | Gravity.CENTER_VERTICAL);
         wLp.rightMargin = u(10);
         fieldBox.addView(wave, wLp);
         dictate = dictateHint();
@@ -675,13 +676,9 @@ public class SearchActivity extends Activity {
                     ui.removeCallbacks(quietStop);
                     ui.removeCallbacks(maxStop);
                     ui.postDelayed(maxStop, 8000);  // talking: up to 8 more seconds
-                    // The words go into the field as they're heard (tvOS dictates into it), and the
-                    // waveform makes way for them; the light keeps flowing until you stop.
-                    if (!heard) {
-                        heard = true;
-                        wave.animate().alpha(0f).setDuration(200).start();
-                        field.animate().alpha(1f).setDuration(200).start();
-                    }
+                    // The words go into the field as they're heard (tvOS dictates into it); the
+                    // waveform beside them carries on until you stop.
+                    heard = true;
                     showText(words.get(0));
                 }
             }
@@ -975,8 +972,7 @@ public class SearchActivity extends Activity {
 
     /**
      * The field's Liquid Glass capsule. At rest there's none, as on tvOS 26 (just the magnifier and
-     * the words); it appears while listening, with Siri's light flowing round it, and faintly while
-     * the field itself has focus.
+     * the words); it shows faintly while the field itself has focus.
      */
     LayerDrawable glassBar(int h) {
         float r = h / 2f;  // half the field's height: a true capsule, as on tvOS
@@ -988,121 +984,32 @@ public class SearchActivity extends Activity {
         // Only the top half: rounded on top with the bar's own radius, square below, so its
         // corners follow the bar's curve exactly instead of poking out.
         barSheen.setCornerRadii(new float[]{r, r, r, r, 0, 0, 0, 0});
-        glow = new ListenGlow();
-        LayerDrawable l = new LayerDrawable(new Drawable[]{barBody, barSheen, glow});
+        LayerDrawable l = new LayerDrawable(new Drawable[]{barBody, barSheen});
         l.setLayerInsetBottom(1, h / 2);
         paintBar();
         return l;
     }
 
     GradientDrawable barBody, barSheen;
-    ListenGlow glow;
-    android.animation.ValueAnimator glowFlow;
 
     void paintBar() {
-        int a = Math.round(255 * Math.max(barGlow, fieldFocus * 0.6f));
+        int a = Math.round(255 * fieldFocus * 0.6f);
         barBody.setAlpha(a);
         barSheen.setAlpha(a);
     }
 
-    /** Cool blues and violets, as Siri's light on tvOS (never red). */
-    static final int[] GLOW = {0xFF64D2FF, 0xFF7D7AFF, 0xFFBF5AF2, 0xFF7D7AFF, 0xFF64D2FF};
     static final int[] WAVE = {0xFFC4EEFF, 0xFFFFFFFF, 0xFFDCCBFF, 0xFFFFFFFF, 0xFFC4EEFF};
 
-    /**
-     * While listening, light flows slowly round the field's rim: a bright line on it and a soft
-     * halo just outside. Drawn only while it shows.
-     */
-    static final int HALO = 6;
-
-    final class ListenGlow extends Drawable {
-        final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
-        final RectF rr = new RectF();
-        final android.graphics.Matrix m = new android.graphics.Matrix();
-        android.graphics.LinearGradient shader;
-        int shaderW;
-        float level, flow;
-        /** The rim's line and each halo ring's width, worked out once rather than every frame. */
-        final float line = u(1.5f), step = u(1.1f);
-
-        ListenGlow() {
-            p.setStyle(Paint.Style.STROKE);
-        }
-
-        /** A stroke centred `out` outside the field's edge (inside when negative), on its exact curve. */
-        void ring(Canvas c, Rect b, float width, float out, int alpha) {
-            float half = b.height() / 2f;
-            p.setStrokeWidth(width);
-            p.setAlpha(alpha);
-            rr.set(b);
-            rr.inset(-out, -out);
-            c.drawRoundRect(rr, half + out, half + out, p);
-        }
-
-        @Override public void draw(Canvas c) {
-            if (level <= 0.002f) return;
-            Rect b = getBounds();
-            if (shader == null || shaderW != b.width()) {
-                shaderW = b.width();
-                shader = new android.graphics.LinearGradient(0, 0, shaderW * 0.55f, 0, GLOW, null,
-                        android.graphics.Shader.TileMode.MIRROR);
-            }
-            m.setTranslate(flow * shaderW * 1.1f, 0);
-            shader.setLocalMatrix(m);
-            p.setShader(shader);
-            // Light, not a shadow: soft rings (HALO of them) fading outwards, then the line on the
-            // rim itself (just inside it, following the capsule's curve exactly).
-            for (int k = HALO - 1; k >= 0; k--) {
-                float fall = 1f - k / (float) HALO;
-                ring(c, b, step, step * (k + 0.5f), Math.round(74 * level * fall * fall));
-            }
-            ring(c, b, line, -line / 2f, Math.round(245 * level));
-        }
-
-        @Override public void setAlpha(int a) { }
-        @Override public void setColorFilter(android.graphics.ColorFilter f) { }
-        @Override public int getOpacity() {
-            return android.graphics.PixelFormat.TRANSLUCENT;
-        }
-    }
-
+    /** The waveform fades in for as long as dictation listens, and out again. */
     void animateBar(float to) {
         if (barAnim != null) barAnim.cancel();
-        if (to > 0f && (glowFlow == null || !glowFlow.isRunning())) {
-            glowFlow = android.animation.ValueAnimator.ofFloat(0f, 1f);
-            glowFlow.setDuration(5200);
-            glowFlow.setRepeatCount(android.animation.ValueAnimator.INFINITE);
-            glowFlow.setInterpolator(new LinearInterpolator());
-            glowFlow.addUpdateListener(a -> {
-                glow.flow = (float) a.getAnimatedValue();
-                glow.invalidateSelf();
-            });
-            glowFlow.start();
-        }
-        // Words heard when the light starts going stay in place while it fades, even once listening
-        // is cancelled and the field gets its old words back: the waveform doesn't return over them.
-        boolean words = heard;
         barAnim = android.animation.ValueAnimator.ofFloat(barGlow, to);
-        barAnim.setDuration(420);
+        barAnim.setDuration(to > 0f ? 220 : 300);
         barAnim.setInterpolator(MainActivity.EASE);
         barAnim.addUpdateListener(a -> {
             barGlow = (float) a.getAnimatedValue();
-            // The capsule and its light come in together; the words give way to the waveform
-            // until the first words are heard, which then show in the field.
-            boolean h = heard || words;
-            if (wave != null) {
-                wave.setAlpha(h ? 0f : barGlow);
-                if (barGlow > 0f) wave.postInvalidateOnAnimation();
-            }
-            field.setAlpha(h ? 1f : 1f - barGlow);
-            paintBar();
-            glow.level = barGlow;
-            glow.invalidateSelf();
-        });
-        barAnim.addListener(new android.animation.AnimatorListenerAdapter() {
-            @Override public void onAnimationEnd(android.animation.Animator a) {
-                if (barGlow <= 0f && glowFlow != null) glowFlow.cancel();
-            }
+            wave.setAlpha(barGlow);
+            if (barGlow > 0f) wave.postInvalidateOnAnimation();
         });
         barAnim.start();
     }
@@ -1110,8 +1017,8 @@ public class SearchActivity extends Activity {
     WaveView wave;
 
     /**
-     * A tvOS-style dictation waveform across the field: thin rounded bars that rise and fall with
-     * your voice. It moves gently on its own while listening (this TV's speech service doesn't
+     * A small tvOS-style dictation waveform at the field's right: thin rounded bars that rise and
+     * fall with your voice. It moves gently on its own while listening (this TV's speech service doesn't
      * always report loudness), and louder when it hears you.
      */
     final class WaveView extends View {
@@ -1520,10 +1427,15 @@ public class SearchActivity extends Activity {
             return l <= 0f ? colour : (int) ev.evaluate(l, colour, 0xFF111114);
         }
 
-        /** ⌫: a tag pointing left with a cross in it. */
+        /**
+         * ⌫ as Apple draws it (delete.left): a tag pointing left, its point a little over a third of
+         * its length, every corner rounded, the cross centred in the square part.
+         */
+        final android.graphics.CornerPathEffect corners = new android.graphics.CornerPathEffect(2.4f * unit);
+
         void deleteKey(Canvas c) {
             box(ROWS - 1, 1, cell);
-            float h = 11f * unit, w = 16f * unit, l = cell.centerX() - w / 2, t = cell.centerY() - h / 2, tip = h * 0.45f;
+            float h = 13f * unit, w = 19f * unit, l = cell.centerX() - w / 2, t = cell.centerY() - h / 2, tip = h * 0.62f;
             del.rewind();
             del.moveTo(l, t + h / 2);
             del.lineTo(l + tip, t);
@@ -1533,11 +1445,13 @@ public class SearchActivity extends Activity {
             del.close();
             ink.setColor(colourOf(ROWS - 1, 1, 0xD9FFFFFF));
             ink.setStyle(Paint.Style.STROKE);
-            ink.setStrokeWidth(1.4f * unit);
+            ink.setStrokeWidth(1.5f * unit);
             ink.setStrokeJoin(Paint.Join.ROUND);
             ink.setStrokeCap(Paint.Cap.ROUND);
+            ink.setPathEffect(corners);
             c.drawPath(del, ink);
-            float x = l + tip + (w - tip) / 2f, y = t + h / 2f, d = h * 0.2f;
+            ink.setPathEffect(null);
+            float x = l + tip + (w - tip) / 2f - 0.6f * unit, y = t + h / 2f, d = h * 0.19f;
             c.drawLine(x - d, y - d, x + d, y + d, ink);
             c.drawLine(x - d, y + d, x + d, y - d, ink);
             ink.setStyle(Paint.Style.FILL);

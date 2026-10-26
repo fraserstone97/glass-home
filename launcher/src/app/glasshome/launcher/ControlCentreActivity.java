@@ -81,13 +81,15 @@ public class ControlCentreActivity extends Activity {
     protected void onCreate(Bundle b) {
         super.onCreate(b);
         root = new FrameLayout(this);
-        // Everything behind dims evenly to 70%, with no blur, as it does behind tvOS's Control Centre.
+        // The forecast's shade, from this side: the screen darkens towards the panel's edge, so the
+        // two panels read as one kind of thing.
         shade = new View(this);
-        shade.setBackgroundColor(0x4D000000);
-        // One flat fill: its fade needs no full-screen off-screen pass, which this GPU would
-        // otherwise allocate and fill as the panel opens and closes.
+        shade.setBackground(new android.graphics.drawable.GradientDrawable(GradientDrawable.Orientation.RIGHT_LEFT,
+                new int[]{0xA6000000, 0x4D000000, 0x00000000}));
+        // One fill: its fade needs no off-screen pass, which this GPU would otherwise allocate and
+        // fill as the panel opens and closes.
         shade.forceHasOverlappingRendering(false);
-        root.addView(shade, new FrameLayout.LayoutParams(-1, -1));
+        root.addView(shade, new FrameLayout.LayoutParams(getResources().getDisplayMetrics().widthPixels * 3 / 5, -1, Gravity.END));
 
         sheet = new LinearLayout(this);
         sheet.setOrientation(LinearLayout.VERTICAL);
@@ -155,14 +157,14 @@ public class ControlCentreActivity extends Activity {
         MainActivity home = MainActivity.live.get();
         if (home != null) home.statusRow(false);
 
-        // Appears in its corner, the glass growing a little out of it as it fades up (tvOS 26's
-        // materialise, not a slide), a frame after the window's first draw so the setup work
-        // doesn't eat its opening frames.
+        // Grows out of the gear's corner as the forecast does out of its pill (the Apple TV app's
+        // menus: from 0.35 of its size, fading up, easeOut 380 ms; the shade over 400 ms, linear),
+        // a frame after the window's first draw so the setup work doesn't eat its opening frames.
         shade.setAlpha(0f);
         sheet.setPivotX(sheetWidth());
         sheet.setPivotY(0);
-        sheet.setScaleX(0.94f);
-        sheet.setScaleY(0.94f);
+        sheet.setScaleX(0.35f);
+        sheet.setScaleY(0.35f);
         sheet.setAlpha(0f);
         root.post(() -> root.postOnAnimation(() -> {
             // Closed before it began (a second press in its first frames): fading up now would
@@ -175,8 +177,8 @@ public class ControlCentreActivity extends Activity {
                 root.getLocationOnScreen(at);
                 ((MainActivity.LiquidGlass) sheet.getBackground()).fixedLoc = new int[]{at[0] + sheet.getLeft(), at[1] + sheet.getTop()};
             }
-            shade.animate().alpha(1f).setDuration(280).setInterpolator(MainActivity.EASE).start();
-            slide(sheet.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(280).setInterpolator(MainActivity.EASE)).start();
+            shade.animate().alpha(1f).setDuration(400).setInterpolator(new android.view.animation.LinearInterpolator()).start();
+            slide(sheet.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(380).setInterpolator(MainActivity.EASE_OUT_QUAD)).start();
         }));
     }
 
@@ -243,14 +245,14 @@ public class ControlCentreActivity extends Activity {
         overridePendingTransition(0, 0);
     }
 
-    /** The glass goes back into its corner as it fades, a little quicker than it came. */
+    /** Back into its corner as it fades, as the forecast goes back into its pill (210 ms). */
     void close() {
         if (closing) return;
         closing = true;
         MainActivity home = MainActivity.live.get();
         if (home != null) home.statusRow(true);
-        shade.animate().alpha(0f).setDuration(200).setInterpolator(MainActivity.EASE).start();
-        slide(sheet.animate().alpha(0f).scaleX(0.96f).scaleY(0.96f).setDuration(200).setInterpolator(MainActivity.EASE))
+        shade.animate().alpha(0f).setDuration(100).setInterpolator(new android.view.animation.LinearInterpolator()).start();
+        slide(sheet.animate().alpha(0f).scaleX(0.35f).scaleY(0.35f).setDuration(210).setInterpolator(MainActivity.EASE_OUT_QUAD))
                 .withEndAction(this::finish).start();
     }
 
@@ -496,15 +498,17 @@ public class ControlCentreActivity extends Activity {
         float r = dp(42);
         MainActivity home = MainActivity.live.get();
         if (home != null && home.glassBg != null && home.getWindow().getDecorView().getVisibility() == View.VISIBLE) {
-            // The same glass as Home's weather, clock and gear, a bigger piece of it.
-            // The shade dims Home to 0.7; the glass shows the picture at that brightness too.
-            MainActivity.LiquidGlass g = home.controlGlass(r).dimmed(0.7f);
-            g.lens = home.dp(12);
+            // The forecast's glass: tvOS's regular dark material, half black over Home's picture
+            // with its colour kept, one tint whatever is behind, so it's never a milky sheet.
+            MainActivity.LiquidGlass g = new MainActivity.LiquidGlass(r, 0x80000000, home.glassSource,
+                    home.screenW, home.screenH, home.unit);
+            g.lens = home.dp(7);
             liquid = true;
             return g;
         }
+        // Over an app there's no picture to borrow: the same dark material, solid enough to read on.
         GradientDrawable body = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
-                new int[]{0xA6303036, 0xB8202026});
+                new int[]{0xD91C1C1E, 0xE6141416});
         body.setCornerRadius(r);
         body.setStroke(Math.max(1, dp(0.6f)), 0x3DFFFFFF);
         GradientDrawable sheen = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,

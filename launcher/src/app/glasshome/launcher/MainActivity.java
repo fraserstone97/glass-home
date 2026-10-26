@@ -854,7 +854,7 @@ public class MainActivity extends Activity {
         // Like tvOS, the home grid has no big title; only the folder gets a header.
         titleBox.setVisibility(folderMode ? View.VISIBLE : View.GONE);
         chevron.setVisibility(folderMode ? View.GONE : View.VISIBLE);
-        swipeHint.setVisibility(folderMode ? View.GONE : View.VISIBLE);
+        swipeHint.setVisibility(View.GONE);  // the chevron alone says it
         shelfTitle.setText("More Apps");
         shelfHint.setText("Hold OK for options.");
 
@@ -2449,7 +2449,7 @@ public class MainActivity extends Activity {
         // they'd peek in at the bottom edge. In the app grid the chevron stays, at the top. With
         // no carousel at all there's nothing up there to point at.
         fadeTo(chevron, full || heroItems.isEmpty() ? 0f : 1f, delay, ms);
-        fadeTo(swipeHint, docked ? 1f : 0f, delay, ms);
+
         for (View v : heroArrows) fadeTo(v, arrows ? 1f : 0f, delay, Math.min(ms, 200));
     }
 
@@ -2693,7 +2693,7 @@ public class MainActivity extends Activity {
         heroInfo.animate().withLayer().alpha(a).translationX(0).translationY(heroInfoY).setStartDelay(show ? 160 : 0)
                 .setDuration(show ? 420 : 140).setInterpolator(EASE).start();
         // Over the carousel the chevron rises to make room for its hint; in the grid it's alone.
-        chevron.animate().translationY(show ? -dp(16) : 0).setStartDelay(show ? 160 : 0).setDuration(show ? 420 : 140)
+        chevron.animate().translationY(0).setStartDelay(show ? 160 : 0).setDuration(show ? 420 : 140)
                 .setInterpolator(EASE).start();
         heroChrome(show ? 160 : 0, show ? 420 : 140);
         handler.removeCallbacks(heroAdvance);
@@ -4581,7 +4581,6 @@ public class MainActivity extends Activity {
         // The forecast grows out of the pill, from its corner, as the Apple TV app's menus come
         // out of what opened them (from 0.35 of its size, fading up, easeOut 380 ms); the pill
         // fades into it and the shade comes up behind, as a menu's dim does (400 ms, linear).
-        weatherCard.animate().alpha(0f).setDuration(140).setInterpolator(EASE).start();
         shade.setAlpha(0f);
         shade.animate().alpha(1f).setDuration(400).setInterpolator(new android.view.animation.LinearInterpolator()).start();
         panel.setPivotX(0);
@@ -4592,6 +4591,9 @@ public class MainActivity extends Activity {
         // As one picture while it grows (no text redrawn at each size); it lands at its own size.
         panel.animate().scaleX(1f).scaleY(1f).alpha(1f).setDuration(380).setInterpolator(EASE_OUT_QUAD).withLayer().start();
         panel.requestFocus();
+        // Faded once focus has left it: the pill's unfocus animation would cut a fade begun before
+        // short, leaving it showing through the panel's glass.
+        weatherCard.animate().alpha(0f).setDuration(140).setInterpolator(EASE).start();
         Weather.refresh(this, false, () -> {
             Weather.Data nd = Weather.cached(this);
             if (nd != null && panel.isAttachedToWindow()) panel.setData(nd);
