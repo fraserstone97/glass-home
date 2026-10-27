@@ -21,7 +21,6 @@ import android.graphics.Path;
 import android.graphics.Rect;
 import android.graphics.RectF;
 import android.graphics.drawable.BitmapDrawable;
-import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.LayerDrawable;
@@ -300,17 +299,13 @@ public class SearchActivity extends Activity {
                 return 0;
             }
 
-            @Override protected float getBottomFadingEdgeStrength() {
-                return 0f;  // the soft fade is only for shelves leaving under the field
-            }
         };
         scroll.setClipChildren(false);
         scroll.setClipToPadding(false);
-        // A shelf leaving upwards (or a poster lifting as the page scrolls) softens away at the
-        // top instead of being cut.
+        // Room for a lift at the top. No fading edge: this TV drew it as a strip of the posters a
+        // little out of place, a line across the top row. The page scrolls by whole rows instead
+        // (keepInView), so none is left cut in half under the field.
         scroll.setPadding(0, u(14), 0, u(40));
-        scroll.setVerticalFadingEdgeEnabled(true);
-        scroll.setFadingEdgeLength(u(30));
         scroll.setVerticalScrollBarEnabled(false);
         grid = new LinearLayout(this);
         grid.setOrientation(LinearLayout.VERTICAL);
@@ -1791,30 +1786,26 @@ public class SearchActivity extends Activity {
             return b.getWidth() * b.getHeight() * 4;
         }
     };
-    /** Each poster's frosted band (its bottom, blurred small), made before the poster went to the graphics chip. */
-    static final android.util.LruCache<String, Bitmap> BANDS = new android.util.LruCache<>(160);
     static final Set<String> DECODING = ConcurrentHashMap.newKeySet();
 
     /** A picture's views, waiting for it to arrive. */
     static final class Slot {
         final ImageView art;
-        final View cap;
         final Sec sec;
 
-        Slot(ImageView art, View cap, Sec sec) {
+        Slot(ImageView art, Sec sec) {
             this.art = art;
-            this.cap = cap;
             this.sec = sec;
         }
     }
 
     final Map<String, List<Slot>> waiting = new HashMap<>();
 
-    void await(String url, ImageView art, View cap, Sec s) {
+    void await(String url, ImageView art, Sec s) {
         if (url == null) return;
         List<Slot> l = waiting.get(url);
         if (l == null) waiting.put(url, l = new ArrayList<>());
-        l.add(new Slot(art, cap, s));
+        l.add(new Slot(art, s));
     }
 
     /** Posters fill in as they arrive, in order, each fading into its placeholder. */
@@ -1827,12 +1818,9 @@ public class SearchActivity extends Activity {
                 try {
                     Bitmap bm = Suggestions.image(this, url, "", u(150));
                     if (bm == null) continue;
-                    // The band is made now: once the poster is on the graphics chip, it can't be read.
-                    Bitmap band = band(bm);
                     Bitmap shown = Suggestions.onGpu(bm);
                     POSTERS.put(url, shown);
-                    if (band != null) BANDS.put(url, band);
-                    ui.post(() -> fill(url, shown, band));
+                    ui.post(() -> fill(url, shown));
                 } finally {
                     DECODING.remove(url);
                 }
@@ -1840,24 +1828,13 @@ public class SearchActivity extends Activity {
         }
     }
 
-    /** The bottom 28% of a poster, blurred small: stretched, it's the frosted band under a focused title. */
-    static Bitmap band(Bitmap bm) {
-        int w = bm.getWidth(), h = bm.getHeight(), top = h * 72 / 100;
-        if (w < 8 || h - top < 4) return null;
-        Bitmap strip = Bitmap.createBitmap(bm, 0, top, w, h - top);
-        Bitmap b = Ui.blur(strip, Math.max(8, w / 10), Math.max(4, (h - top) / 10), 2, 2);
-        if (strip != bm) strip.recycle();
-        return b;
-    }
-
-    void fill(String url, Bitmap bm, Bitmap band) {
+    void fill(String url, Bitmap bm) {
         if (isDestroyed()) return;
         List<Slot> l = waiting.remove(url);
         if (l == null) return;
         long now = SystemClock.uptimeMillis();
         for (Slot s : l) {
             s.art.setImageBitmap(bm);
-            if (s.cap != null) s.cap.setBackground(frost(band));
             // In a shelf rising as one picture it's simply there: a fade would make the whole
             // picture be drawn again every frame.
             if (s.sec != null && s.sec.riseAt > 0 && now - s.sec.riseAt < 600) continue;
@@ -1867,12 +1844,6 @@ public class SearchActivity extends Activity {
             a.setInterpolator(new LinearInterpolator());
             a.start();
         }
-    }
-
-    /** The band behind a focused poster's caption: its art blurred (until it arrives, plain dark), dimmed for the words. */
-    Drawable frost(Bitmap band) {
-        Drawable base = band == null ? new ColorDrawable(0xE01C1C1E) : new BitmapDrawable(getResources(), band);
-        return new LayerDrawable(new Drawable[]{base, new ColorDrawable(0x59000000)});
     }
 
     // ---------------------------------------------------------------- results
@@ -2230,10 +2201,11 @@ public class SearchActivity extends Activity {
     LinearLayout gridRow(Sec s, int n) {
         LinearLayout row = new LinearLayout(this);
         row.setClipChildren(false);
+        row.setClipToPadding(false);  // a lifted poster grows up into the padding, not cut at its old edge
         row.setTag(ROW);
         row.setPadding(u(40), u(17), u(40), 0);
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
-        lp.bottomMargin = u(12);
+        lp.bottomMargin = u(4);  // the cards carry their title's room under them
         s.view.addView(row, lp);
         if (s.riseAt > 0 && n < 2 && n * COLS < s.firstBuild) rise(row, s.riseDelay + n * 70L, 1f);
         return row;
@@ -2349,8 +2321,8 @@ public class SearchActivity extends Activity {
                 .withEndAction(then).start();
     }
 
-    /** What a poster's caption says (tvOS: "TV Show · Thriller"): what it is, its main genre, and one score. */
-    static String caption(Result r, boolean score) {
+    /** What a title is, as tvOS words it ("Series · Thriller"): what it is and its main genre. */
+    static String caption(Result r) {
         StringBuilder sb = new StringBuilder();
         if (r.role != null) {
             // An actor's or director's work: when, and who they played.
@@ -2366,71 +2338,52 @@ public class SearchActivity extends Activity {
             break;
         }
         if (r.dupe && r.year != null && !r.year.isEmpty()) sb.append(" \u00b7 ").append(r.year);
-        if (score) {
-            String sc = r.tomato >= 0 ? ratings(0, r.tomato, r.certified) : ratings(r.imdb, -1, false);
-            if (!sc.isEmpty()) sb.append(" \u00b7 ").append(sc);
-        }
         return sb.toString();
     }
 
     /**
-     * A poster, as tvOS 26's TV app shows it: just the art at rest. Focused, it grows by 40 px
-     * (85 ms in, 230 ms out), gains a glass sheen and rim, and its bottom becomes a frosted band
-     * (the art's own bottom, blurred) carrying the title and "Series · Crime".
+     * A poster, as the Apple TV app's search shows it: just the art, its corners rounded. Focused,
+     * it lifts by 10% (85 ms in, 230 ms out) with a soft shadow and a glass sheen and rim, and its
+     * title fades in under it. Nothing is laid over the art.
      */
     View poster(Sec s, Result r) {
         int w = s.w, h = w * 3 / 2, radius = u(10);
-        FrameLayout box = new FrameLayout(this);
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setClipChildren(false);
         ImageView art = new ImageView(this);
         art.setScaleType(ImageView.ScaleType.CENTER_CROP);
         art.setFocusable(true);
         art.setBackgroundColor(0xFF2A2A30);
+        art.setOutlineProvider(round(radius));
+        art.setClipToOutline(true);
         GradientDrawable sheen = new GradientDrawable(GradientDrawable.Orientation.TL_BR,
                 new int[]{0x40FFFFFF, 0x0AFFFFFF, 0x00FFFFFF});
         sheen.setCornerRadius(radius);
         sheen.setStroke(Math.max(1, u(0.6f)), 0x55FFFFFF);
         sheen.setAlpha(0);
         art.setForeground(sheen);
-        box.addView(art, new FrameLayout.LayoutParams(w, h));
-
-        LinearLayout cap = new LinearLayout(this) {
-            @Override public boolean hasOverlappingRendering() {
-                return false;  // only its band and words: fading it needs no extra layer
-            }
-        };
-        cap.setOrientation(LinearLayout.VERTICAL);
-        cap.setGravity(Gravity.CENTER);
-        cap.setPadding(u(8), 0, u(8), u(2));
-        cap.setAlpha(0f);
-        TextView name = text(r.title, 12.5f, "medium", Color.WHITE);
-        TextView sub = text(caption(r, true), 11.5f, "regular", 0x80FFFFFF);
-        for (TextView t : new TextView[]{name, sub}) {
-            t.setSingleLine(true);
-            t.setEllipsize(TextUtils.TruncateAt.END);
-            t.setGravity(Gravity.CENTER_HORIZONTAL);
-            t.setShadowLayer(u(2), 0, u(1), 0x66000000);
-            cap.addView(t, new LinearLayout.LayoutParams(-1, -2));
-        }
-        showIcons(sub);
-        box.addView(cap, new FrameLayout.LayoutParams(-1, h * 28 / 100, Gravity.BOTTOM));
+        box.addView(art, new LinearLayout.LayoutParams(w, h));
+        TextView name = text(r.title, 12f, "medium", Color.WHITE);
+        name.setSingleLine(true);
+        name.setEllipsize(TextUtils.TruncateAt.END);
+        name.setGravity(Gravity.CENTER_HORIZONTAL);
+        name.setPadding(0, 0, 0, u(3));  // room for descenders: a y's tail was cut off
+        name.setAlpha(0f);
+        LinearLayout.LayoutParams nl = new LinearLayout.LayoutParams(w, -2);
+        nl.topMargin = u(13);
+        box.addView(name, nl);
         Bitmap ready = r.poster == null ? null : POSTERS.get(r.poster);
-        if (ready != null) {
-            art.setImageBitmap(ready);
-            cap.setBackground(frost(BANDS.get(r.poster)));
-        } else {
-            cap.setBackground(frost(null));
-            await(r.poster, art, cap, s);
-        }
-        // The band follows the corners: the whole card is cut to its rounded shape.
-        box.setOutlineProvider(round(radius));
-        box.setClipToOutline(true);
+        if (ready != null) art.setImageBitmap(ready);
+        else await(r.poster, art, s);
         art.setOnFocusChangeListener((v, f) -> {
-            lift(box, f, 1.1f, u(14));
+            lift(art, f, 1.1f, u(14));
             sheen(sheen, f);
-            cap.animate().alpha(f ? 1f : 0f).setDuration(f ? 85 : 230).setInterpolator(f ? FOCUS_IN : FOCUS_OUT).start();
+            name.animate().alpha(f ? 1f : 0f).translationY(f ? u(4) : 0).setDuration(f ? 85 : 230)
+                    .setInterpolator(f ? FOCUS_IN : FOCUS_OUT).start();
             focused(s, box, r, f);
         });
-        art.setOnKeyListener((v, k, e) -> cardKey(v, box, 1.1f, k, e, () -> open(r), null));
+        art.setOnKeyListener((v, k, e) -> cardKey(v, art, 1.1f, k, e, () -> open(r), null));
         return box;
     }
 
@@ -2592,7 +2545,7 @@ public class SearchActivity extends Activity {
         thumb.setClipToOutline(true);
         Bitmap ready = r.poster == null ? null : POSTERS.get(r.poster);
         if (ready != null) thumb.setImageBitmap(ready);
-        else await(r.poster, thumb, null, s);
+        else await(r.poster, thumb, s);
         card.addView(thumb, new LinearLayout.LayoutParams(u(40), u(60)));
         LinearLayout words = new LinearLayout(this);
         words.setOrientation(LinearLayout.VERTICAL);
@@ -2600,7 +2553,7 @@ public class SearchActivity extends Activity {
         t.setMaxLines(2);
         t.setEllipsize(TextUtils.TruncateAt.END);
         words.addView(t);
-        TextView m = text(caption(r, false), 11.5f, "regular", 0x80FFFFFF);
+        TextView m = text(caption(r), 11.5f, "regular", 0x80FFFFFF);
         m.setSingleLine(true);
         m.setEllipsize(TextUtils.TruncateAt.END);
         words.addView(m);
@@ -2853,7 +2806,28 @@ public class SearchActivity extends Activity {
         int y = vScroll != null && vScroll.isRunning() ? vTarget : scroll.getScrollY();
         if (bottom - y > visible) y = bottom - visible;
         if (top < y) y = top;
-        glide(Math.max(0, y));
+        glide(Math.max(0, rowEdge(y)));
+    }
+
+    /**
+     * The first place at or below y where a row (a shelf, or one of a grid's rows) starts: the
+     * page stops there, so the row above has gone entirely under the field rather than half.
+     */
+    int rowEdge(int y) {
+        int best = Integer.MAX_VALUE;
+        for (int i = 0; i < grid.getChildCount(); i++) {
+            View section = grid.getChildAt(i);
+            Sec s = (Sec) section.getTag();
+            int edge = section.getTop() - u(6);
+            if (edge >= y) best = Math.min(best, edge);
+            if (s == null || !s.grid || !(section instanceof ViewGroup)) continue;
+            ViewGroup g = (ViewGroup) section;
+            for (int k = 2; k < g.getChildCount(); k++) {
+                int e = section.getTop() + g.getChildAt(k).getTop();
+                if (e >= y) best = Math.min(best, e);
+            }
+        }
+        return best == Integer.MAX_VALUE ? y : best;
     }
 
     /**
