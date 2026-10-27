@@ -396,6 +396,11 @@ public class DetailActivity extends Activity {
                     o.art = o.installed ? banner(pm, o.pkg) : null;
                     o.rank = (o.free || o.ads ? 0 : o.subscription ? 1 : o.addon != null || o.part != null ? 2 : 3) + (o.installed ? 0 : 1);
                 }
+                // Only what you could watch it with: your apps, and services you could sign up
+                // to. A shop you don't have (Rakuten, Sky Store) selling it isn't a way to watch.
+                int all = offers.size();
+                offers.removeIf(o -> !o.installed && !o.free && !o.ads && !o.subscription);
+                elsewhere = all > 0 && offers.isEmpty();
                 offers.sort((x, y) -> Integer.compare(x.rank, y.rank));
                 ui.post(() -> show(n, offers));
             } catch (Exception e) {
@@ -583,7 +588,8 @@ public class DetailActivity extends Activity {
         }
         if (offers.isEmpty()) {
             TextView none = text(12.5f, "regular", 0x99FFFFFF);
-            none.setText("Not available to stream, rent or buy in the UK right now.");
+            none.setText(elsewhere ? "Only to rent or buy in apps that aren\u2019t on this TV."
+                    : "Not available to stream, rent or buy in the UK right now.");
             ways.items.addView(none);
         }
         if (first != null) first.requestFocus();
@@ -601,6 +607,9 @@ public class DetailActivity extends Activity {
      * else Open in the service or store you have (you may not subscribe, so it doesn't promise
      * to play: you buy, rent, subscribe or add the channel there); else Get the app that streams it.
      */
+    /** Offers there were, but only from shops whose apps aren't on the TV. */
+    volatile boolean elsewhere;
+
     View primary(List<Offer> offers) {
         // Ranked: anything free comes before a subscription.
         for (Offer o : offers) {
@@ -1097,7 +1106,8 @@ public class DetailActivity extends Activity {
         if (isDestroyed()) return;
         built = true;
         if (related != null) relatedRow(related);
-        if (!people.isEmpty()) castRow(people);
+        JSONObject ext = c.optJSONObject("externalIds");
+        if (!people.isEmpty()) castRow(people, series, ext == null ? 0 : Suggestions.parseInt(ext.optString("tmdbId")));
         information(n, c, series);
     }
 
@@ -1191,10 +1201,14 @@ public class DetailActivity extends Activity {
         overridePendingTransition(R.anim.page_in, R.anim.hold);
     }
 
-    /** Cast & Crew: initials in a circle (no photos), the name, then the character or "Director". */
-    void castRow(List<String[]> people) {
+    /**
+     * Cast & Crew as tvOS's monograms: each person's photo in a circle (from TMDB, with a key), their
+     * initials until it comes or when there's none, then the name and the character or "Director".
+     */
+    void castRow(List<String[]> people, boolean series, int tmdb) {
         LinearLayout s = section("Cast & Crew");
-        Row row = new Row(u(40), u(8), u(4));
+        Row row = new Row(u(40), u(10), u(4));
+        Map<String, FrameLayout> circles = new HashMap<>();
         // With a TMDB key Search can find a person's films and series; without one, nothing to open.
         boolean find = Suggestions.hasToken(this);
         for (String[] p : people) {
@@ -1208,6 +1222,8 @@ public class DetailActivity extends Activity {
             GradientDrawable g = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, new int[]{0xFF5A5A60, 0xFF2E2E33});
             g.setShape(GradientDrawable.OVAL);
             circle.setBackground(g);
+            circle.setClipToOutline(true);  // the photo cut to the circle
+            circles.put(SearchBrain.norm(p[0]), circle);
             TextView ini = text(30, "semibold", Color.WHITE);
             ini.setText(initials(p[0]));
             circle.addView(ini, new FrameLayout.LayoutParams(-2, -2, Gravity.CENTER));
@@ -1238,6 +1254,42 @@ public class DetailActivity extends Activity {
         }
         s.addView(row, new LinearLayout.LayoutParams(-1, -2));
         sections.addView(s);
+        if (tmdb > 0 && Suggestions.hasToken(this)) side.execute(() -> photos(series, tmdb, circles));
+    }
+
+    /** The cast's photos from TMDB, each fading into its circle as it arrives. */
+    void photos(boolean series, int tmdb, Map<String, FrameLayout> circles) {
+        Map<String, String> paths = new HashMap<>();
+        try {
+            JSONObject cr = Suggestions.get(this, "/" + (series ? "tv/" + tmdb + "/aggregate_credits" : "movie/" + tmdb + "/credits"));
+            for (String part : new String[]{"cast", "crew"}) {
+                JSONArray a = cr.optJSONArray(part);
+                for (int i = 0; a != null && i < a.length(); i++) {
+                    JSONObject o = a.optJSONObject(i);
+                    String path = o == null ? "" : str(o, "profile_path");
+                    if (!path.isEmpty()) paths.putIfAbsent(SearchBrain.norm(str(o, "name")), path);
+                }
+            }
+        } catch (Exception e) {
+            return;  // no photos: the initials stay
+        }
+        int size = Math.round(u(90) * 1.15f);
+        for (Map.Entry<String, FrameLayout> e : circles.entrySet()) {
+            String path = paths.get(e.getKey());
+            if (path == null || gone()) continue;
+            Bitmap b = Suggestions.onGpu(Suggestions.image(this, path, "w185", size));
+            if (b == null) continue;
+            FrameLayout circle = e.getValue();
+            ui.post(() -> {
+                if (isDestroyed()) return;
+                ImageView face = new ImageView(this);
+                face.setScaleType(ImageView.ScaleType.CENTER_CROP);
+                face.setImageBitmap(b);
+                face.setAlpha(0f);
+                circle.addView(face, new FrameLayout.LayoutParams(-1, -1));
+                face.animate().alpha(1f).setDuration(240).setInterpolator(LINEAR).start();
+            });
+        }
     }
 
     /** "GO" for Gary Oldman, "RD" for Robert Downey Jr. */
@@ -1400,13 +1452,14 @@ public class DetailActivity extends Activity {
             this.edge = edge;
             setHorizontalScrollBarEnabled(false);
             setOverScrollMode(OVER_SCROLL_NEVER);
-            // Room above and below for a focused tile's lift, inside the row's own clip.
-            setPadding(0, top, 0, bottom);
+            // Room above and below for a focused tile's lift. The room above is inside the tiles'
+            // own row: left on the scroller, a lifted cast circle was still cut flat at the row's top.
+            setPadding(0, 0, 0, bottom);
             setClipToPadding(false);
             items = new LinearLayout(DetailActivity.this);
             items.setClipChildren(false);
             items.setClipToPadding(false);
-            items.setPadding(edge, 0, edge, 0);
+            items.setPadding(edge, top, edge, 0);
             addView(items);
         }
 

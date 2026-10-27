@@ -752,6 +752,7 @@ final class SearchBrain {
             for (int k = 0; a != null && k < a.length(); k++) {
                 JSONObject w = a.getJSONObject(k);
                 if (!WEST_LANG.contains(w.optString("original_language")) || w.isNull("poster_path")) continue;
+                if (!popularOnTmdb(w, "tv".equals(kinds.get(i)))) continue;
                 w.put("media_type", kinds.get(i));
                 works.add(w);
             }
@@ -885,7 +886,7 @@ final class SearchBrain {
     // ---------------------------------------------------------------- titles
 
     static final String NODE_FIELDS = " id objectType content(country: $country, language: $language) {"
-            + " title originalReleaseYear posterUrl backdrops { backdropUrl } scoring { imdbScore imdbVotes tomatoMeter certifiedFresh }"
+            + " title originalReleaseYear posterUrl backdrops { backdropUrl } scoring { imdbScore imdbVotes tmdbPopularity tomatoMeter certifiedFresh }"
             + " productionCountries externalIds { tmdbId } genres { shortName } }"
             + " offers(country: $country, platform: WEB) { monetizationType standardWebURL"
             + " package { technicalName addonParent(country: $country, platform: WEB) { technicalName } } }";
@@ -926,7 +927,7 @@ final class SearchBrain {
         JSONArray edges = popular(filter, 40, "TRENDING");
         for (int i = 0; i < edges.length(); i++) {
             Result r = parse(edges.getJSONObject(i).getJSONObject("node"), mine());
-            if (!r.offers.isEmpty()) merge(out, r);
+            if (!r.offers.isEmpty() && popular(r)) merge(out, r);
         }
         return out;
     }
@@ -1050,8 +1051,8 @@ final class SearchBrain {
             }
             if (q.yearMin > 0) sc += ry >= q.yearMin && ry <= q.yearMax ? 15 : -10;
             if (q.type != null) sc += q.type.equals(r.type) ? 12 : -12;
-            // Well known beats obscure: a little for its audience size.
-            sc += Math.min(10, Math.log10(Math.max(1, r.votes)) * 2);
+            // Well known beats obscure: a little for its audience size, and for being watched now.
+            sc += Math.min(10, Math.log10(Math.max(1, r.votes)) * 2) + Math.min(4, Math.log10(1 + r.pop) * 2);
             // Opened from Search before (Recently Searched): likely what's wanted again.
             if (r.id != null && recent.contains(r.id)) sc += 6;
             sc -= i * 0.5;                            // JustWatch's popularity order
@@ -1060,16 +1061,59 @@ final class SearchBrain {
             kept.add(r);
         }
         kept.sort((a, b) -> Double.compare(score.get(b), score.get(a)));
-        // When what was asked for is clearly one title (Slow Horses), titles that merely share a
-        // word with it (Only Fools and Horses) go: titles related to it follow it instead.
+        // Only what clears the bar (popular). When nothing by exactly the name typed does, the best
+        // known of those still shows, alone: it's what was asked for. If nothing at all clears it,
+        // the few best matches show rather than nothing.
+        Result exact = null;
+        boolean exactPopular = false;
+        for (Result r : kept) {
+            if (match.get(r) < 100) continue;
+            exactPopular |= popular(r);
+            if (exact == null || fame(r) > fame(exact)) exact = r;
+        }
+        Result alone = exactPopular ? null : exact;
+        List<Result> before = new ArrayList<>(kept);
+        kept.removeIf(r -> r != alone && !popular(r));
+        if (kept.isEmpty()) kept.addAll(before.subList(0, Math.min(3, before.size())));
+        // When what was asked for is clearly one title (Moana), it's that title, as Netflix reads
+        // it: the one people mean (the best known by that name) first, and beside it only what
+        // people would mean too: its sequels and new versions (Moana 2, the 2026 Moana). Titles
+        // that merely share a word with it (Only Fools and Horses for Slow Horses) go, and so do
+        // obscure namesakes (a 1926 documentary, a 2009 Italian series called Moana) that hardly
+        // anyone watches next to it. Titles like it follow it instead (titleShelves).
         if (!kept.isEmpty() && match.get(kept.get(0)) >= 85) {
             kept.removeIf(r -> match.get(r) < 60);
-            // An exact title (Dune, The Office): other titles with its words in (Dune Drifter, Office
-            // Uprising) only if they're well known next to it; sequels, versions and remakes stay.
-            Result top = kept.get(0);
-            if (match.get(top) >= 100) {
-                double floor = Math.max(3000, top.votes / 50.0);
-                kept.removeIf(r -> r != top && match.get(r) < 100 && r.votes < floor);
+            // The one meant. A title spelt exactly as typed beats one only forgiven a slip (BBC's
+            // Gladiators, not the film Gladiator); among those, the ranking's order (The Traitors
+            // made here before the American one), unless another has three times the audience (the
+            // 2016 Moana, not the 2026 remake). A year typed has already chosen.
+            List<Result> named = new ArrayList<>();
+            String typed = literal(q.text);
+            for (Result r : kept) {
+                if (popular(r) && literal(r.title).replaceAll("(uk|us|usa)$", "").equals(typed)) named.add(r);
+            }
+            if (named.isEmpty()) {
+                double bestMatch = match.get(kept.get(0));
+                for (Result r : kept) if (match.get(r) >= bestMatch) named.add(r);
+            }
+            Result top = named.get(0);
+            if (q.year == 0) {
+                Result first = top;
+                for (Result r : named) if (r.votes >= 3.0 * Math.max(1, first.votes) && r.votes > top.votes) top = r;
+            }
+            Result meant = top;
+            if (meant != kept.get(0)) {
+                kept.remove(meant);
+                kept.add(0, meant);
+            }
+            double votes = Math.max(5000, meant.votes / 50.0), pop = Math.max(5, meant.pop / 10);
+            kept.removeIf(r -> r != meant && r.votes < votes && r.pop < pop);
+            if (match.get(meant) >= 100) {
+                // An exact title (The Office, Dune): its other versions and its sequels and
+                // spin-offs (Dune: Part Two, Moana 2) stay; titles that just have its words in them
+                // (Office Romance, The Office Movers) go, unless nearly as well known as it.
+                double near = meant.votes / 4.0;
+                kept.removeIf(r -> r != meant && match.get(r) < 100 && !sequel(meant, r) && r.votes < near);
             }
         }
         List<Result> out = new ArrayList<>();
@@ -1138,7 +1182,7 @@ final class SearchBrain {
         }
         for (int i = 0; i < edges.length() && out.size() < MAX * 2; i++) {
             Result r = parse(edges.getJSONObject(i).getJSONObject("node"), on);
-            if (r.offers.isEmpty() || q.service != null && !r.on(q.service.id)) continue;
+            if (r.offers.isEmpty() || q.service != null && !r.on(q.service.id) || !popular(r)) continue;
             // Every genre asked for, and one of them what it mainly is (no cartoons for "comedy").
             if (!q.genres.isEmpty()) {
                 // (A rating says it's for children; "family" needn't be the first genre listed.)
@@ -1177,6 +1221,10 @@ final class SearchBrain {
             for (int i = 0; i < edges.length() && out.size() < MAX; i++) {
                 Result r = parse(edges.getJSONObject(i).getJSONObject("node"), mine());
                 if (!western(r) || (r.offers.isEmpty() && !r.rentBuy)) continue;
+                if (!popular(r)) continue;
+                // The same kind of thing: an animated film's are animated, a documentary's are
+                // documentaries (no Evil Dead beside Moana); otherwise a genre in common.
+                if (!alike(to, r)) continue;
                 out.add(r);
             }
         } catch (Exception ignored) {
@@ -1186,6 +1234,21 @@ final class SearchBrain {
     }
 
     // ---------------------------------------------------------------- people
+
+    /** Genres that say what kind of thing a title is, beyond its subject. */
+    static final Set<String> DEFINING = new HashSet<>(Arrays.asList("ani", "doc", "hrr", "rly", "fml"));
+
+    static boolean alike(Result a, Result b) {
+        if (a.genres.isEmpty() || b.genres.isEmpty()) return true;
+        boolean shared = false;
+        for (String g : a.genres) {
+            if (DEFINING.contains(g) && !b.genres.contains(g)) return false;
+            shared |= b.genres.contains(g);
+        }
+        // And nothing defining that a lacks: no horror beside a comedy.
+        for (String g : b.genres) if (DEFINING.contains(g) && !"fml".equals(g) && !a.genres.contains(g)) return false;
+        return shared;
+    }
 
     /** An actor's or director's work, and its shelf's name. */
     static final class Person {
@@ -1222,8 +1285,8 @@ final class SearchBrain {
             JSONArray gids = w.optJSONArray("genre_ids");
             boolean talk = false;
             for (int k = 0; gids != null && k < gids.length(); k++) talk |= gids.optInt(k) == 10767 || gids.optInt(k) == 10763;
-            if (talk || w.optInt("vote_count") < 80 || w.isNull("poster_path")) continue;
             String type = w.optString("media_type");
+            if (talk || !popularOnTmdb(w, "tv".equals(type)) || w.isNull("poster_path")) continue;
             if (q.type != null && !q.type.equals(type)) continue;
             // A guest spot in a series or a cameo in a film isn't what they're known for.
             if (!directs && ("tv".equals(type) ? w.optInt("episode_count", 99) < 6 : w.optInt("order", 0) > 15)) continue;
@@ -1355,6 +1418,7 @@ final class SearchBrain {
         if (sc != null) {
             r.imdb = sc.optDouble("imdbScore", 0);
             r.votes = sc.optInt("imdbVotes", 0);
+            r.pop = sc.optDouble("tmdbPopularity", 0);
             if (!sc.isNull("tomatoMeter")) r.tomato = sc.optInt("tomatoMeter", -1);
             r.certified = sc.optBoolean("certifiedFresh", false);
         }
@@ -1394,8 +1458,11 @@ final class SearchBrain {
             }
         }
         for (int k = 0; offers != null && k < offers.length(); k++) {
-            String m = offers.getJSONObject(k).optString("monetizationType");
+            JSONObject o = offers.getJSONObject(k);
+            String m = o.optString("monetizationType");
             if (m.equals("RENT") || m.equals("BUY")) r.rentBuy = true;
+            JSONObject pk = o.optJSONObject("package");
+            if (pk != null && UK_CHANNELS.contains(pk.optString("technicalName"))) r.ukChannel = true;
         }
         return r;
     }
@@ -1506,6 +1573,49 @@ final class SearchBrain {
         if (qCov < 1) return tj.startsWith(qj) && qj.length() >= 4 ? 85 : 40 * qCov;
         if (hit == tw.size()) return begun ? 85 : 100;
         return inOrder ? 85 : 65;
+    }
+
+    static final Set<String> SEQUEL_WORDS = new HashSet<>(Arrays.asList(
+            "ii", "iii", "iv", "v", "vi", "part", "chapter", "returns", "reloaded", "revolutions", "rises",
+            "resurrection", "forever", "again", "begins", "legacy", "reborn", "redemption"));
+
+    /**
+     * r carries on from meant: its name starts with meant's and goes on as sequels and spin-offs do,
+     * with a number ("Moana 2"), a subtitle ("Dune: Part Two", "Dune: Prophecy") or a sequel word.
+     */
+    static boolean sequel(Result meant, Result r) {
+        List<String> mw = keyWords(meant.title), rw = keyWords(r.title);
+        if (rw.size() <= mw.size() || !rw.subList(0, mw.size()).equals(mw)) return false;
+        String next = rw.get(mw.size());
+        if (next.matches("\\d+") || SEQUEL_WORDS.contains(next)) return true;
+        String name = r.raw.isEmpty() ? r.title : r.raw;
+        int colon = name.indexOf(':');
+        return colon > 0 && norm(name.substring(0, colon)).equals(norm(meant.title));
+    }
+
+    /** The UK broadcasters' own players: iPlayer, ITVX, Channel 4, My5, U. */
+    static final Set<String> UK_CHANNELS = new HashSet<>(Arrays.asList("bbc", "itv", "itvx", "all4", "my5", "uktvplay"));
+
+    /**
+     * The bar every result clears, whatever the search: well enough known (IMDb votes) or much
+     * watched now (TMDB popularity, for what's new), so nothing obscure is shown. Series get far
+     * fewer votes than films, and British series on their own channels fewer still (Gladiators,
+     * Race Across the World), so their bars are lower.
+     */
+    static boolean popular(Result r) {
+        boolean tv = "tv".equals(r.type);
+        if (r.votes >= (tv ? 1500 : 10000) || r.pop >= (tv ? 8 : 15)) return true;
+        return tv && r.ukChannel && r.countries.contains("GB") && r.votes >= 300;
+    }
+
+    /** As popular, for a TMDB title (an actor's work, a subject's): TMDB's own counts, about a thirtieth of IMDb's. */
+    static boolean popularOnTmdb(JSONObject w, boolean tv) {
+        return w.optInt("vote_count") >= (tv ? 60 : 300) || w.optDouble("popularity") >= (tv ? 8 : 15);
+    }
+
+    /** How well known a title is: its audience (IMDb votes) and how much it's watched now (TMDB). */
+    static double fame(Result r) {
+        return Math.log10(1 + r.votes) + Math.log10(1 + r.pop);
     }
 
     static final Set<String> WEST = new HashSet<>(Arrays.asList(

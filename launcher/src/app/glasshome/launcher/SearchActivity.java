@@ -119,7 +119,11 @@ public class SearchActivity extends Activity {
     android.animation.ValueAnimator barAnim, fieldAnim;
     KeyGrid keys;
     /** The results column: suggestions, then the shelves. Beside the keyboard until you move into it. */
-    LinearLayout results;
+    FrameLayout results;
+    /** The field's row, which goes up off the screen as the page scrolls (pageScrolled). */
+    View fieldBar;
+    /** Where the results start on the page: under the field, and under the suggestions when there are some. */
+    int resultsTop;
     HorizontalScrollView hintRow;
     LinearLayout hints;
     LinearLayout grid;
@@ -150,6 +154,10 @@ public class SearchActivity extends Activity {
         /** Where it was made (ISO codes), for keeping loose matches to what UK viewers watch. */
         final List<String> countries = new ArrayList<>();
         int tmdbId, votes;
+        /** TMDB's popularity: how much it's watched now. */
+        double pop;
+        /** On a UK broadcaster's own player (iPlayer, ITVX, Channel 4, My5, U). */
+        boolean ukChannel;
         /** JustWatch's genre codes, main genre first. */
         final List<String> genres = new ArrayList<>();
         /** For an actor's or director's work: the part they played. */
@@ -274,9 +282,11 @@ public class SearchActivity extends Activity {
 
         // The results column, beside the keyboard: suggestions directly under the field (no band
         // when there are none), then the shelves. It clips at its own edges, so posters scrolled
-        // out of a row never show beside the keyboard.
-        results = new LinearLayout(this);
-        results.setOrientation(LinearLayout.VERTICAL);
+        // out of a row never show beside the keyboard. The whole page scrolls as one, as tvOS's
+        // does: moving down the results takes the field and suggestions up off the screen with
+        // them, so nothing ever sits under the field.
+        results = new FrameLayout(this);
+        resultsTop = fieldTop + fieldH;
         hintRow = new HorizontalScrollView(this);
         hintRow.setHorizontalScrollBarEnabled(false);
         hintRow.setClipChildren(false);
@@ -290,30 +300,39 @@ public class SearchActivity extends Activity {
         hints.setClipChildren(false);
         hintRow.addView(hints);
         hintRow.setVisibility(View.GONE);
-        results.addView(hintRow, new LinearLayout.LayoutParams(-1, -2));
+        // The shelves start under the suggestions when there are some, and move up when they go.
+        hintRow.addOnLayoutChangeListener((v, l, t, r, bt, ol, ot, or, ob) -> placeResults());
 
-        // The shelves scroll under the search field, never over it. Scrolling follows focus by
-        // whole shelves (keepInView), not by Android's own nudging.
+        // Scrolling follows focus row by row (keepInView), not by Android's own nudging.
         scroll = new ScrollView(this) {
             @Override protected int computeScrollDeltaToGetChildRectOnScreen(Rect r) {
                 return 0;
             }
 
+            // The arrows only ever move focus: at the last row, Down goes nowhere, rather than
+            // scrolling the page on into the room left after it.
+            @Override public boolean executeKeyEvent(KeyEvent e) {
+                return false;
+            }
+
         };
         scroll.setClipChildren(false);
         scroll.setClipToPadding(false);
-        // Room for a lift at the top. No fading edge: this TV drew it as a strip of the posters a
-        // little out of place, a line across the top row. The page scrolls by whole rows instead
-        // (keepInView), so none is left cut in half under the field.
-        scroll.setPadding(0, u(14), 0, u(40));
+        // No fading edge: this TV drew it as a strip of the posters a little out of place.
+        // A screen's room after the last shelf, so any row can be brought to the top, however few
+        // there are (with less, a short page couldn't scroll far enough and the row above peeked in).
+        scroll.setPadding(0, resultsTop + u(14), 0, Ui.screen(this).y);
+        scroll.setOnScrollChangeListener((v, x, y, ox, oy) -> pageScrolled(y));
         scroll.setVerticalScrollBarEnabled(false);
         grid = new LinearLayout(this);
         grid.setOrientation(LinearLayout.VERTICAL);
         grid.setClipChildren(false);
         scroll.addView(grid, new FrameLayout.LayoutParams(-1, -2));
-        results.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1f));
+        results.addView(scroll, new FrameLayout.LayoutParams(-1, -1));
+        FrameLayout.LayoutParams hLp = new FrameLayout.LayoutParams(-1, -2, Gravity.TOP);
+        hLp.topMargin = resultsTop;
+        results.addView(hintRow, hLp);
         FrameLayout.LayoutParams rLp = new FrameLayout.LayoutParams(-1, -1);
-        rLp.topMargin = fieldTop + fieldH;
         results.setTranslationX(KEYS_W);
         root.addView(results, rLp);
 
@@ -323,20 +342,20 @@ public class SearchActivity extends Activity {
         kLp.topMargin = HEADER - keys.pad;
         root.addView(keys, kLp);
 
-        // The header (the field) floats over the shelves on a soft dark fade.
+        // The header: the field, straight on the page. Nothing passes under it, so it needs no
+        // shade: the results scroll it away instead.
         LinearLayout col = new LinearLayout(this);
         col.setOrientation(LinearLayout.VERTICAL);
         col.setPadding(0, fieldTop, 0, u(18));
         col.setClipChildren(false);
         col.setClipToPadding(false);
-        col.setBackground(new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
-                new int[]{0xF0000000, 0xD9000000, 0x00000000}));
 
         // tvOS 26's field: a magnifier and large words straight on the page, across its width.
         LinearLayout bar = new LinearLayout(this);
         bar.setGravity(Gravity.CENTER_VERTICAL);
         bar.setPadding(u(12), 0, u(16), 0);
         bar.setBackground(glassBar(fieldH));
+        fieldBar = bar;
         LinearLayout.LayoutParams barLp = new LinearLayout.LayoutParams(sw - 2 * u(40), fieldH);
         barLp.gravity = Gravity.CENTER_HORIZONTAL;
         col.addView(bar, barLp);
@@ -409,6 +428,7 @@ public class SearchActivity extends Activity {
             if (now == null) return;
             boolean inside = isIn(now, scroll);
             slide(inside);
+            if (!inside) glide(0);  // the keyboard, field or a suggestion: the page back at its top
             if (inside) {
                 lastResult = new WeakReference<>(now);
                 ui.removeCallbacks(ambientTop);  // the focused result's background, not the top one's
@@ -1519,6 +1539,7 @@ public class SearchActivity extends Activity {
         boolean show = !next.isEmpty() && field.length() > 0;
         hintRow.setVisibility(show ? View.VISIBLE : View.GONE);
         hintRow.scrollTo(0, 0);
+        if (!show) placeResults();  // gone, so no layout of its own to say so
         // A suggestion chosen stays chosen as the row changes under it.
         if (at >= 0) {
             if (show) hints.getChildAt(Math.min(at, hints.getChildCount() - 1)).requestFocus();
@@ -1857,6 +1878,8 @@ public class SearchActivity extends Activity {
         TextView heading;
         /** Recently Searched, with its compact cards. */
         boolean recent;
+        /** Top Results: its posters say what each is ("Series · Crime") under the title, as Apple's. */
+        boolean top;
         /** A shelf that scrolls sideways, or (grid) rows of six. */
         HorizontalScrollView hs;
         LinearLayout row;
@@ -2101,6 +2124,7 @@ public class SearchActivity extends Activity {
         Sec s = new Sec();
         s.view = v;
         s.recent = RECENTLY.equals(sh.heading);
+        s.top = "Top Results".equals(sh.heading);
         s.grid = asGrid;
         s.gap = u(20);
         // Apple's six-column grid: 260 x 390 posters, 40 px apart, 80 px in from the edges.
@@ -2373,6 +2397,18 @@ public class SearchActivity extends Activity {
         LinearLayout.LayoutParams nl = new LinearLayout.LayoutParams(w, -2);
         nl.topMargin = u(13);
         box.addView(name, nl);
+        // Top Results says what each is, under its title; the other shelves give the title alone.
+        TextView kind = null;
+        if (s.top) {
+            kind = text(caption(r), 10.5f, "regular", 0x99FFFFFF);
+            kind.setSingleLine(true);
+            kind.setEllipsize(TextUtils.TruncateAt.END);
+            kind.setGravity(Gravity.CENTER_HORIZONTAL);
+            kind.setPadding(0, 0, 0, u(3));
+            kind.setAlpha(0f);
+            box.addView(kind, new LinearLayout.LayoutParams(w, -2));
+        }
+        TextView under = kind;
         Bitmap ready = r.poster == null ? null : POSTERS.get(r.poster);
         if (ready != null) art.setImageBitmap(ready);
         else await(r.poster, art, s);
@@ -2380,6 +2416,8 @@ public class SearchActivity extends Activity {
             lift(art, f, 1.1f, u(14));
             sheen(sheen, f);
             name.animate().alpha(f ? 1f : 0f).translationY(f ? u(4) : 0).setDuration(f ? 85 : 230)
+                    .setInterpolator(f ? FOCUS_IN : FOCUS_OUT).start();
+            if (under != null) under.animate().alpha(f ? 1f : 0f).translationY(f ? u(4) : 0).setDuration(f ? 85 : 230)
                     .setInterpolator(f ? FOCUS_IN : FOCUS_OUT).start();
             focused(s, box, r, f);
         });
@@ -2786,48 +2824,43 @@ public class SearchActivity extends Activity {
     int vTarget;
     Runnable vStart = () -> { };
 
-    /** Scrolls so the whole shelf (or grid row) holding v, heading to the bottom of its cards, is on screen. */
+    /**
+     * The page follows focus as tvOS's does: on the first shelf it's at its top, the field above
+     * it; on any other row, that row sits near the top of the screen and everything above it (the
+     * field and suggestions too) has gone up off the screen. Never a row half under anything.
+     */
     void keepInView(View v) {
         View section = v;
         while (section != null && section.getParent() != grid) {
             section = section.getParent() instanceof View ? (View) section.getParent() : null;
         }
         if (section == null) return;
-        int top = section.getTop() - u(6), bottom = section.getBottom();
+        int top = section.getTop();
+        boolean first = grid.indexOfChild(section) == 0;
         Sec s = (Sec) section.getTag();
         if (s != null && s.grid) {
             View row = v;
             while (row.getParent() != section) row = (View) row.getParent();
-            // The first row keeps its heading in view; the others scroll row by row.
-            if (((ViewGroup) section).indexOfChild(row) > 1) top = section.getTop() + row.getTop();
-            bottom = section.getTop() + row.getBottom();
-        }
-        int visible = scroll.getHeight() - scroll.getPaddingTop() - scroll.getPaddingBottom();
-        int y = vScroll != null && vScroll.isRunning() ? vTarget : scroll.getScrollY();
-        if (bottom - y > visible) y = bottom - visible;
-        if (top < y) y = top;
-        glide(Math.max(0, rowEdge(y)));
-    }
-
-    /**
-     * The first place at or below y where a row (a shelf, or one of a grid's rows) starts: the
-     * page stops there, so the row above has gone entirely under the field rather than half.
-     */
-    int rowEdge(int y) {
-        int best = Integer.MAX_VALUE;
-        for (int i = 0; i < grid.getChildCount(); i++) {
-            View section = grid.getChildAt(i);
-            Sec s = (Sec) section.getTag();
-            int edge = section.getTop() - u(6);
-            if (edge >= y) best = Math.min(best, edge);
-            if (s == null || !s.grid || !(section instanceof ViewGroup)) continue;
-            ViewGroup g = (ViewGroup) section;
-            for (int k = 2; k < g.getChildCount(); k++) {
-                int e = section.getTop() + g.getChildAt(k).getTop();
-                if (e >= y) best = Math.min(best, e);
+            int at = ((ViewGroup) section).indexOfChild(row);
+            // A grid's first row keeps its heading with it; later rows go row by row.
+            if (at > 1) {
+                top = section.getTop() + row.getTop();
+                first = false;
             }
         }
-        return best == Integer.MAX_VALUE ? y : best;
+        glide(first ? 0 : Math.max(0, scroll.getPaddingTop() + top - u(30)));
+    }
+
+    /** The field and suggestions ride up with the page (they're not in it, as they don't slide with the keyboard). */
+    void pageScrolled(int y) {
+        fieldBar.setTranslationY(-y);
+        hintRow.setTranslationY(-y);
+    }
+
+    /** The shelves start under the field, and under the suggestions while there are some. */
+    void placeResults() {
+        int top = resultsTop + (hintRow.getVisibility() == View.VISIBLE ? hintRow.getHeight() : 0) + u(14);
+        if (scroll.getPaddingTop() != top) scroll.setPadding(0, top, 0, scroll.getPaddingBottom());
     }
 
     /**
