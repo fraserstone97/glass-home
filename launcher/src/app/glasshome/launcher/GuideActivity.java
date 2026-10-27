@@ -419,7 +419,7 @@ public class GuideActivity extends Activity {
     /**
      * OK: on now, the channel live in its app; earlier, the programme in the app's catch-up; later,
      * nothing to open yet. The links are the ones each app answers on this TV: Freely's own TV-app
-     * links where an app takes them (iPlayer, ITVX), Channel 4's web pages, and My5 (whose links go
+     * links where an app takes them (iPlayer, ITVX's catch-up), ITVX's channel links, Channel 4's web pages, and My5 (whose links go
      * through its server, and show an error) opened at its start, or searched, instead.
      */
     void open(GuideData.Show s, GuideData.Channel ch) {
@@ -445,6 +445,9 @@ public class GuideActivity extends Activity {
         }
         android.content.pm.PackageManager pm = getPackageManager();
         for (Intent i : tries) {
+            // Started afresh: an app already open (ITVX) only comes to the front with what it last
+            // showed, and drops the link.
+            if (Intent.ACTION_VIEW.equals(i.getAction())) i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
             if (i.resolveActivity(pm) != null && Suggestions.start(this, i)) return;
         }
         Intent launch = Suggestions.launchIntent(this, ch.pkg);
@@ -470,6 +473,12 @@ public class GuideActivity extends Activity {
             String slug = Uri.parse(ch.live).getLastPathSegment();
             String id = slug == null ? null : IPLAYER.get(slug);
             return id == null ? null : IPLAYER_TV + id;
+        }
+        if ("air.ITVMobilePlayer".equals(ch.pkg)) {
+            // ITVX opens a channel live for any itv.com link with ?channel= (its name, as Freely's
+            // hub/itv, hub/itv2 ... end); the hub link itself only opens the app.
+            String name = Uri.parse(ch.live).getLastPathSegment();
+            return name == null ? null : "https://www.itv.com/watch?channel=" + name;
         }
         return ch.live;
     }
