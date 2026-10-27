@@ -1165,7 +1165,7 @@ final class SearchBrain {
                 hot = Math.max(hot, r.pop);
             }
             double votes = Math.max(5000, most / 50.0), pop = Math.max(15, hot / 4);
-            kept.removeIf(r -> r != meant && r.votes < votes && r.pop < pop);
+            kept.removeIf(r -> r != meant && r.jellyfin == null && r.votes < votes && r.pop < pop);
             if (match.get(meant) >= 100) {
                 // An exact title (The Office, Dune): its other versions and its sequels and
                 // spin-offs (Dune: Part Two, Moana 2) stay; titles that just have its words in them
@@ -1801,9 +1801,11 @@ final class SearchBrain {
      * The bar every result clears, whatever the search: well enough known (IMDb votes) or much
      * watched now (TMDB popularity, for what's new), so nothing obscure is shown. Series get far
      * fewer votes than films, British films fewer than Hollywood's, and British series on their
-     * own channels fewer still (Gladiators, Race Across the World), so their bars are lower.
+     * own channels fewer still (Gladiators, Race Across the World), so their bars are lower. Your
+     * own library is always shown.
      */
     static boolean popular(Result r) {
+        if (r.jellyfin != null) return true;
         boolean tv = "tv".equals(r.type), british = r.countries.contains("GB");
         if (r.votes >= (tv ? 2000 : british ? 10000 : 20000) || r.pop >= (tv ? 8 : 15)) return true;
         return tv && r.ukChannel && british && r.votes >= 300;
