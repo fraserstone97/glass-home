@@ -2,6 +2,7 @@
 <resources>
     <!-- The app's name: build.sh replaces "Glass Home" everywhere in this file with $APP_NAME. -->
     <string name="app_name">Glass Home</string>
+    <string name="guide_name">Guide</string>
     <string name="label_sleep">Glass Home sleep</string>
     <string name="label_power">Glass Home – Turn Off and Sleep Timer</string>
     <string name="label_keys">Glass Home – Remote buttons</string>

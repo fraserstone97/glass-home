@@ -166,6 +166,24 @@
             </intent-filter>
         </activity>
 
+        <!-- The Guide: what's on (Freely's London listings), each channel opened in its own app. An app
+             of its own on the TV (one of it, in its own task, like any app), and a card on Home. -->
+        <activity
+            android:name=".GuideActivity"
+            android:label="@string/guide_name"
+            android:launchMode="singleTask"
+            android:taskAffinity="app.glasshome.launcher.guide"
+            android:banner="@drawable/guide_banner"
+            android:theme="@style/PageTheme"
+            android:exported="true"
+            android:screenOrientation="landscape"
+            android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenSize|smallestScreenSize|screenLayout|uiMode|density">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+        </activity>
+
         <!-- First-run setup (and Settings > Home Screen > Run Setup Again): opens and closes like the other pages. -->
         <activity
             android:name=".SetupActivity"

@@ -40,6 +40,9 @@ Android 7 or newer.
   or sells it, labelled the way Apple labels them (*Stream* for a subscription you may or may not
   have, *Free with ads*, add-on channels as add-ons, rental and purchase prices). (Actors,
   directors and subjects need the free TMDB key below.)
+- **A TV guide, like Freely's.** The Guide app (a card on Home) lists what's on across the BBC,
+  ITV, Channel 4 and Channel 5 channels, a week back and a week ahead, from Freely's London guide.
+  OK on something on now opens the channel live in its app; on something earlier, its catch-up.
 - **Remote buttons that work.** Netflix, Prime Video, YouTube and Quick Settings, from any screen.
 - **Apple's aerials as the screen saver.** 92 of Apple TV's aerial films in 4K, shuffled with no
   repeats, dissolving from one to the next. Press Up to see where you are, Right for the next one.
@@ -50,7 +53,8 @@ Android 7 or newer.
 - **Light and fast.** About 2 MB, plain Java with no libraries, tuned frame by frame on a
   mid-range TV.
 - **No accounts, no tracking.** The only network calls are JustWatch (recommendations), TMDB
-  (artwork, optional), your weather source and Apple's video server (the screen saver).
+  (artwork, optional), your weather source, Freely (the Guide's listings) and Apple's video server
+  (the screen saver).
 
 Recommendations and *How to Watch* are for the UK (BBC iPlayer, ITVX, Channel 4, Netflix, Prime
 Video, Disney+, Apple TV, NOW, HBO Max, Paramount+). Everything else works anywhere.
@@ -140,6 +144,9 @@ your household uses? Point it at [`PROMPT.md`](PROMPT.md).
 - **Control Centre:** the gear at the top right, or your remote's Quick Settings button.
 - **App Switcher:** press Home twice quickly. Left and right, OK to go back into an app.
 - **Screen saver now:** on the first app in the dock, press Back.
+- **Guide:** arrows move through channels and programmes; Up from the first channel picks the day;
+  Back returns to now, then to Home. My5 can't be opened on a channel or a programme, so for
+  Channel 5 the Guide opens My5 (live) or searches it (catch-up).
 - **Glass Home's settings:** Control Centre › Home Screen. Top Shelf (which services, films or
   series), Weather, Home Screen (wallpaper, sounds, full screen when idle), Screen Saver (which one,
   when it starts, when the TV turns off), and more.

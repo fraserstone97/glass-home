@@ -3867,13 +3867,15 @@ public class MainActivity extends Activity {
         Intent q = new Intent(Intent.ACTION_MAIN).addCategory(category);
         for (ResolveInfo ri : pm.queryIntentActivities(q, 0)) {
             ActivityInfo ai = ri.activityInfo;
-            if (ai.packageName.equals(getPackageName()) || pkgs.contains(ai.packageName) || NOT_APPS.contains(ai.packageName)) continue;
+            // Home's own activities aren't cards on it, but for the Guide, an app of its own.
+            boolean guide = ai.packageName.equals(getPackageName()) && GuideActivity.class.getName().equals(ai.name);
+            if (!guide && (ai.packageName.equals(getPackageName()) || pkgs.contains(ai.packageName) || NOT_APPS.contains(ai.packageName))) continue;
             ComponentName cn = new ComponentName(ai.packageName, ai.name);
             String key = cn.flattenToShortString(), label = ri.loadLabel(pm).toString();
             // An update installs a new file (a new path, a new date): unchanged, the card is kept.
             String dir = ai.applicationInfo.sourceDir;
             String stamp = (leanback ? "tv " : "") + (dir == null ? "" : dir + " " + new java.io.File(dir).lastModified());
-            pkgs.add(ai.packageName);
+            if (!guide) pkgs.add(ai.packageName);
             AppEntry old = prev == null ? null : prev.get(key);
             if (old != null && stamp.equals(old.stamp) && label.equals(old.label)) {
                 out.put(key, old);
@@ -4129,7 +4131,7 @@ public class MainActivity extends Activity {
                 actions.add(() -> setHidden(a, true));
             }
         }
-        if (!isSettings(a) && !INPUTS_KEY.equals(a.key)) {
+        if (!isSettings(a) && !getPackageName().equals(a.pkg)) {  // not Inputs or the Guide: they're Home's own
             labels.add("App Info");
             actions.add(() -> startSafe(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
                     Uri.parse("package:" + a.pkg))));
