@@ -787,9 +787,10 @@ public class MainActivity extends Activity {
         });
         ccButton.setOnClickListener(v -> openControlCentre());
 
-        // Room around the button for its focus growth (1.12x) so nothing is clipped;
-        // the margins shrink by the same amount, so the row sits exactly where it did.
-        int grow = dp(6);
+        // Room around the button for its focus growth (1.12x, 2 dp a side) and its lean at a wall
+        // (bump, 6 dp) so nothing is clipped; the margins shrink by the same amount, so the row
+        // sits exactly where it did.
+        int grow = dp(10);
         clockBox.setPadding(grow, grow, grow, grow);
         clockBox.setClipToPadding(false);
         FrameLayout.LayoutParams clp = new FrameLayout.LayoutParams(
