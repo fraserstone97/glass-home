@@ -32,9 +32,37 @@ public class KeysService extends AccessibilityService {
         KEYS.put(KeyEvent.KEYCODE_NOTIFICATION, CONTROL_CENTRE);
     }
 
+    /** Running (bound by the system), so remote keys reach it: a trailer can count on Back (TrailerWatch). */
+    static volatile boolean bound;
+
+    @Override
+    protected void onServiceConnected() {
+        bound = true;
+    }
+
+    @Override
+    public boolean onUnbind(Intent i) {
+        bound = false;
+        return super.onUnbind(i);
+    }
+
+    /** Back went down during a trailer, so its release is the trailer's too. */
+    boolean backTaken;
+
     @Override
     protected boolean onKeyEvent(KeyEvent e) {
         int k = e.getKeyCode();
+        if (k == KeyEvent.KEYCODE_BACK) {
+            // A trailer playing in YouTube from a title page: Back is back to the page, as from
+            // Apple's player, rather than into YouTube's own pages.
+            if (e.getAction() == KeyEvent.ACTION_DOWN && e.getRepeatCount() == 0) backTaken = TrailerWatch.playing();
+            if (!backTaken) return false;
+            if (e.getAction() == KeyEvent.ACTION_UP) {
+                backTaken = false;
+                TrailerWatch.back();
+            }
+            return true;
+        }
         if (k == KeyEvent.KEYCODE_SEARCH || k == KeyEvent.KEYCODE_VOICE_ASSIST || k == KeyEvent.KEYCODE_ASSIST) {
             // Search opens listening on the press. A remote that reports the button being held
             // searches what was said when it's let go, like the Siri button. This TV's remote
@@ -99,6 +127,7 @@ public class KeysService extends AccessibilityService {
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT));
             return;
         }
+        TrailerWatch.stop();  // another app, chosen: a trailer playing now no longer comes back
         Intent i = Suggestions.launchIntent(this, target);
         if (i != null) Suggestions.start(this, i);
     }

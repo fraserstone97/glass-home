@@ -844,16 +844,24 @@ public class DetailActivity extends Activity {
 
     /**
      * Plays the trailer, full screen, coming back to this page when it ends or on Back. In YouTube's
-     * own bare player when its app is here: that's signed in to your account, so with Premium
-     * there's never an advert first (an embedded player can't promise that), and it shows only
-     * YouTube's controls. Without the app, in a player of our own (TrailerActivity).
+     * app when it's here: signed in to your account, so with Premium there's no advert first (an
+     * embedded player can't promise that), captions as you last left them there, and only YouTube's
+     * controls. Running already, it's straight into the trailer (about 2.7 s on this TV; 4 s from
+     * cold). TrailerWatch brings this page back. Without what that needs (notification access, the
+     * remote's key service), YouTube's bare player, which closes by itself but starts from a copy
+     * of the app that is often signed out (adverts) and takes about 8.5 s. Without YouTube, a player
+     * of our own (TrailerActivity).
      */
     void playTrailer(String key) {
         if (Suggestions.installed(this, YOUTUBE)) {
-            Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse("https://www.youtube.com/watch?v=" + key))
-                    .setPackage(YOUTUBE).putExtra("force_fullscreen", true).putExtra("finish_on_ended", true);
+            boolean follow = TrailerWatch.possible(this);
+            // From the start (t=0): signed in, YouTube would go on from where a trailer was left.
+            Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse("https://www.youtube.com/watch?v=" + key + "&t=0"))
+                    .setPackage(YOUTUBE);
+            if (!follow) i.putExtra("force_fullscreen", true).putExtra("finish_on_ended", true);
             try {
                 startActivity(i);
+                if (follow) TrailerWatch.start(this);
                 return;
             } catch (android.content.ActivityNotFoundException e) {
                 // its player won't take it: ours, then

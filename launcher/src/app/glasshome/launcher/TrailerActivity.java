@@ -27,7 +27,7 @@ import java.util.Locale;
 
 /**
  * A title's trailer, played here when YouTube's app isn't on the TV (DetailActivity.playTrailer
- * prefers YouTube's own bare player, where a Premium account means no adverts): full screen on
+ * prefers YouTube's app, signed in, where a Premium account means no adverts): full screen on
  * black, and when it ends (or on Back) the title page is there again, with Search under it. The
  * video is YouTube's embedded player in a page of our own. The remote drives it as Apple's player:
  * OK or play/pause pauses, Left and Right skip ten seconds, Back closes. While paused, the title
