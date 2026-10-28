@@ -67,6 +67,7 @@ public class MainActivity extends Activity {
     static final int COLS = 6;
     static final String SETTINGS_KEY = "special:settings";
     static final String INPUTS_KEY = "special:inputs";
+    static final String SEARCH_KEY = "special:search";
     static final String FOLDER_KEY = "special:folder";
     static final String PREF_ORDER = "order";
     static final String PREF_HIDDEN = "hidden";
@@ -1857,6 +1858,51 @@ public class MainActivity extends Activity {
         return b;
     }
 
+    /** The Search tile: Settings' silver, with the magnifier in the gear's graphite. */
+    static Bitmap searchArt(int w, int h) {
+        Bitmap b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+        Canvas c = new Canvas(b);
+        Paint p = new Paint(Paint.DITHER_FLAG);
+        p.setShader(new LinearGradient(0, 0, 0, h, 0xFFE9E9EE, 0xFFAFAFB8, Shader.TileMode.CLAMP));
+        c.drawRect(0, 0, w, h, p);
+        drawSearchGlass(c, w / 2f, h / 2f, h * 0.31f);
+        return b;
+    }
+
+    /**
+     * The magnifier as SF Symbols draws magnifyingglass (a big ring up and to the left, a short
+     * thicker handle to the lower right), lit and shadowed as the Settings gear, so the two cards
+     * read as a pair, as Apple's do. r is half its height.
+     */
+    static void drawSearchGlass(Canvas c, float cx, float cy, float r) {
+        float ring = r * 0.6f, w = r * 0.22f, rx = cx - r * 0.2f, ry = cy - r * 0.2f;
+        float e = (ring + w * 0.5f) * 0.7071f;
+        Paint s = new Paint(Paint.ANTI_ALIAS_FLAG);
+        s.setStyle(Paint.Style.STROKE);
+        s.setStrokeCap(Paint.Cap.ROUND);
+        s.setStrokeWidth(w);
+        android.graphics.Path line = new android.graphics.Path(), g = new android.graphics.Path(), h = new android.graphics.Path();
+        line.addCircle(rx, ry, ring, android.graphics.Path.Direction.CW);
+        s.getFillPath(line, g);
+        line.reset();
+        line.moveTo(rx + e, ry + e);
+        line.lineTo(cx + r * 0.76f, cy + r * 0.76f);
+        s.setStrokeWidth(w * 1.25f);
+        s.getFillPath(line, h);
+        g.op(h, android.graphics.Path.Op.UNION);
+        Paint p = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.DITHER_FLAG);
+        p.setColor(0x47000000);
+        p.setMaskFilter(new android.graphics.BlurMaskFilter(r * 0.07f, android.graphics.BlurMaskFilter.Blur.NORMAL));
+        c.save();
+        c.translate(0, r * 0.05f);
+        c.drawPath(g, p);
+        c.restore();
+        p.setMaskFilter(null);
+        p.setColor(Color.BLACK);
+        p.setShader(new LinearGradient(0, cy - r, 0, cy + r, 0xFF6B6E76, 0xFF2B2D32, Shader.TileMode.CLAMP));
+        c.drawPath(g, p);
+    }
+
     /**
      * The Settings gear: one bold, rounded eight-tooth cog in graphite with a silver hub, lit
      * from above and resting on a soft shadow. All vector, so it's sharp at any size.
@@ -3403,9 +3449,17 @@ public class MainActivity extends Activity {
         // picture to blur, nothing for Home to draw, and no wait before the app starts.
         int w = Math.round(tile.getWidth() * tile.getScaleX());
         int h = Math.round(tile.getHeight() * tile.getScaleY());
+        Intent launch = a.launch;
+        if (SEARCH_KEY.equals(a.key)) {
+            // Search, being Home's own, closes back into the card as tvOS apps do: it's told where.
+            int[] at = new int[2];
+            tile.getLocationOnScreen(at);
+            launch = new Intent(launch).putExtra(SearchActivity.EXTRA_TILE, new Rect(at[0], at[1], at[0] + w, at[1] + h))
+                    .putExtra(SearchActivity.EXTRA_TILE_RADIUS, radius * tile.getScaleX());
+        }
         try {
             Bundle opts = ActivityOptions.makeScaleUpAnimation(tile, 0, 0, w, h).toBundle();
-            startActivity(a.launch, opts);
+            startActivity(launch, opts);
             appOpened = true;
             openedKey = a.key;
             handler.removeCallbacks(returnRun);  // the last return's fallback would clear appOpened
@@ -3750,6 +3804,7 @@ public class MainActivity extends Activity {
         addResolved(pm, Intent.CATEGORY_LAUNCHER, pkgs, false, found, prev, fresh);
         if (!pkgs.contains(TV_SETTINGS)) addSettingsEntry(pm, found, prev, fresh);
         if (Inputs.showCard(this) && !Inputs.list(this).isEmpty()) addInputsEntry(found, prev, fresh);
+        addSearchEntry(found, prev, fresh);
         // Each app's banner and icon are loaded and its card drawn from its biggest art, about 60 ms
         // an app on this TV: three at a time, so a cold start waits about half a second for
         // twenty-four apps rather than a second and a half (Home first appeared after 2.1 s, now 1.2).
@@ -3924,6 +3979,18 @@ public class MainActivity extends Activity {
             int px = priority(x), py = priority(y);
             return px != py ? Integer.compare(px, py) : x.label.compareToIgnoreCase(y.label);
         });
+        // Search new to a layout you've arranged: where tvOS keeps it, just before Settings (which
+        // the saved order would otherwise keep ahead of it), until you move it.
+        AppEntry search = pool.get(SEARCH_KEY);
+        if (search != null) {
+            for (int i = 0; i < apps.size(); i++) {
+                if (isSettings(apps.get(i))) {
+                    rest.remove(search);
+                    apps.add(i, search);
+                    break;
+                }
+            }
+        }
         apps.addAll(rest);
         // The More Apps card shows the first apps inside it: drawn again only when they change.
         List<AppEntry> first = new ArrayList<>(hiddenApps.subList(0, Math.min(FOLDER_SHOWS, hiddenApps.size())));
@@ -3961,6 +4028,7 @@ public class MainActivity extends Activity {
     int priority(AppEntry e) {
         // Inputs is the first card after the dock row.
         if (INPUTS_KEY.equals(e.key)) return COLS;
+        if (SEARCH_KEY.equals(e.key)) return 1999;  // just before Settings, as tvOS keeps it
         if (isSettings(e)) return 2000;
         int i = DEFAULT_ORDER.indexOf(e.pkg);
         return i < 0 ? 1000 : i < COLS ? i : i + 1;
@@ -3968,6 +4036,30 @@ public class MainActivity extends Activity {
 
     boolean isSettings(AppEntry e) {
         return SETTINGS_KEY.equals(e.key) || TV_SETTINGS.equals(e.pkg);
+    }
+
+    /**
+     * The Search app's card, as on tvOS's Home Screen (where Search is an app beside Settings):
+     * silver with the magnifier, Settings' twin. OK opens Search out of it, typing rather than
+     * listening; the mic button still opens it listening, from anywhere.
+     */
+    void addSearchEntry(Map<String, AppEntry> out, Map<String, AppEntry> prev, List<AppEntry> fresh) {
+        AppEntry old = prev == null ? null : prev.get(SEARCH_KEY);
+        if (old != null) {  // drawn by Home, the same every time
+            out.put(SEARCH_KEY, old);
+            return;
+        }
+        AppEntry e = new AppEntry();
+        e.key = SEARCH_KEY;
+        e.pkg = getPackageName();
+        e.label = "Search";
+        e.system = true;
+        e.color = 0xFF8E8E93;
+        e.launch = new Intent(this, SearchActivity.class);
+        e.banner = new BitmapDrawable(getResources(), searchArt(640, 384));
+        e.icon = e.banner;
+        out.put(e.key, e);
+        fresh.add(e);
     }
 
     /** Inputs card: a graphite tvOS-style card with the input glyph; OK opens Control Centre on its Inputs page. */

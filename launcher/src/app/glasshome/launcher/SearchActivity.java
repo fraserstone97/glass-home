@@ -253,13 +253,27 @@ public class SearchActivity extends Activity {
     /** Opened over Home (not over another app). */
     boolean overHome;
 
+    /**
+     * Opened from its card on Home (MainActivity.launchAnimated), where the system grew it out of
+     * the card as it does an app: the card's place on screen, and its corners, to close back into.
+     */
+    static final String EXTRA_TILE = "tile", EXTRA_TILE_RADIUS = "tile_radius";
+    Rect tile;
+    float tileRadius;
+    /** The whole page, shrunk into the card on the way out. */
+    View page;
+    boolean closing;
+
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
         ClipAudit.watch(this);  // a development check, off unless asked for over adb
         createdAt = SystemClock.uptimeMillis();
         overHome = MainActivity.onScreen;
+        tile = getIntent().getParcelableExtra(EXTRA_TILE);
+        tileRadius = getIntent().getFloatExtra(EXTRA_TILE_RADIUS, 0f);
         FrameLayout root = new FrameLayout(this);
+        page = root;
         GradientDrawable bg = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
                 new int[]{0xFF040405, 0xFF050506, 0xFF000000});
         root.setBackground(bg);
@@ -456,6 +470,14 @@ public class SearchActivity extends Activity {
      * wait for it (show) and then rise in.
      */
     void enter(View root, View header) {
+        if (tile != null) {
+            // Grown out of its card by the system, as an app is: already whole inside the growing
+            // window, so nothing fades or drops in there. Results wait for the growth to finish.
+            enterEnd = SystemClock.uptimeMillis() + 420;
+            root.post(() -> entering = true);
+            root.postDelayed(this::solid, 600);  // in case the system never says it has finished
+            return;
+        }
         root.setAlpha(0f);
         header.setTranslationY(-u(30));
         header.setScaleX(0.96f);
@@ -465,17 +487,82 @@ public class SearchActivity extends Activity {
         // deadline, not a flag cleared later, which a slow first frame could clear before it's set.
         enterEnd = SystemClock.uptimeMillis() + 660;
         root.post(() -> entering = true);
-        root.animate().alpha(1f).setDuration(300).setInterpolator(MainActivity.EASE).withEndAction(() -> {
-            // Faded in over Home: from now on the page is solid, so the TV draws only it, not Home
-            // underneath as well. (Over another app it stays see-through, so that app isn't stopped.)
-            if (overHome && android.os.Build.VERSION.SDK_INT >= 30 && !isFinishing()) setTranslucent(false);
-        }).start();
+        root.animate().alpha(1f).setDuration(300).setInterpolator(MainActivity.EASE).withEndAction(this::solid).start();
         // As one image while it moves (like the lifting pills): no text re-drawn at each size. Not
         // when it opens listening: then the glow and waveform inside it change every frame, and a
         // layer over them would be drawn again each frame too.
         android.view.ViewPropertyAnimator a = header.animate().translationY(0).scaleX(1f).scaleY(1f).setStartDelay(40)
                 .setDuration(620).setInterpolator(Glass.SNAP);
         if (!isVoiceIntent(getIntent())) a.withLayer();
+        a.start();
+    }
+
+    /**
+     * Arrived over Home: from now on the page is solid, so the TV draws only it, not Home
+     * underneath as well. (Over another app it stays see-through, so that app isn't stopped.)
+     */
+    void solid() {
+        if (overHome && android.os.Build.VERSION.SDK_INT >= 30 && !isFinishing() && !closing) setTranslucent(false);
+    }
+
+    @Override
+    public void onEnterAnimationComplete() {
+        super.onEnterAnimationComplete();
+        if (tile != null) solid();
+    }
+
+    /** Closing into its card on Home: how long the page takes to shrink into it. */
+    static final long CLOSE_MS = 380;
+
+    /**
+     * Back to Home as a tvOS app goes: the page shrinks into its card and fades into it as it lands.
+     * See-through again first, so Home is there under it; then gone without a system animation.
+     */
+    void closeIntoTile() {
+        if (closing) return;
+        closing = true;
+        stopListening();
+        if (android.os.Build.VERSION.SDK_INT >= 30) {
+            setTranslucent(true);
+            // Home comes back to the front under it: there already, not faded up by the system
+            // (its default for that, about 0.4 s, showed Home dark around the shrinking page).
+            overridePendingTransition(0, 0);
+        }
+        View v = page;
+        int w = v.getWidth(), h = v.getHeight();
+        float sx = tile.width() / (float) w, sy = tile.height() / (float) h;
+        float[] corner = {0f};
+        v.setPivotX(0);
+        v.setPivotY(0);
+        v.setOutlineProvider(new ViewOutlineProvider() {
+            @Override
+            public void getOutline(View view, Outline o) {
+                o.setRoundRect(0, 0, w, h, corner[0]);
+            }
+        });
+        v.setClipToOutline(true);
+        v.setLayerType(View.LAYER_TYPE_HARDWARE, null);  // one still picture, shrinking
+        ValueAnimator a = ValueAnimator.ofFloat(0f, 1f).setDuration(CLOSE_MS);
+        a.setInterpolator(MainActivity.EASE);
+        a.addUpdateListener(an -> {
+            float f = (float) an.getAnimatedValue();
+            float scaleX = 1f + (sx - 1f) * f, scaleY = 1f + (sy - 1f) * f;
+            v.setScaleX(scaleX);
+            v.setScaleY(scaleY);
+            v.setTranslationX(tile.left * f);
+            v.setTranslationY(tile.top * f);
+            // Square at full screen, the card's corners as it lands (in the page's own units).
+            corner[0] = tileRadius * f / ((scaleX + scaleY) / 2f);
+            v.invalidateOutline();
+            v.setAlpha(f < 0.45f ? 1f : 1f - (f - 0.45f) / 0.55f);
+        });
+        a.addListener(new android.animation.AnimatorListenerAdapter() {
+            @Override
+            public void onAnimationEnd(android.animation.Animator an) {
+                finish();
+                overridePendingTransition(0, 0);
+            }
+        });
         a.start();
     }
 
@@ -499,6 +586,10 @@ public class SearchActivity extends Activity {
             showKeys();
             return;
         }
+        if (tile != null && overHome) {
+            closeIntoTile();
+            return;
+        }
         super.onBackPressed();
         overridePendingTransition(0, R.anim.page_out);
     }
@@ -508,6 +599,10 @@ public class SearchActivity extends Activity {
         super.onNewIntent(i);
         setIntent(i);
         live = new WeakReference<>(this);
+        if (i.hasExtra(EXTRA_TILE)) {  // its card again (the mic button over it keeps the card it came from)
+            tile = i.getParcelableExtra(EXTRA_TILE);
+            tileRadius = i.getFloatExtra(EXTRA_TILE_RADIUS, 0f);
+        }
         // A name chosen in a title page's cast: their films and series, ready to choose from.
         String q = i.getStringExtra("q");
         if (q != null) {
