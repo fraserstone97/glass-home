@@ -256,6 +256,7 @@ public class SearchActivity extends Activity {
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
+        ClipAudit.watch(this);  // a development check, off unless asked for over adb
         createdAt = SystemClock.uptimeMillis();
         overHome = MainActivity.onScreen;
         FrameLayout root = new FrameLayout(this);
@@ -2241,8 +2242,14 @@ public class SearchActivity extends Activity {
             s.hs.addView(s.row);
             v.addView(s.hs, new LinearLayout.LayoutParams(-1, -2));
         }
+        // Room under the last line for a focused card's title and caption, which drop 4 as they
+        // show: the shelf ended at their resting edge and cut them flat there. The gap below
+        // gives it back, so the shelves sit where they did.
+        int under = u(6);
+        v.setPadding(0, 0, 0, under);
+        v.setClipToPadding(false);
         LinearLayout.LayoutParams sl = new LinearLayout.LayoutParams(-1, -2);
-        sl.bottomMargin = s.recent ? u(13) : u(28);
+        sl.bottomMargin = (s.recent ? u(13) : u(28)) - under;
         grid.addView(v, index < 0 ? grid.getChildCount() : index, sl);
         // New results rise in shelf by shelf. While the page itself is still fading in they're
         // simply there, so its arrival stays smooth.
@@ -2315,10 +2322,10 @@ public class SearchActivity extends Activity {
         row.setClipChildren(false);
         row.setClipToPadding(false);  // a lifted poster grows up into the padding, not cut at its old edge
         row.setTag(ROW);
-        row.setPadding(u(40), u(17), u(40), 0);
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
-        lp.bottomMargin = u(4);  // the cards carry their title's room under them
-        s.view.addView(row, lp);
+        // The cards carry their title's room under them, inside the row: a row rises in as one
+        // picture its own size, and a focused card's caption, 4 lower, was cut flat at its edge.
+        row.setPadding(u(40), u(17), u(40), u(4));
+        s.view.addView(row, new LinearLayout.LayoutParams(-1, -2));
         if (s.riseAt > 0 && n < 2 && n * COLS < s.firstBuild) rise(row, s.riseDelay + n * 70L, 1f);
         return row;
     }

@@ -58,6 +58,7 @@ public class TrailerActivity extends Activity {
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
+        ClipAudit.watch(this);  // a development check, off unless asked for over adb
         open++;
         key = getIntent().getStringExtra(EXTRA_KEY);
         title = getIntent().getStringExtra(EXTRA_TITLE);

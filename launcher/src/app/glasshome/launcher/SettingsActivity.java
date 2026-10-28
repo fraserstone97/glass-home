@@ -63,6 +63,7 @@ public class SettingsActivity extends Activity {
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
+        ClipAudit.watch(this);  // a development check, off unless asked for over adb
         Clicks.init(this);
         // Typing (a TMDB key, a city) brings the TV's keyboard up over the lower half; the field
         // sits at the top of the list, so the page stays where it is.
@@ -148,10 +149,13 @@ public class SettingsActivity extends Activity {
 
         // Right: the rows, from x 1060 to 1840 px. They scroll up under the title and are cut off
         // there, not at the first row's place. The scroller reaches 80 px past the rows each side
-        // (its padding), so a list sliding in or out isn't cut off at the column's edges.
+        // (its padding), so a list sliding in or out isn't cut off at the column's edges. That
+        // needs the scroller itself to let its child draw there: by default it clips the pages to
+        // their own bounds, the column, and the lists were cut flat at its edges as they slid.
         scroller = new ScrollView(this);
         scroller.setVerticalScrollBarEnabled(false);
         scroller.setOverScrollMode(View.OVER_SCROLL_NEVER);
+        scroller.setClipChildren(false);
         scroller.setClipToPadding(false);
         scroller.setPadding(u(40), u(45), u(40), u(30));
         pages = new FrameLayout(this);

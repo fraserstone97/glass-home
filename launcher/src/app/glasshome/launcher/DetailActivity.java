@@ -281,6 +281,7 @@ public class DetailActivity extends Activity {
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
+        ClipAudit.watch(this);  // a development check, off unless asked for over adb
         Intent in = getIntent();
         titleText = in.getStringExtra("title");
         id = in.getStringExtra("id");

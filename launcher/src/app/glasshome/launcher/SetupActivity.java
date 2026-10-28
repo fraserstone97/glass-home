@@ -55,6 +55,7 @@ public class SetupActivity extends Activity {
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
+        ClipAudit.watch(this);  // a development check, off unless asked for over adb
         Clicks.init(this);
         root = new FrameLayout(this);
         root.setBackgroundColor(0xFF000000);

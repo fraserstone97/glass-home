@@ -71,6 +71,7 @@ public class GuideActivity extends Activity {
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
+        ClipAudit.watch(this);  // a development check, off unless asked for over adb
         unit = Ui.unit(this);
         android.graphics.Point p = Ui.screen(this);
         screenW = p.x;
@@ -176,7 +177,11 @@ public class GuideActivity extends Activity {
         LinearLayout.LayoutParams sl = new LinearLayout.LayoutParams(-2, -2);
         sl.topMargin = u(4);
         text.addView(subtitle, sl);
-        FrameLayout.LayoutParams textLp = new FrameLayout.LayoutParams(u(440), -2, Gravity.TOP | Gravity.START);
+        // The words stay 440 wide; the box reaches 6 further, so a long title leaning at the wall
+        // (a programme not on yet, Glass.bump) isn't cut along its right edge.
+        text.setPadding(0, 0, u(6), 0);
+        text.setClipToPadding(false);
+        FrameLayout.LayoutParams textLp = new FrameLayout.LayoutParams(u(446), -2, Gravity.TOP | Gravity.START);
         textLp.leftMargin = u(40);
         textLp.topMargin = u(34);
         root.addView(text, textLp);
@@ -891,7 +896,9 @@ public class GuideActivity extends Activity {
                 float y = px(rowsY) + (i - top) * px(pitch);
                 channelCard(c, ch, y, i == row);
                 c.save();
-                c.clipRect(gx, y - px(4), gr + px(8), y + px(rowH) + px(4));
+                // Room for the programme focus just left, still lifted and shadowed as it settles
+                // (3 px wider, 2 taller and its shadow 4 lower): the focused one's own clip.
+                c.clipRect(gx - px(2), y - px(4), gr + px(8), y + px(rowH) + px(8));
                 for (GuideData.Show s : ch.shows) {
                     if (s.end <= startF || s.start >= end) continue;
                     if (s == focus) continue;  // drawn last, over its neighbours

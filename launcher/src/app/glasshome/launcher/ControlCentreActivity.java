@@ -80,6 +80,7 @@ public class ControlCentreActivity extends Activity {
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
+        ClipAudit.watch(this);  // a development check, off unless asked for over adb
         root = new FrameLayout(this);
         // The forecast's shade, from this side: the screen darkens towards the panel's edge, so the
         // two panels read as one kind of thing.

@@ -295,6 +295,7 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle b) {
         live = new java.lang.ref.WeakReference<>(this);
         super.onCreate(b);
+        ClipAudit.watch(this);  // a development check, off unless asked for over adb
         // The wallpaper/artwork always covers the screen: skip the window's own full-screen fill
         // (this TV's Mali GPU is fill-rate bound, so every hidden full-screen layer costs frames).
         getWindow().setBackgroundDrawable(null);
@@ -2330,8 +2331,9 @@ public class MainActivity extends Activity {
         FrameLayout.LayoutParams ilp = new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM | Gravity.START);
         // Room round it for the focused button's lift and shadow (at 12 the shadow's far edge was
-        // cut along a line); the margins take it back, so nothing moves.
-        int room = dp(20);
+        // cut along a line, and at 20 its faint tail still was, 2 levels brighter past the edge);
+        // the margins take it back, so nothing moves.
+        int room = dp(32);
         heroInfo.setPadding(room, room, room, room);
         ilp.leftMargin = side - room;
         ilp.bottomMargin = dp(40) - room;
