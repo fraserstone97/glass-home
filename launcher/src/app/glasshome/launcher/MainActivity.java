@@ -51,6 +51,7 @@ import android.widget.ScrollView;
 import android.widget.TextClock;
 import android.widget.TextView;
 
+import java.io.File;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -136,6 +137,8 @@ public class MainActivity extends Activity {
         int iconRes, bannerRes;
         /** Where its banner and icon are still to be loaded from (scan's parallel step); then null. */
         ResolveInfo from;
+        /** Its banner is a card Home drew (from its icon, or its banner's logo zoomed), not the app's own. */
+        boolean drawn;
         Intent launch;
         int color;
         boolean system;
@@ -336,7 +339,11 @@ public class MainActivity extends Activity {
         focusIndex(0);
         registerPackageReceiver();
         registerScreenOff();
+        handler.postDelayed(saveCards, SAVE_CARDS_MS);
     }
+
+    /** How long after the cards change they're saved: well clear of start-up and the carousel's first pictures. */
+    static final long SAVE_CARDS_MS = 15_000;
 
     @Override
     protected void onNewIntent(Intent intent) {
@@ -3761,14 +3768,15 @@ public class MainActivity extends Activity {
         return found;
     }
 
-    /** One app's card art (scan), from its highest-resolution banner or icon. */
+    /** One app's card art (scan), from its highest-resolution banner or icon; or as saved, when it is. */
     void drawCard(PackageManager pm, AppEntry e) {
         if (e.from != null) {
             ActivityInfo ai = e.from.activityInfo;
-            e.banner = e.bannerRes != 0 ? ai.loadBanner(pm) : null;
             if (e.icon == null) e.icon = e.from.loadIcon(pm);
             e.color = tintFrom(e.icon);
             e.from = null;
+            if (openCard(e)) return;
+            e.banner = e.bannerRes != 0 ? ai.loadBanner(pm) : null;
         }
         boolean zoom = e.banner != null && ZOOM_BANNER_PKGS.contains(e.pkg);
         boolean card = !zoom && (e.banner == null || TVOS_CARD_PKGS.contains(e.pkg));
@@ -3786,7 +3794,100 @@ public class MainActivity extends Activity {
         boolean own = !zoom && !card && e.bannerRes != 0;
         Drawable big = own ? hiRes(pm, e.pkg, e.bannerRes, e.banner) : e.banner;
         e.tileArt = tileArt(big != e.banner && sameArt(big, e.banner) ? big : e.banner);
+        e.drawn = zoom || card;
     }
+
+    // ---------------------------------------------------------------- saved cards
+
+    /**
+     * Each app's card, saved once drawn: a cold start (the TV switching on from off, or Home
+     * restarting) opens it in a few milliseconds instead of drawing it again from the app's art,
+     * about 60 an app, so Home is up sooner. Saved under the app's file and date, its name, the tile's
+     * size and this build of Home: anything that would draw it differently finds none, and draws.
+     */
+    File cardFile(AppEntry e) {
+        if (e.stamp == null) return null;  // Home's own cards (Settings, Inputs) are drawn each time
+        if (homeBuild == 0) {
+            try {
+                homeBuild = getPackageManager().getPackageInfo(getPackageName(), 0).lastUpdateTime;
+            } catch (PackageManager.NameNotFoundException ex) {
+                homeBuild = 1;
+            }
+        }
+        String id = e.stamp + "\n" + e.label + "\n" + tileW + "x" + tileH + "\n" + homeBuild;
+        return new File(new File(getCacheDir(), "cards"), e.key.replaceAll("[^A-Za-z0-9._-]", "_")
+                + "-" + Integer.toHexString(id.hashCode()) + ".card");
+    }
+
+    /** When this copy of Home was installed: a new build draws every card afresh. */
+    static volatile long homeBuild;
+
+    /** The app's card as saved (cardFile), when there is one: its tile, and its drawn card if Home drew it. */
+    boolean openCard(AppEntry e) {
+        File f = cardFile(e);
+        if (f == null || !f.exists()) return false;
+        try (java.io.DataInputStream in = new java.io.DataInputStream(new java.io.BufferedInputStream(new java.io.FileInputStream(f)))) {
+            Bitmap tile = picture(in), drawn = in.readBoolean() ? picture(in) : null;
+            if (tile == null) throw new java.io.IOException("unreadable");
+            tile.setHasMipMap(true);
+            tile.prepareToDraw();
+            e.tileArt = tile;
+            e.drawn = drawn != null;
+            // A card Home drew is the banner it shows everywhere (the App Switcher too); an app's own
+            // banner is fetched afresh where it's wanted bigger, so its tile stands in for it.
+            e.banner = new BitmapDrawable(getResources(), drawn != null ? drawn : tile);
+            return true;
+        } catch (Exception ex) {
+            f.delete();
+            return false;
+        }
+    }
+
+    static Bitmap picture(java.io.DataInputStream in) throws java.io.IOException {
+        byte[] b = new byte[in.readInt()];
+        in.readFully(b);
+        return android.graphics.BitmapFactory.decodeByteArray(b, 0, b.length);
+    }
+
+    static void picture(java.io.DataOutputStream out, Bitmap b) throws java.io.IOException {
+        java.io.ByteArrayOutputStream png = new java.io.ByteArrayOutputStream(64 << 10);
+        b.compress(Bitmap.CompressFormat.PNG, 100, png);
+        out.writeInt(png.size());
+        png.writeTo(out);
+    }
+
+    /**
+     * The cards not saved yet, saved a while after they were drawn, on a background lane (never in
+     * start-up's way); the saved cards of apps gone or changed are deleted.
+     */
+    final Runnable saveCards = () -> {
+        List<AppEntry> list = new ArrayList<>(all.values());
+        scans.execute(() -> {
+            File dir = new File(getCacheDir(), "cards");
+            dir.mkdirs();
+            Set<String> keep = new HashSet<>();
+            for (AppEntry e : list) {
+                File f = cardFile(e);
+                if (f == null || e.tileArt == null || e.tileArt.isRecycled()) continue;
+                keep.add(f.getName());
+                if (f.exists()) continue;
+                Drawable b = e.drawn ? e.banner : null;
+                Bitmap drawn = b instanceof BitmapDrawable ? ((BitmapDrawable) b).getBitmap() : null;
+                File tmp = new File(dir, f.getName() + ".tmp");
+                try (java.io.DataOutputStream out = new java.io.DataOutputStream(new java.io.BufferedOutputStream(new java.io.FileOutputStream(tmp)))) {
+                    picture(out, e.tileArt);
+                    out.writeBoolean(drawn != null);
+                    if (drawn != null) picture(out, drawn);
+                } catch (Exception ex) {
+                    tmp.delete();
+                    continue;
+                }
+                if (!tmp.renameTo(f)) tmp.delete();
+            }
+            File[] old = dir.listFiles();
+            for (File f : old == null ? new File[0] : old) if (!keep.contains(f.getName())) f.delete();
+        });
+    };
 
     /** Takes a scan's apps as Home's own (main thread). A card is the same object while its app is unchanged. */
     void install(Map<String, AppEntry> found) {
@@ -4005,6 +4106,8 @@ public class MainActivity extends Activity {
         boolean inGrid = f == null || tiles.contains(f);
         List<AppEntry> was = new ArrayList<>(apps), wasHidden = new ArrayList<>(hiddenApps);
         install(found);
+        handler.removeCallbacks(saveCards);
+        handler.postDelayed(saveCards, SAVE_CARDS_MS);
         // The same cards in the same places (an update to an app Home doesn't show, which Google's
         // services send often): the grid stays as it is, its focused card not lifted afresh.
         if (apps.equals(was) && hiddenApps.equals(wasHidden)) return;

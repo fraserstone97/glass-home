@@ -546,14 +546,41 @@ public class SearchActivity extends Activity {
     protected void onStop() {
         super.onStop();
         stoppedAt = SystemClock.uptimeMillis();
+        stopped = true;
     }
+
+    /** Out of sight: under a title page, or behind another app. */
+    boolean stopped;
 
     @Override
     protected void onRestart() {
         super.onRestart();
+        stopped = false;
+        ui.removeCallbacks(letGo);
         // Under a title page it keeps its results for Back; otherwise a long absence starts again.
         if (!opened && SystemClock.uptimeMillis() - stoppedAt > AWAY_MS) fresh();
     }
+
+    /**
+     * Another app is in front, Search waiting behind it (under the title page you watched from):
+     * once you've been away as long as Search takes to start afresh, the pictures kept for moving
+     * back along the results are let go, up to 40 MB, so the app you're watching has the TV's
+     * memory. Android never closes Home's process to make room (the remote's key service keeps
+     * it up), so this is the only way it gets it back. At once, out of sight, when Android says
+     * memory is short. A quick trip (a trailer) comes back to them all.
+     */
+    @Override
+    public void onTrimMemory(int level) {
+        super.onTrimMemory(level);
+        if (level == TRIM_MEMORY_UI_HIDDEN) ui.postDelayed(letGo, AWAY_MS);
+        else if (stopped && level >= TRIM_MEMORY_RUNNING_LOW) letGo.run();
+    }
+
+    final Runnable letGo = () -> {
+        AMBIENT.evictAll();
+        POSTERS.trimToSize(4 << 20);
+        DetailActivity.AHEAD.evictAll();
+    };
 
     static boolean isVoiceIntent(Intent i) {
         String a = i == null ? null : i.getAction();
@@ -2323,8 +2350,14 @@ public class SearchActivity extends Activity {
     /** A card took or lost focus: its shelf's heading, the background, and scrolling to keep it in view. */
     void focused(Sec s, View card, Result r, boolean f) {
         headingFocus(s, f);
+        ui.removeCallbacks(aheadRun);
         if (!f) return;
         if (r != null) ambientFor(r);
+        // A title resting in focus has its page's details asked for, so OK opens it whole.
+        if (r != null && r.id != null && r.appLaunch == null && !"app".equals(r.type) && !"browse".equals(r.type)) {
+            aheadRun = () -> DetailActivity.ahead(this, r.id, r.tmdbId, r.type);
+            ui.postDelayed(aheadRun, DetailActivity.AHEAD_MS);
+        }
         scrollRow(s, card);
         keepInView(card);
     }
@@ -3153,7 +3186,7 @@ public class SearchActivity extends Activity {
         ambient.animate().alpha(0f).setDuration(300).setInterpolator(MainActivity.EASE).start();
     }
 
-    Runnable ambientRun = () -> { }, ambientTop = () -> { };
+    Runnable ambientRun = () -> { }, ambientTop = () -> { }, aheadRun = () -> { };
 
     // ---------------------------------------------------------------- opening
 

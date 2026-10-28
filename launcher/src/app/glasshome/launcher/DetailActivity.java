@@ -52,6 +52,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 /**
  * A title's page, opened from Search, laid out as tvOS 26's: the backdrop, with everything at the
@@ -73,6 +74,107 @@ public class DetailActivity extends Activity {
             + " ... on Show { totalSeasonCount seasons { totalEpisodeCount content(country: $c, language: $l) { seasonNumber }"
             + " offers(country: $c, platform: WEB, filter: {monetizationTypes: [FREE, ADS, BUY]}) { monetizationType"
             + " presentationType elementCount retailPrice(language: $l) retailPriceValue package { technicalName } } } } } }";
+
+    /**
+     * A title's details asked for ahead, while its result rested in focus (Search, or Related here):
+     * by the time OK is pressed they've usually come, and its page opens whole rather than filling
+     * in. Text only, a few KB a title, and no pictures opened: its logo is fetched onto the disk.
+     */
+    static final class Ahead {
+        final long at = android.os.SystemClock.uptimeMillis();
+        Future<JSONObject> node, cast, clips;
+    }
+
+    /** The last eight titles asked for ahead, each good for ten minutes. */
+    static final android.util.LruCache<String, Ahead> AHEAD = new android.util.LruCache<>(8);
+
+    /** Those lookups, at background priority (they never take the processor from drawing); gone when idle. */
+    static final ExecutorService LOOKUPS;
+
+    static {
+        java.util.concurrent.ThreadPoolExecutor pool = new java.util.concurrent.ThreadPoolExecutor(4, 4, 30,
+                java.util.concurrent.TimeUnit.SECONDS, new java.util.concurrent.LinkedBlockingQueue<>(), job -> new Thread(() -> {
+                    android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
+                    job.run();
+                }, "ahead"));
+        pool.allowCoreThreadTimeOut(true);
+        LOOKUPS = pool;
+    }
+
+    /** The title's details: the ones asked for ahead while they're fresh and came, else asked for now. */
+    static Ahead ahead(Context ctx, String id, int tmdb, String type) {
+        Context c = ctx.getApplicationContext();
+        String key = id + " " + tmdb;
+        synchronized (AHEAD) {
+            Ahead a = AHEAD.get(key);
+            if (a != null && android.os.SystemClock.uptimeMillis() - a.at < 10 * 60_000
+                    && !failed(a.node) && !failed(a.cast) && !failed(a.clips)) return a;
+            a = new Ahead();
+            a.node = LOOKUPS.submit(() -> {
+                JSONObject vars = new JSONObject().put("id", id).put("c", "GB").put("l", "en");
+                return Suggestions.post("https://apis.justwatch.com/graphql",
+                        new JSONObject().put("query", QUERY).put("variables", vars).toString())
+                        .getJSONObject("data").getJSONObject("node");
+            });
+            if (tmdb > 0 && Suggestions.hasToken(c)) {
+                String kind = "tv".equals(type) ? "tv/" : "movie/";
+                // TMDB's cast and crew, in billing order: JustWatch's own list for a series is in no
+                // useful order (Steve Carell 45th in The Office's) and full of episode directors.
+                a.cast = LOOKUPS.submit(() -> billing(Suggestions.get(c, "/" + kind + tmdb + ("tv/".equals(kind) ? "/aggregate_credits" : "/credits"))));
+                // Its trailers too: TMDB says which are the official ones.
+                a.clips = LOOKUPS.submit(() -> Suggestions.get(c, "/" + kind + tmdb + "/videos?include_video_language=en,null"));
+                LOOKUPS.execute(() -> {
+                    try {
+                        String logo = Suggestions.tmdbArt(c, type, tmdb)[1];
+                        if (logo != null) Suggestions.download(c, logo, "");
+                    } catch (Exception e) {
+                        // fetched with the page instead
+                    }
+                });
+            }
+            AHEAD.put(key, a);
+            return a;
+        }
+    }
+
+    /**
+     * Only what the page uses of TMDB's cast and crew, kept with the title: the first twenty billed
+     * and the directors. A long series' whole list (everyone in every episode) runs to megabytes.
+     */
+    static JSONObject billing(JSONObject credits) throws org.json.JSONException {
+        List<JSONObject> cast = new ArrayList<>();
+        JSONArray a = credits.optJSONArray("cast");
+        for (int i = 0; a != null && i < a.length(); i++) if (a.optJSONObject(i) != null) cast.add(a.optJSONObject(i));
+        cast.sort((x, y) -> Integer.compare(x.optInt("order", 999), y.optInt("order", 999)));
+        JSONArray top = new JSONArray(), directors = new JSONArray();
+        for (int i = 0; i < Math.min(20, cast.size()); i++) top.put(cast.get(i));
+        JSONArray crew = credits.optJSONArray("crew");
+        for (int i = 0; crew != null && i < crew.length(); i++) {
+            JSONObject cr = crew.optJSONObject(i);
+            if (cr != null && "Director".equals(cr.optString("job"))) directors.put(cr);
+        }
+        return new JSONObject().put("cast", top).put("crew", directors);
+    }
+
+    /** A lookup that has finished without an answer (to be asked again), rather than one still going. */
+    static boolean failed(Future<?> f) {
+        if (f == null || !f.isDone()) return false;
+        try {
+            f.get();
+            return false;
+        } catch (Exception e) {
+            return true;
+        }
+    }
+
+    /** The answer, or null when it failed or hasn't come within ms. */
+    static JSONObject got(Future<JSONObject> f, long ms) {
+        try {
+            return f == null ? null : f.get(ms, java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (Exception e) {
+            return null;
+        }
+    }
 
     /** JustWatch service -> the Android TV app that plays it (the stores open in their apps too). */
     static final Map<String, String> APPS = new LinkedHashMap<>();
@@ -380,20 +482,11 @@ public class DetailActivity extends Activity {
             side.execute(() -> backdrop(knownBackdrop));
         }
         if (id == null) return;
-        // TMDB's cast and crew, in billing order, asked for alongside the details when there's a
-        // key: JustWatch's own list for a series is in no useful order (Steve Carell 45th in The
-        // Office's) and full of episode directors.
-        java.util.concurrent.Future<JSONObject> cast = token && tmdb > 0 ? SearchBrain.POOL.submit(() ->
-                Suggestions.get(this, "/" + ("tv".equals(type) ? "tv/" + tmdb + "/aggregate_credits" : "movie/" + tmdb + "/credits"))) : null;
-        // Its trailers too: TMDB says which are the official ones.
-        java.util.concurrent.Future<JSONObject> clips = token && tmdb > 0 ? SearchBrain.POOL.submit(() ->
-                Suggestions.get(this, "/" + ("tv".equals(type) ? "tv/" : "movie/") + tmdb + "/videos?include_video_language=en,null")) : null;
+        // The details, cast and trailers: usually asked for already, while its result had focus.
+        Ahead a = ahead(this, id, tmdb, type);
         io.execute(() -> {
             try {
-                JSONObject vars = new JSONObject().put("id", id).put("c", "GB").put("l", "en");
-                JSONObject res = Suggestions.post("https://apis.justwatch.com/graphql",
-                        new JSONObject().put("query", QUERY).put("variables", vars).toString());
-                JSONObject n = res.getJSONObject("data").getJSONObject("node");
+                JSONObject n = a.node.get();
                 // Sorted out here, with each app's banner, so the page builds in one go.
                 List<Offer> offers = offers(n);
                 PackageManager pm = getPackageManager();
@@ -408,16 +501,9 @@ public class DetailActivity extends Activity {
                 offers.removeIf(o -> !o.installed && !o.free && !o.ads && !o.subscription);
                 elsewhere = all > 0 && offers.isEmpty();
                 offers.sort((x, y) -> Integer.compare(x.rank, y.rank));
-                try {
-                    if (cast != null) tmdbCast = cast.get(2500, java.util.concurrent.TimeUnit.MILLISECONDS);
-                } catch (Exception e) {
-                    // JustWatch's list, then
-                }
-                try {
-                    if (clips != null) tmdbVideos = clips.get(1000, java.util.concurrent.TimeUnit.MILLISECONDS);
-                } catch (Exception e) {
-                    // JustWatch's clips, then
-                }
+                // Without them in time, JustWatch's cast list and clips.
+                tmdbCast = got(a.cast, 2500);
+                tmdbVideos = got(a.clips, 1000);
                 ui.post(() -> show(n, offers));
             } catch (Exception e) {
                 ui.post(() -> {
@@ -629,6 +715,7 @@ public class DetailActivity extends Activity {
         fadeIn(actions, 120);
         fadeIn(waysLabel, 160);
         fadeIn(ways, 200);
+        reportFullyDrawn();  // the page is whole: "Fully drawn" in the system log times its opening
         // The shelves below the fold once the page has settled, so their building and pictures
         // stay out of the fade-ups.
         ui.postDelayed(() -> sections(n, c, series, people), 700);
@@ -1329,6 +1416,11 @@ public class DetailActivity extends Activity {
                         .setInterpolator(has ? FOCUS_IN : FOCUS_OUT).start();
                 caption.animate().alpha(has ? 1f : 0f).translationY(has ? u(10) : 0).setDuration(has ? 85 : 230)
                         .setInterpolator(has ? FOCUS_IN : FOCUS_OUT).start();
+                ui.removeCallbacks(aheadRun);
+                if (has) {
+                    aheadRun = () -> ahead(this, it[0], Suggestions.parseInt(it[5]), "SHOW".equals(it[1]) ? "tv" : "movie");
+                    ui.postDelayed(aheadRun, AHEAD_MS);
+                }
             });
             tile.setOnClickListener(v -> openRelated(it));
             LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, -2);
@@ -1350,6 +1442,13 @@ public class DetailActivity extends Activity {
             }
         });
     }
+
+    /**
+     * How long a title rests in focus before its page's details are asked for (ahead): long enough
+     * that moving along a row asks for none on the way.
+     */
+    static final long AHEAD_MS = 450;
+    Runnable aheadRun = () -> { };
 
     /** Another title's page. Two deep at most: a third replaces the one beneath it. */
     void openRelated(String[] it) {
