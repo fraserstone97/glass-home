@@ -113,7 +113,7 @@ public class SearchActivity extends Activity {
     /** The search running now: a newer one stops it. */
     Future<?> running;
     EditText field;
-    /** "Hold [mic] to dictate", at the field's right while it's empty. */
+    /** "Press [mic] to dictate", at the field's right while it's empty. */
     TextView dictate;
     float barGlow, fieldFocus;
     android.animation.ValueAnimator barAnim, fieldAnim;
@@ -270,14 +270,8 @@ public class SearchActivity extends Activity {
         HEADER = u(101.5f);
         KEYS_W = u(256);
         // Behind everything, as on tvOS: the focused title's artwork, soft and dim.
-        ambient = new ImageView(this);
-        ambient.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        ambient = ambientLayer();
         ambient.setAlpha(0f);
-        // Its dark shade rides on it, so with no picture there's nothing extra to draw, and it's
-        // kept as one ready image so fading it costs nothing.
-        ambient.setForeground(new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
-                new int[]{0xCC000000, 0x8C000000, 0xE6000000}));
-        ambient.setLayerType(View.LAYER_TYPE_HARDWARE, null);
         root.addView(ambient, new FrameLayout.LayoutParams(-1, -1));
 
         // The results column, beside the keyboard: suggestions directly under the field (no band
@@ -433,10 +427,6 @@ public class SearchActivity extends Activity {
                 lastResult = new WeakReference<>(now);
                 ui.removeCallbacks(ambientTop);  // the focused result's background, not the top one's
             }
-            if (ambientTodo != null) {  // backgrounds wait until focus has settled
-                ui.removeCallbacks(ambientBatch);
-                ui.postDelayed(ambientBatch, 600);
-            }
         });
 
         setContentView(root);
@@ -522,8 +512,47 @@ public class SearchActivity extends Activity {
         if (q != null) {
             jump = true;
             setQuery(q);
+        } else {
+            fresh();  // opened again (Home, the mic button): a new search, never last night's
         }
         if (isVoiceIntent(i)) listenSoon();
+    }
+
+    /**
+     * A new visit: the field empty, the page before a search at its top, the keyboard focused. For
+     * Search opened again while it was still there underneath (the TV slept on it, or the mic
+     * button was pressed over it), and for coming back to it after a long time away.
+     */
+    void fresh() {
+        ui.removeCallbacks(debounced);
+        ui.removeCallbacks(relanded);
+        ui.removeCallbacks(listenRun);
+        stopListening();
+        setStatus("");
+        lastResult = null;
+        if (field.length() > 0 || !lastQuery.isEmpty()) setQuery("");
+        if (vScroll != null) vScroll.cancel();
+        ui.removeCallbacks(vStart);
+        scroll.scrollTo(0, 0);
+        slide(false);
+        showKeys();
+    }
+
+    /** Away this long (the TV asleep, the screensaver), Search is fresh when it's back. */
+    static final long AWAY_MS = 5 * 60 * 1000L;
+    long stoppedAt;
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+        stoppedAt = SystemClock.uptimeMillis();
+    }
+
+    @Override
+    protected void onRestart() {
+        super.onRestart();
+        // Under a title page it keeps its results for Back; otherwise a long absence starts again.
+        if (!opened && SystemClock.uptimeMillis() - stoppedAt > AWAY_MS) fresh();
     }
 
     static boolean isVoiceIntent(Intent i) {
@@ -534,6 +563,20 @@ public class SearchActivity extends Activity {
     @Override
     public boolean dispatchKeyEvent(KeyEvent ev) {
         MainActivity.navSound(this, ev);  // the same ticks as everywhere else
+        // While listening (the remote can't say when its mic button is let go, and ignores it
+        // pressed again mid-sentence): OK searches what's been said now, Back stops without one.
+        int k = ev.getKeyCode();
+        if (listening && (k == KeyEvent.KEYCODE_BACK || k == KeyEvent.KEYCODE_DPAD_CENTER || k == KeyEvent.KEYCODE_ENTER)) {
+            if (ev.getAction() == KeyEvent.ACTION_UP && ev.getRepeatCount() == 0) {
+                if (k == KeyEvent.KEYCODE_BACK) {
+                    ui.removeCallbacks(listenRun);
+                    stopListening();
+                } else {
+                    finishSpeech();
+                }
+            }
+            return true;
+        }
         return super.dispatchKeyEvent(ev);
     }
 
@@ -628,12 +671,13 @@ public class SearchActivity extends Activity {
                 ui.removeCallbacks(quietStop);
                 ui.postDelayed(quietStop, QUIET_MS);
                 ui.removeCallbacks(maxStop);
-                ui.postDelayed(maxStop, 12000);
+                ui.postDelayed(maxStop, 10000);
             }
-            // Sound started: give words time to come back before the silence timer can end it.
+            // Sound started: words should follow within a couple of seconds. If none do, it was the
+            // room (a fan, the telly), which mustn't keep the microphone open.
             @Override public void onBeginningOfSpeech() {
                 ui.removeCallbacks(quietStop);
-                ui.postDelayed(quietStop, QUIET_MS + 2500);
+                ui.postDelayed(quietStop, NOISE_MS);
             }
             @Override public void onRmsChanged(float db) {
                 // Loudness over the room's own hum: the floor follows the quietest moments, so the
@@ -650,6 +694,7 @@ public class SearchActivity extends Activity {
             }
             @Override public void onError(int err) {
                 ui.removeCallbacks(quietStop);
+                ui.removeCallbacks(pauseStop);
                 if (!listening && !ending) return;  // stopped on purpose (a second press)
                 ending = false;
                 boolean quiet = quietEnd && (err == SpeechRecognizer.ERROR_NO_MATCH || err == SpeechRecognizer.ERROR_SPEECH_TIMEOUT);
@@ -663,6 +708,8 @@ public class SearchActivity extends Activity {
                         : "Voice isn\u2019t available. Type instead.");
             }
             @Override public void onResults(Bundle r) {
+                ui.removeCallbacks(quietStop);
+                ui.removeCallbacks(pauseStop);
                 ending = false;
                 setListening(false);
                 if (isDestroyed()) return;
@@ -692,9 +739,11 @@ public class SearchActivity extends Activity {
             @Override public void onPartialResults(Bundle r) {
                 List<String> words = r.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
                 if (words != null && !words.isEmpty() && !words.get(0).isEmpty()) {
+                    // Talking: listening ends at the first real pause after the words, as if the
+                    // button had been let go then (the remote never says when it is).
                     ui.removeCallbacks(quietStop);
-                    ui.removeCallbacks(maxStop);
-                    ui.postDelayed(maxStop, 8000);  // talking: up to 8 more seconds
+                    ui.removeCallbacks(pauseStop);
+                    ui.postDelayed(pauseStop, PAUSE_MS);
                     // The words go into the field as they're heard (tvOS dictates into it); the
                     // waveform beside them carries on until you stop.
                     heard = true;
@@ -769,6 +818,7 @@ public class SearchActivity extends Activity {
 
     void stopListening() {
         ui.removeCallbacks(quietStop);
+        ui.removeCallbacks(pauseStop);
         ui.removeCallbacks(maxStop);
         ending = false;
         if (recognizer != null && listening) recognizer.cancel();
@@ -810,6 +860,13 @@ public class SearchActivity extends Activity {
 
     /** Nothing said this long after the microphone opened: stop quietly, as Siri does. */
     static final long QUIET_MS = 2500;
+    /** Sound with no words in it for this long: the room, not you. */
+    static final long NOISE_MS = 2000;
+    /** A pause this long after words: you've finished, so what you said is searched. */
+    static final long PAUSE_MS = 1100;
+    final Runnable pauseStop = () -> {
+        if (listening && recognizer != null) recognizer.stopListening();
+    };
     final Runnable quietStop = () -> {
         if (!listening || recognizer == null) return;
         // End the recording rather than throw it away: anything heard is still searched, and if
@@ -939,15 +996,18 @@ public class SearchActivity extends Activity {
         if (empty) setHints(Collections.emptyList());
     }
 
-    /** "Hold [mic] to dictate": the mic in a small grey disc, in the hint's grey. */
+    /**
+     * "Press [mic] to dictate": the mic in a small grey disc, in the hint's grey. Apple says "Hold";
+     * this TV's remote can't report a hold (KeysService), so here it's a press.
+     */
     TextView dictateHint() {
         TextView t = new TextView(this);
         int d = u(19);
         BitmapDrawable mic = new BitmapDrawable(getResources(), micDisc(d));
         mic.setBounds(0, 0, d, d);
-        SpannableStringBuilder sb = new SpannableStringBuilder("Hold \u00a0 to dictate");
+        SpannableStringBuilder sb = new SpannableStringBuilder("Press \u00a0 to dictate");
         sb.setSpan(new ImageSpan(mic, android.os.Build.VERSION.SDK_INT >= 29 ? DynamicDrawableSpan.ALIGN_CENTER
-                : DynamicDrawableSpan.ALIGN_BASELINE), 5, 6, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                : DynamicDrawableSpan.ALIGN_BASELINE), 6, 7, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
         t.setText(sb);
         t.setTextColor(HINT_COLOUR);
         t.setTypeface(Ui.font(this, "semibold"));
@@ -2082,7 +2142,8 @@ public class SearchActivity extends Activity {
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
         box.setGravity(Gravity.CENTER_HORIZONTAL);
-        box.addView(text(failed ? "Can\u2019t Connect" : "No Results", 24, "display", Color.WHITE));
+        // Its own width, so it centres (a vertical row's default is the full width, text at the left).
+        box.addView(text(failed ? "Can\u2019t Connect" : "No Results", 24, "display", Color.WHITE), new LinearLayout.LayoutParams(-2, -2));
         TextView m = text(failed ? "Check your internet connection and try again."
                 : "There were no results for \u201c" + lastQuery + "\u201d. Please try a new search.", 14.5f, "regular", 0x80FFFFFF);
         m.setGravity(Gravity.CENTER);
@@ -2311,10 +2372,15 @@ public class SearchActivity extends Activity {
             // Along the row as usual. At its ends Android would look anywhere that way, and find
             // another row's tiles scrolled out of sight: Left goes back to the keyboard instead,
             // and Right stays put, as on tvOS.
+            // Searched for within the row only: the field and suggestions, moved up off the screen
+            // as the page scrolls, are still where they were laid out as far as Android's own
+            // search knows, level with a lower row, and it chose them (Right went nowhere).
             boolean left = k == KeyEvent.KEYCODE_DPAD_LEFT;
-            View next = v.focusSearch(left ? View.FOCUS_LEFT : View.FOCUS_RIGHT);
-            if (next != null && rowOf(next) == rowOf(v)) return false;
-            if (left) showKeys();
+            View row = rowOf(v);
+            View next = row instanceof ViewGroup ? android.view.FocusFinder.getInstance()
+                    .findNextFocus((ViewGroup) row, v.findFocus() != null ? v.findFocus() : v, left ? View.FOCUS_LEFT : View.FOCUS_RIGHT) : null;
+            if (next != null) next.requestFocus(left ? View.FOCUS_LEFT : View.FOCUS_RIGHT);
+            else if (left) showKeys();
             return true;
         }
         if (k != KeyEvent.KEYCODE_DPAD_CENTER && k != KeyEvent.KEYCODE_ENTER && k != KeyEvent.KEYCODE_NUMPAD_ENTER) return false;
@@ -2628,6 +2694,8 @@ public class SearchActivity extends Activity {
     /** Your services, and their banners (by package), from the last look. */
     static volatile List<Suggestions.Provider> services = Collections.emptyList();
     static final Map<String, Bitmap> BANNERS = new ConcurrentHashMap<>();
+    /** Each banner blurred to a glow of its own colours, for its tile's background. */
+    static final Map<String, Bitmap> GLOWS = new ConcurrentHashMap<>();
     /** The genre tiles on screen, waiting for their pictures. */
     final Map<String, ImageView> tiles = new HashMap<>();
 
@@ -2676,6 +2744,8 @@ public class SearchActivity extends Activity {
             Bitmap b = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888);
             d.setBounds(0, 0, bw, bh);
             d.draw(new Canvas(b));
+            Bitmap glow = Ui.blur(b, 12, 18, 3, 3);
+            if (glow != null) GLOWS.put(p.pkg, Suggestions.onGpu(glow));
             BANNERS.put(p.pkg, Suggestions.onGpu(b));
         }
         if (mine.equals(services)) return;
@@ -2701,6 +2771,21 @@ public class SearchActivity extends Activity {
                     }
                 }
                 if (pick != null) break;
+            }
+            // Nothing popular now is of that genre (documentaries, romance rarely trend): the
+            // genre's own best-known title on your services instead, so no tile is left blank.
+            if (pick == null) {
+                try {
+                    for (Result r : brain.genreTop(g[1])) {
+                        if (r.poster != null && used.add(r.poster)) {
+                            pick = r;
+                            break;
+                        }
+                    }
+                } catch (Exception e) {
+                    // offline: the tile's plain glass
+                }
+                if (gen != generation) return;
             }
             if (pick == null) continue;
             // A still from the title, sharp, cropped to the tile, as Apple's Browse tiles are: scenes,
@@ -2738,6 +2823,13 @@ public class SearchActivity extends Activity {
         art.setScaleType(ImageView.ScaleType.FIT_XY);
         if (r.service != null) {
             art.setBackgroundColor(0xFF1C1C1E);
+            // The service's own colours, blurred and dimmed behind its logo (Prime Video's blue,
+            // ITVX's green), as tvOS's app tiles glow, rather than a grey card.
+            Bitmap glow = GLOWS.get(r.service.pkg);
+            if (glow != null) {
+                art.setImageBitmap(glow);
+                art.setColorFilter(0x8C000000, android.graphics.PorterDuff.Mode.SRC_ATOP);
+            }
             box.addView(art, new FrameLayout.LayoutParams(w, h));
             Bitmap banner = BANNERS.get(r.service.pkg);
             if (banner != null) {
@@ -2746,6 +2838,13 @@ public class SearchActivity extends Activity {
                 logo.setOutlineProvider(round(u(5)));
                 logo.setClipToOutline(true);
                 box.addView(logo, new FrameLayout.LayoutParams(u(110), u(62), Gravity.CENTER));
+            } else {
+                // No banner to show (its app isn't on this TV): its name, never a blank tile.
+                TextView name = text(r.title, 15.5f, "display", Color.WHITE);
+                name.setGravity(Gravity.CENTER);
+                name.setMaxLines(2);
+                FrameLayout.LayoutParams nl = new FrameLayout.LayoutParams(w - u(18), -2, Gravity.CENTER);
+                box.addView(name, nl);
             }
         } else {
             art.setBackground(new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
@@ -2779,6 +2878,7 @@ public class SearchActivity extends Activity {
         box.setOnFocusChangeListener((v, f) -> {
             lift(box, f, 1.1f, u(14));
             sheen(sheen, f);
+            if (f) ambientNone();
             focused(s, box, null, f);
         });
         box.setOnKeyListener((v, k, e) -> cardKey(v, box, 1.1f, k, e, () -> {
@@ -2855,6 +2955,13 @@ public class SearchActivity extends Activity {
     void pageScrolled(int y) {
         fieldBar.setTranslationY(-y);
         hintRow.setTranslationY(-y);
+        // Scrolled up out of sight, they can't be moved to: Android's focus search would still find
+        // them where they were laid out, beside the results now there.
+        int block = y > 0 ? ViewGroup.FOCUS_BLOCK_DESCENDANTS : ViewGroup.FOCUS_AFTER_DESCENDANTS;
+        if (hintRow.getDescendantFocusability() != block) {
+            hintRow.setDescendantFocusability(block);
+            if (fieldBar instanceof ViewGroup) ((ViewGroup) fieldBar).setDescendantFocusability(block);
+        }
     }
 
     /** The shelves start under the field, and under the suggestions while there are some. */
@@ -2888,51 +2995,90 @@ public class SearchActivity extends Activity {
     volatile String ambientFor;
 
     /**
-     * Backgrounds ready to show, by picture address, prepared as results appear: under 2 MB each,
-     * so ten stay light on the TV's memory.
+     * One background layer. Its dark shade rides on it, so with no picture there's nothing extra
+     * to draw, and it's kept as one ready image so fading it costs nothing.
      */
-    static final android.util.LruCache<String, Bitmap> AMBIENT = new android.util.LruCache<>(10);
-    final ExecutorService ambientIo = Executors.newSingleThreadExecutor();
-    /** The focused title's picture, never queued behind the ones being got ready. */
-    final ExecutorService ambientNow = Executors.newSingleThreadExecutor();
+    ImageView ambientLayer() {
+        ImageView v = new ImageView(this);
+        v.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        v.setForeground(new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
+                new int[]{0xCC000000, 0x8C000000, 0xE6000000}));
+        v.setLayerType(View.LAYER_TYPE_HARDWARE, null);
+        return v;
+    }
 
     /**
-     * The picture behind a result: the studio's full-size key art (TMDB) when there is one, else
-     * JustWatch's 1920 px backdrop, opened at two thirds of the screen's width (1280 px), so the
-     * scaling softens it a little and it's never blocky.
+     * Backgrounds opened and ready to show, by picture address: under 2 MB each (1280 px, 16-bit,
+     * on the GPU), a dozen at once, so going back along the results finds them there. The rest
+     * wait on disk (prepareAmbient), a quick read away.
+     */
+    static final android.util.LruCache<String, Bitmap> AMBIENT = new android.util.LruCache<String, Bitmap>(24 << 20) {
+        @Override protected int sizeOf(String k, Bitmap b) {
+            return Math.max(1, b.getAllocationByteCount());
+        }
+    };
+    /** Getting the results' backgrounds ready, two at a time, behind everything on screen. */
+    final ExecutorService ambientIo = Executors.newFixedThreadPool(2, job -> new Thread(() -> {
+        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
+        job.run();
+    }, "ambient"));
+    /** The focused title's picture, never queued behind the ones being got ready. */
+    final ExecutorService ambientNow = Executors.newSingleThreadExecutor();
+    /** Backgrounds being got ready now, so none is fetched twice at once. */
+    final Set<String> ambientGetting = java.util.Collections.newSetFromMap(new ConcurrentHashMap<>());
+
+    /**
+     * The picture behind a result: the studio's key art (TMDB) when there is one, else JustWatch's
+     * 1920 px backdrop, opened at two thirds of the screen's width (1280 px), so the scaling
+     * softens it a little and it's never blocky. TMDB's art comes at its own 1280 px size, not the
+     * original (often 4K): the same picture on screen, a fraction of the download and decoding.
      */
     Bitmap ambientArt(Result r, String url) {
         Bitmap b = AMBIENT.get(url);
         if (b != null) return b;
         String art = r == null || r.tmdbId <= 0 ? null : Suggestions.tmdbBackdrop(this, r.type, r.tmdbId);
-        // Two thirds of the screen's width: drawn full screen, the smooth scaling gives it the
-        // lightest softness, with no blurring to do and half the memory.
         int full = Ui.screen(this).x * 2 / 3;
-        Bitmap src = art == null ? null : Suggestions.screenImage(this, art, full);
+        Bitmap src = art == null ? null : Suggestions.screenImage(this, Suggestions.tmdbSized(art, "w1280"), full);
         if (src == null) src = Suggestions.screenImage(this, url, full);
         if (src == null) return null;
         if (!isDestroyed()) AMBIENT.put(url, src);  // not kept in Home's process once Search has gone
         return src;
     }
 
-    /** The first few results' backgrounds, waiting to be got ready until focus settles. */
+    /**
+     * A result's background fetched to the disk cache, not opened: opening (decoding) big pictures
+     * in the background takes the TV's processor from drawing the page, so that's left until
+     * focus reaches the result, when it's a quick read from disk.
+     */
+    void ambientDownload(Result r, String url) {
+        try {
+            String art = r == null || r.tmdbId <= 0 ? null : Suggestions.tmdbBackdrop(this, r.type, r.tmdbId);
+            if (Suggestions.download(this, art != null ? Suggestions.tmdbSized(art, "w1280") : url, "") == null && art != null) {
+                Suggestions.download(this, url, "");
+            }
+        } catch (Exception e) {
+            // fetched when focused instead
+        }
+    }
+
+    /** The results whose backgrounds are to be got ready, in the order they're shown. */
     List<Result> ambientTodo;
 
     /**
-     * Gets the first four results' backgrounds ready, once nothing has changed for 600 ms: each is
-     * a big picture to decode, which would take time from the rows moving. The rest load as you
-     * move to them.
+     * Fetches the results' backgrounds as soon as their rows have risen (24 of them, in the order
+     * they're shown), two at a time at background priority, so each is on disk before focus
+     * reaches it, and opening it then takes a moment.
      */
     void prepareAmbient(List<Result> rs) {
         if (isDestroyed()) return;
         List<Result> todo = new ArrayList<>();
         for (Result r : rs) {
             String u = r.backdrop != null ? r.backdrop : r.poster;
-            if (u != null && !"app".equals(r.type) && AMBIENT.get(u) == null && todo.size() < 4) todo.add(r);
+            if (u != null && !"app".equals(r.type) && AMBIENT.get(u) == null && todo.size() < 24) todo.add(r);
         }
         ambientTodo = todo.isEmpty() ? null : todo;
         ui.removeCallbacks(ambientBatch);
-        if (ambientTodo != null) ui.postDelayed(ambientBatch, 600);
+        if (ambientTodo != null) ui.postDelayed(ambientBatch, 250);
     }
 
     final Runnable ambientBatch = () -> {
@@ -2940,14 +3086,17 @@ public class SearchActivity extends Activity {
         ambientTodo = null;
         if (todo == null || isDestroyed()) return;
         int gen = generation;
-        ambientIo.execute(() -> {
-            for (Result r : todo) {
-                if (gen != generation) return;
-                String u = r.backdrop != null ? r.backdrop : r.poster;
-                if (u.equals(ambientFor)) continue;  // the one showing is being got by ambientNow
-                ambientArt(r, u);
+        for (Result r : todo) {
+            String u = r.backdrop != null ? r.backdrop : r.poster;
+            try {
+                ambientIo.execute(() -> {
+                    if (gen != generation || AMBIENT.get(u) != null) return;
+                    ambientDownload(r, u);
+                });
+            } catch (Exception e) {
+                return;  // the page has closed
             }
-        });
+        }
     };
 
     void ambientFor(Result r) {
@@ -2958,31 +3107,50 @@ public class SearchActivity extends Activity {
         ui.removeCallbacks(ambientRun);
         Bitmap ready = AMBIENT.get(url);
         if (ready != null) {
-            // Ready: straight in, with a quick cross-fade.
-            ambient.animate().cancel();
-            ambient.setImageBitmap(ready);
-            ambient.setAlpha(0.35f);
-            ambient.animate().alpha(1f).setDuration(260).setInterpolator(MainActivity.EASE).start();
+            showAmbient(ready, 260);  // ready: straight in
             return;
         }
         ambientRun = () -> ambientNow.execute(() -> {
-            if (!url.equals(ambientFor)) return;  // focus has moved on
-            // The studio's full-size key art (TMDB) when there is one, else JustWatch's 1920 px
-            // picture, opened at two thirds of the screen's width and drawn full screen under the
-            // page's dark shade.
-            Bitmap bm = ambientArt(r, url);
+            // Being got ready already: wait for that one rather than fetch it again.
+            while (!ambientGetting.add(url)) {
+                if (!url.equals(ambientFor)) return;  // focus has moved on
+                SystemClock.sleep(40);
+            }
+            Bitmap bm;
+            try {
+                if (!url.equals(ambientFor)) return;
+                bm = ambientArt(r, url);
+            } finally {
+                ambientGetting.remove(url);
+            }
             ui.post(() -> {
                 if (bm == null || !url.equals(ambientFor) || isDestroyed()) return;
-                ambient.animate().cancel();
-                ambient.animate().alpha(0f).setDuration(180).setInterpolator(MainActivity.EASE).withEndAction(() -> {
-                    ambient.setImageBitmap(bm);
-                    ambient.animate().alpha(1f).setDuration(700).setInterpolator(MainActivity.EASE).start();
-                }).start();
+                showAmbient(bm, 320);
             });
         });
-        // Not while the row glides and the card lifts: a big picture to decode would take frames
-        // from them. Moving on before then cancels it.
-        ui.postDelayed(ambientRun, 300);
+        // A moment's wait, so moving quickly along a row doesn't fetch each picture on the way.
+        ui.postDelayed(ambientRun, 90);
+    }
+
+    /**
+     * The new picture in its place at once, brightening from half: a cross-fade proper (the old
+     * picture on a second full-screen layer under it) cost this TV's GPU a second full-screen
+     * fill every frame of every fade, and made one frame in seven late while moving along results.
+     */
+    void showAmbient(Bitmap b, long ms) {
+        ambient.animate().cancel();
+        ambient.setImageBitmap(b);
+        ambient.setAlpha(Math.min(ambient.getAlpha(), 0.5f));
+        ambient.animate().alpha(1f).setDuration(ms).setInterpolator(MainActivity.EASE).start();
+    }
+
+    /** Nothing behind the page: Browse's tiles are pictures themselves, so a title's stays not. */
+    void ambientNone() {
+        if (ambientFor == null) return;
+        ambientFor = null;
+        ui.removeCallbacks(ambientRun);
+        ambient.animate().cancel();
+        ambient.animate().alpha(0f).setDuration(300).setInterpolator(MainActivity.EASE).start();
     }
 
     Runnable ambientRun = () -> { }, ambientTop = () -> { };

@@ -134,6 +134,8 @@ public class MainActivity extends Activity {
         Bitmap tileArt;
         /** The app's own icon and banner resources, for fetching them at a higher density. */
         int iconRes, bannerRes;
+        /** Where its banner and icon are still to be loaded from (scan's parallel step); then null. */
+        ResolveInfo from;
         Intent launch;
         int color;
         boolean system;
@@ -2319,7 +2321,9 @@ public class MainActivity extends Activity {
         heroButton.setVisibility(View.GONE);
         FrameLayout.LayoutParams ilp = new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM | Gravity.START);
-        int room = dp(12);
+        // Room round it for the focused button's lift and shadow (at 12 the shadow's far edge was
+        // cut along a line); the margins take it back, so nothing moves.
+        int room = dp(20);
         heroInfo.setPadding(room, room, room, room);
         ilp.leftMargin = side - room;
         ilp.bottomMargin = dp(40) - room;
@@ -3736,25 +3740,52 @@ public class MainActivity extends Activity {
         addResolved(pm, Intent.CATEGORY_LAUNCHER, pkgs, false, found, prev, fresh);
         if (!pkgs.contains(TV_SETTINGS)) addSettingsEntry(pm, found, prev, fresh);
         if (Inputs.showCard(this) && !Inputs.list(this).isEmpty()) addInputsEntry(found, prev, fresh);
-        for (AppEntry e : fresh) {
-            boolean zoom = e.banner != null && ZOOM_BANNER_PKGS.contains(e.pkg);
-            boolean card = !zoom && (e.banner == null || TVOS_CARD_PKGS.contains(e.pkg));
-            if (zoom || card) {
-                // Built from the app's highest-resolution art, which is only held while drawing.
-                Drawable icon = e.icon, banner = e.banner;
-                e.icon = hiRes(pm, e.pkg, e.iconRes, icon);
-                if (banner != null) e.banner = hiRes(pm, e.pkg, e.bannerRes, banner);
-                Bitmap art = zoom ? zoomedBanner(e) : tvosCard(e);
-                e.icon = icon;
-                e.banner = new BitmapDrawable(getResources(), art);
+        // Each app's banner and icon are loaded and its card drawn from its biggest art, about 60 ms
+        // an app on this TV: three at a time, so a cold start waits about half a second for
+        // twenty-four apps rather than a second and a half (Home first appeared after 2.1 s, now 1.2).
+        if (fresh.size() < 3) {
+            for (AppEntry e : fresh) drawCard(pm, e);
+        } else {
+            java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(3);
+            List<java.util.concurrent.Future<?>> jobs = new ArrayList<>();
+            for (AppEntry e : fresh) jobs.add(pool.submit(() -> drawCard(pm, e)));
+            for (java.util.concurrent.Future<?> j : jobs) {
+                try {
+                    j.get();
+                } catch (Exception ignored) {
+                    // that app's card keeps its plain banner
+                }
             }
-            // The tile itself from the biggest banner the app ships (iPlayer and ITVX have 640 px,
-            // Netflix 480), held only while it's drawn: more pixels in, cleaner when scaled down.
-            boolean own = !zoom && !card && e.bannerRes != 0;
-            Drawable big = own ? hiRes(pm, e.pkg, e.bannerRes, e.banner) : e.banner;
-            e.tileArt = tileArt(big != e.banner && sameArt(big, e.banner) ? big : e.banner);
+            pool.shutdown();
         }
         return found;
+    }
+
+    /** One app's card art (scan), from its highest-resolution banner or icon. */
+    void drawCard(PackageManager pm, AppEntry e) {
+        if (e.from != null) {
+            ActivityInfo ai = e.from.activityInfo;
+            e.banner = e.bannerRes != 0 ? ai.loadBanner(pm) : null;
+            if (e.icon == null) e.icon = e.from.loadIcon(pm);
+            e.color = tintFrom(e.icon);
+            e.from = null;
+        }
+        boolean zoom = e.banner != null && ZOOM_BANNER_PKGS.contains(e.pkg);
+        boolean card = !zoom && (e.banner == null || TVOS_CARD_PKGS.contains(e.pkg));
+        if (zoom || card) {
+            // Built from the app's highest-resolution art, which is only held while drawing.
+            Drawable icon = e.icon, banner = e.banner;
+            e.icon = hiRes(pm, e.pkg, e.iconRes, icon);
+            if (banner != null) e.banner = hiRes(pm, e.pkg, e.bannerRes, banner);
+            Bitmap art = zoom ? zoomedBanner(e) : tvosCard(e);
+            e.icon = icon;
+            e.banner = new BitmapDrawable(getResources(), art);
+        }
+        // The tile itself from the biggest banner the app ships (iPlayer and ITVX have 640 px,
+        // Netflix 480), held only while it's drawn: more pixels in, cleaner when scaled down.
+        boolean own = !zoom && !card && e.bannerRes != 0;
+        Drawable big = own ? hiRes(pm, e.pkg, e.bannerRes, e.banner) : e.banner;
+        e.tileArt = tileArt(big != e.banner && sameArt(big, e.banner) ? big : e.banner);
     }
 
     /** Takes a scan's apps as Home's own (main thread). A card is the same object while its app is unchanged. */
@@ -3886,11 +3917,10 @@ public class MainActivity extends Activity {
             e.key = key;
             e.label = label;
             e.stamp = stamp;
-            e.banner = leanback ? ai.loadBanner(pm) : null;
-            e.icon = ri.loadIcon(pm);
+            // Its banner and icon are loaded with its card, several apps at once (drawCard).
+            e.from = ri;
             e.iconRes = ri.getIconResource();
             e.bannerRes = leanback ? ai.getBannerResource() : 0;
-            e.color = tintFrom(e.icon);
             e.system = (ai.applicationInfo.flags & ApplicationInfo.FLAG_SYSTEM) != 0;
             e.launch = new Intent(Intent.ACTION_MAIN).addCategory(category).setComponent(cn)
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
@@ -4880,11 +4910,15 @@ public class MainActivity extends Activity {
                     if (Math.abs(dy) > tileH / 2f && Math.abs(dx) > tileW * 1.5f) {
                         // Wrapped to another row (end of a row): a slide would streak across the
                         // whole screen, so settle into the new slot instead, as tvOS does.
+                        // The tile fades, not its cell: a fading cell is drawn through a layer cut
+                        // to the cell's bounds, which squared off the lifted card being moved and
+                        // lost its shadow. (Its label keeps its own fade, shown only with focus.)
                         View cell = (View) t.getParent();
-                        cell.setAlpha(0f);
                         cell.setScaleX(0.86f);
                         cell.setScaleY(0.86f);
-                        cell.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(300).setInterpolator(EASE_OUT_QUAD).start();
+                        cell.animate().scaleX(1f).scaleY(1f).setDuration(300).setInterpolator(EASE_OUT_QUAD).start();
+                        t.setAlpha(0f);
+                        t.animate().alpha(1f).setDuration(300).setInterpolator(EASE_OUT_QUAD).start();
                         continue;
                     }
                     // Neighbours slide aside with a 300 ms ease, as tvOS's do: visibly making room

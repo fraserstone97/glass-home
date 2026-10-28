@@ -24,6 +24,7 @@ import android.text.TextUtils;
 import android.text.style.ForegroundColorSpan;
 import android.view.Gravity;
 import android.view.KeyEvent;
+import android.view.ViewGroup;
 import android.view.View;
 import android.view.animation.AccelerateInterpolator;
 import android.view.animation.DecelerateInterpolator;
@@ -72,11 +73,6 @@ public class DetailActivity extends Activity {
             + " ... on Show { totalSeasonCount seasons { totalEpisodeCount content(country: $c, language: $l) { seasonNumber }"
             + " offers(country: $c, platform: WEB, filter: {monetizationTypes: [FREE, ADS, BUY]}) { monetizationType"
             + " presentationType elementCount retailPrice(language: $l) retailPriceValue package { technicalName } } } } } }";
-
-    /** Related titles, asked for alongside the details (a separate, smaller answer). */
-    static final String SIMILAR = "query R($id: ID!, $c: Country!, $l: Language!) { node(id: $id) { ... on MovieOrShow {"
-            + " similarTitlesV2(country: $c, first: 12) { edges { node { id objectType content(country: $c, language: $l) {"
-            + " title posterUrl backdrops { backdropUrl } externalIds { tmdbId } } } } } } } }";
 
     /** JustWatch service -> the Android TV app that plays it (the stores open in their apps too). */
     static final Map<String, String> APPS = new LinkedHashMap<>();
@@ -286,6 +282,8 @@ public class DetailActivity extends Activity {
         credits.setMaxLines(3);
         credits.setEllipsize(TextUtils.TruncateAt.END);
         credits.setLineSpacing(0, 1.1f);
+        // It sits on the artwork's light side, with no shade behind it: a soft shadow keeps it legible.
+        credits.setShadowLayer(u(5), 0, u(0.5f), 0xB3000000);
         credits.setAlpha(0f);
         row.addView(credits, new FrameLayout.LayoutParams(-2, -2, Gravity.END | Gravity.BOTTOM));
         LinearLayout.LayoutParams rl = new LinearLayout.LayoutParams(-1, -2);
@@ -382,6 +380,14 @@ public class DetailActivity extends Activity {
             side.execute(() -> backdrop(knownBackdrop));
         }
         if (id == null) return;
+        // TMDB's cast and crew, in billing order, asked for alongside the details when there's a
+        // key: JustWatch's own list for a series is in no useful order (Steve Carell 45th in The
+        // Office's) and full of episode directors.
+        java.util.concurrent.Future<JSONObject> cast = token && tmdb > 0 ? SearchBrain.POOL.submit(() ->
+                Suggestions.get(this, "/" + ("tv".equals(type) ? "tv/" + tmdb + "/aggregate_credits" : "movie/" + tmdb + "/credits"))) : null;
+        // Its trailers too: TMDB says which are the official ones.
+        java.util.concurrent.Future<JSONObject> clips = token && tmdb > 0 ? SearchBrain.POOL.submit(() ->
+                Suggestions.get(this, "/" + ("tv".equals(type) ? "tv/" : "movie/") + tmdb + "/videos?include_video_language=en,null")) : null;
         io.execute(() -> {
             try {
                 JSONObject vars = new JSONObject().put("id", id).put("c", "GB").put("l", "en");
@@ -402,6 +408,16 @@ public class DetailActivity extends Activity {
                 offers.removeIf(o -> !o.installed && !o.free && !o.ads && !o.subscription);
                 elsewhere = all > 0 && offers.isEmpty();
                 offers.sort((x, y) -> Integer.compare(x.rank, y.rank));
+                try {
+                    if (cast != null) tmdbCast = cast.get(2500, java.util.concurrent.TimeUnit.MILLISECONDS);
+                } catch (Exception e) {
+                    // JustWatch's list, then
+                }
+                try {
+                    if (clips != null) tmdbVideos = clips.get(1000, java.util.concurrent.TimeUnit.MILLISECONDS);
+                } catch (Exception e) {
+                    // JustWatch's clips, then
+                }
                 ui.post(() -> show(n, offers));
             } catch (Exception e) {
                 ui.post(() -> {
@@ -411,7 +427,7 @@ public class DetailActivity extends Activity {
                 });
             }
         });
-        rel.execute(this::related);
+        rel.execute(() -> related(type, tmdb));
     }
 
     /** TMDB's artwork for the title when there's a key (else the fallback): the backdrop, then its logo. */
@@ -560,7 +576,7 @@ public class DetailActivity extends Activity {
         SearchActivity.showIcons(meta);
 
         // Starring … / Director …: grey labels, white names.
-        List<String[]> people = people(c.optJSONArray("credits"));
+        List<String[]> people = tmdbCast != null ? tmdbPeople(tmdbCast, series) : people(c.optJSONArray("credits"), series);
         List<String> actors = new ArrayList<>();
         String director = null;
         for (String[] p : people) {
@@ -579,6 +595,22 @@ public class DetailActivity extends Activity {
 
         actions.removeAllViews();
         View first = primary(offers);
+        String trailer = trailer(tmdbVideos, null, c.optString("title", ""));
+        if (trailer != null) pill("Trailer", v -> playTrailer(trailer));
+        else if (tmdbVideos == null) {
+            // No TMDB: JustWatch's clips, which it gives only in a search (asked by id, it gives
+            // none), so the title is searched for and found by id; the button fades in after.
+            String name = c.optString("title", "");
+            io.execute(() -> {
+                String key = trailer(null, jwClips(name), name);
+                if (key != null) ui.post(() -> {
+                    if (isDestroyed()) return;
+                    View b = pill("Trailer", v -> playTrailer(key));
+                    b.setAlpha(0f);
+                    b.animate().alpha(1f).setDuration(240).setInterpolator(LINEAR).start();
+                });
+            });
+        }
         ways.items.removeAllViews();
         tiles.clear();
         for (Offer o : offers) way(o);
@@ -650,18 +682,147 @@ public class DetailActivity extends Activity {
         return SearchActivity.ratings(imdb, tomato, sc != null && sc.optBoolean("certifiedFresh", false));
     }
 
-    /** Cast first, then up to two directors, ten in all: {name, character, "Director" or null}. */
-    static List<String[]> people(JSONArray credits) {
+    /** TMDB's cast and crew for the page (see load), when it came: then also the cast's photos. */
+    volatile JSONObject tmdbCast;
+    /** TMDB's videos for the title (see load), when they came. */
+    volatile JSONObject tmdbVideos;
+
+    /**
+     * The title's trailer on YouTube (its video id), or null. TMDB's official trailer when there's
+     * a key (a teaser only when there's no trailer; the first one released, a series' first
+     * season's); else JustWatch's clips, whose list mixes in a sequel's trailer (Gladiator II's
+     * for Gladiator), scenes and reviews: only one named for this title and a trailer will do.
+     */
+    static String trailer(JSONObject tmdb, JSONArray jw, String title) {
+        JSONArray v = tmdb == null ? null : tmdb.optJSONArray("results");
+        String best = null, bestAt = null;
+        int bestScore = 0;
+        for (int i = 0; v != null && i < v.length(); i++) {
+            JSONObject o = v.optJSONObject(i);
+            if (o == null || !"YouTube".equals(o.optString("site")) || str(o, "key").isEmpty()) continue;
+            String type = o.optString("type"), name = o.optString("name").toLowerCase(Locale.ROOT);
+            int sc = "Trailer".equals(type) ? 4 : "Teaser".equals(type) ? 1 : 0;
+            if (sc == 0) continue;
+            if (o.optBoolean("official")) sc += 2;
+            if (name.contains("official trailer")) sc++;
+            String at = str(o, "published_at");
+            if (sc > bestScore || sc == bestScore && bestAt != null && at.compareTo(bestAt) < 0) {
+                best = str(o, "key");
+                bestScore = sc;
+                bestAt = at;
+            }
+        }
+        if (best != null) return best;
+        String t = SearchBrain.norm(title);
+        if (t.isEmpty()) return null;
+        int bestJw = 0;
+        for (int i = 0; jw != null && i < jw.length(); i++) {
+            JSONObject o = jw.optJSONObject(i);
+            if (o == null || !"YOUTUBE".equals(o.optString("provider")) || str(o, "externalId").isEmpty()) continue;
+            String name = " " + SearchBrain.norm(o.optString("name")) + " ";
+            int at = name.indexOf(" " + t + " ");
+            if (at < 0 || !name.contains(" trailer ") || name.matches(".*\\b(reaction|review|explained|recap|breakdown)\\b.*")) continue;
+            // Named for a sequel: "Gladiator II", "Dune Part Two", "Moana 2".
+            String after = name.substring(at + t.length() + 2);
+            if (after.matches("(\\d+|ii|iii|iv|part|chapter)\\b.*")) continue;
+            int sc = name.contains(" official ") ? 2 : 1;
+            if (sc > bestJw) {
+                best = str(o, "externalId");
+                bestJw = sc;
+            }
+        }
+        return best;
+    }
+
+    /** JustWatch's clips for this title (by its id), from a search for its name; null if not found. */
+    JSONArray jwClips(String name) {
+        if (id == null || name.isEmpty()) return null;
+        try {
+            String q = "query T($c: Country!, $l: Language!, $f: TitleFilter) { popularTitles(country: $c, filter: $f, first: 8) {"
+                    + " edges { node { id content(country: $c, language: $l) { clips { externalId provider name } } } } } }";
+            JSONObject vars = new JSONObject().put("c", "GB").put("l", "en").put("f", new JSONObject().put("searchQuery", name));
+            JSONArray edges = Suggestions.post("https://apis.justwatch.com/graphql",
+                    new JSONObject().put("query", q).put("variables", vars).toString())
+                    .getJSONObject("data").getJSONObject("popularTitles").getJSONArray("edges");
+            for (int i = 0; i < edges.length(); i++) {
+                JSONObject n = edges.getJSONObject(i).getJSONObject("node");
+                if (id.equals(n.optString("id"))) return n.getJSONObject("content").optJSONArray("clips");
+            }
+        } catch (Exception e) {
+            // no trailer, then
+        }
+        return null;
+    }
+
+    /**
+     * Plays the trailer, full screen, coming back to this page when it ends or on Back. In YouTube's
+     * own bare player when its app is here: that's signed in to your account, so with Premium
+     * there's never an advert first (an embedded player can't promise that), and it shows only
+     * YouTube's controls. Without the app, in a player of our own (TrailerActivity).
+     */
+    void playTrailer(String key) {
+        if (Suggestions.installed(this, YOUTUBE)) {
+            Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse("https://www.youtube.com/watch?v=" + key))
+                    .setPackage(YOUTUBE).putExtra("force_fullscreen", true).putExtra("finish_on_ended", true);
+            try {
+                startActivity(i);
+                return;
+            } catch (android.content.ActivityNotFoundException e) {
+                // its player won't take it: ours, then
+            }
+        }
+        startActivity(new Intent(this, TrailerActivity.class).putExtra(TrailerActivity.EXTRA_KEY, key)
+                .putExtra(TrailerActivity.EXTRA_TITLE, title.getText().toString()));
+        overridePendingTransition(R.anim.page_in, R.anim.hold);
+    }
+
+    static final String YOUTUBE = "com.google.android.youtube.tv";
+
+    /**
+     * Cast first, then up to two directors, ten in all: {name, character, "Director" or null}, from
+     * JustWatch. A series has no director of its own (the ones listed directed an episode or two),
+     * and nobody is listed twice.
+     */
+    static List<String[]> people(JSONArray credits, boolean series) {
         List<String[]> actors = new ArrayList<>(), directors = new ArrayList<>();
+        java.util.Set<String> seen = new java.util.HashSet<>();
         for (int i = 0; credits != null && i < credits.length(); i++) {
             JSONObject cr = credits.optJSONObject(i);
             if (cr == null) continue;
             String name = str(cr, "name");
-            if (name.isEmpty()) continue;
+            if (name.isEmpty() || !seen.add(SearchBrain.norm(name))) continue;
             if ("ACTOR".equals(cr.optString("role"))) actors.add(new String[]{name, str(cr, "characterName"), null});
-            else if ("DIRECTOR".equals(cr.optString("role")) && directors.size() < 2) directors.add(new String[]{name, "Director", "Director"});
+            else if (!series && "DIRECTOR".equals(cr.optString("role")) && directors.size() < 2) directors.add(new String[]{name, "Director", "Director"});
         }
         List<String[]> out = new ArrayList<>(actors.subList(0, Math.min(actors.size(), 10 - directors.size())));
+        out.addAll(directors);
+        return out;
+    }
+
+    /** The same from TMDB's credits: its billing order (a series' main cast first), a film's directors. */
+    static List<String[]> tmdbPeople(JSONObject credits, boolean series) {
+        List<JSONObject> cast = new ArrayList<>();
+        JSONArray a = credits.optJSONArray("cast");
+        for (int i = 0; a != null && i < a.length(); i++) if (a.optJSONObject(i) != null) cast.add(a.optJSONObject(i));
+        // In billing order; the list's own order otherwise (the sort keeps ties as they were).
+        cast.sort((x, y) -> Integer.compare(x.optInt("order", 999), y.optInt("order", 999)));
+        List<String[]> directors = new ArrayList<>();
+        JSONArray crew = series ? null : credits.optJSONArray("crew");
+        for (int i = 0; crew != null && i < crew.length() && directors.size() < 2; i++) {
+            JSONObject cr = crew.optJSONObject(i);
+            if (cr != null && "Director".equals(cr.optString("job"))) directors.add(new String[]{str(cr, "name"), "Director", "Director"});
+        }
+        List<String[]> out = new ArrayList<>();
+        java.util.Set<String> seen = new java.util.HashSet<>();
+        for (JSONObject p : cast) {
+            if (out.size() >= 10 - directors.size()) break;
+            String name = str(p, "name");
+            if (name.isEmpty() || !seen.add(SearchBrain.norm(name))) continue;
+            String role = str(p, "character");
+            JSONArray roles = p.optJSONArray("roles");  // a series': the part they played most
+            if (role.isEmpty() && roles != null && roles.length() > 0) role = str(roles.optJSONObject(0), "character");
+            out.add(new String[]{name, role, null});
+        }
         out.addAll(directors);
         return out;
     }
@@ -710,6 +871,8 @@ public class DetailActivity extends Activity {
             // Discs and cinemas aren't a way to watch on the TV; free live channels aren't the title.
             if ("CINEMA".equals(mt) || "FAST".equals(mt) || "DVD".equals(pt) || "BLURAY".equals(pt)) continue;
             String own = pk.optString("technicalName"), tech = own, clear = str(pk, "clearName"), icon = str(pk, "icon");
+            // Sky Go comes with a Sky TV subscription, not one you'd take out to watch this.
+            if ("skygo".equals(own) || clear.equalsIgnoreCase("Sky Go")) continue;
             JSONObject parent = pk.optJSONObject("addonParent");
             String addon = null;
             if ("amazonprimevideowithads".equals(own) || "amazonimdbtv".equals(own)) {
@@ -979,6 +1142,9 @@ public class DetailActivity extends Activity {
         white.tint = f -> t.setTextColor((int) EV.evaluate(f, Color.WHITE, 0xFF111114));
         t.setOnFocusChangeListener((v, has) -> Glass.focus(white, has, 75, 150, FOCUS_IN, FOCUS_OUT));
         t.setOnClickListener(click);
+        // At either end of the buttons, Left and Right stay put: there was nothing beside it, and
+        // focus jumped down into Related.
+        t.setOnKeyListener((v, k, e) -> e.getAction() == KeyEvent.ACTION_DOWN && rowEnd(actions, v, k));
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, u(37));
         if (actions.getChildCount() > 0) lp.leftMargin = u(8);
         actions.addView(t, lp);
@@ -993,6 +1159,9 @@ public class DetailActivity extends Activity {
         GradientDrawable platter = new GradientDrawable();
         platter.setCornerRadius(u(15));
         platter.setColor(0x1AFFFFFF);
+        // A hairline rim, as glass has: over dark artwork the platter alone melts into it, and two
+        // cards side by side read as one.
+        platter.setStroke(Math.max(1, u(0.6f)), 0x1FFFFFFF);
         LinearLayout t = new LinearLayout(this);
         t.setGravity(Gravity.CENTER_VERTICAL);
         t.setPadding(u(10), 0, u(16), 0);
@@ -1069,37 +1238,27 @@ public class DetailActivity extends Activity {
     /** The shelves below the fold have been built. */
     boolean built;
 
-    /** Asks JustWatch for related titles (on `rel`), for the shelf below How to Watch. */
-    void related() {
+    /**
+     * Related titles (on `rel`), for the shelf below How to Watch: the same as Search's titles like
+     * it (SearchBrain.similar), so only well-known titles of the same kind, closest first.
+     */
+    void related(String type, int tmdb) {
         if (id == null) return;
-        try {
-            JSONObject vars = new JSONObject().put("id", id).put("c", "GB").put("l", "en");
-            JSONObject res = Suggestions.post("https://apis.justwatch.com/graphql",
-                    new JSONObject().put("query", SIMILAR).put("variables", vars).toString());
-            JSONObject sim = res.getJSONObject("data").getJSONObject("node").optJSONObject("similarTitlesV2");
-            JSONArray edges = sim == null ? null : sim.optJSONArray("edges");
-            List<String[]> out = new ArrayList<>();
-            for (int i = 0; edges != null && i < edges.length(); i++) {
-                JSONObject n = edges.getJSONObject(i).optJSONObject("node");
-                JSONObject c = n == null ? null : n.optJSONObject("content");
-                String poster = str(c, "posterUrl");
-                if (c == null || poster.isEmpty()) continue;
-                JSONArray bds = c.optJSONArray("backdrops");
-                String bd = bds != null && bds.length() > 0 ? "https://images.justwatch.com" + bds.optJSONObject(0)
-                        .optString("backdropUrl").replace("{profile}", "s1920").replace("{format}", "jpg") : null;
-                JSONObject ext = c.optJSONObject("externalIds");
-                out.add(new String[]{n.optString("id"), n.optString("objectType"), Suggestions.cleanTitle(str(c, "title")),
-                        "https://images.justwatch.com" + poster.replace("{profile}", "s332").replace("{format}", "jpg"),
-                        bd, ext == null ? "0" : str(ext, "tmdbId")});
-            }
-            if (!out.isEmpty()) ui.post(() -> {
-                if (isDestroyed()) return;
-                related = out;
-                if (built) relatedRow(out);
-            });
-        } catch (Exception ignored) {
-            // the page is complete without it
+        SearchActivity.Result to = new SearchActivity.Result();
+        to.id = id;
+        to.type = "tv".equals(type) ? "tv" : "movie";
+        to.tmdbId = tmdb;
+        List<String[]> out = new ArrayList<>();
+        for (SearchActivity.Result r : new SearchBrain(this).similar(to, this::gone)) {
+            if (r.poster == null || id.equals(r.id)) continue;
+            out.add(new String[]{r.id, "tv".equals(r.type) ? "SHOW" : "MOVIE", r.title, r.poster, r.backdrop, String.valueOf(r.tmdbId)});
+            if (out.size() >= 12) break;
         }
+        if (!out.isEmpty()) ui.post(() -> {
+            if (isDestroyed()) return;
+            related = out;
+            if (built) relatedRow(out);
+        });
     }
 
     void sections(JSONObject n, JSONObject c, boolean series, List<String[]> people) {
@@ -1131,7 +1290,8 @@ public class DetailActivity extends Activity {
     /** Related: 2:3 posters whose titles show only when focused. */
     void relatedRow(List<String[]> items) {
         LinearLayout s = section("Related");
-        Row row = new Row(u(40), u(12), u(4));
+        // Room below for the focused poster's title, which drops in under it.
+        Row row = new Row(u(40), u(12), u(14));
         List<ImageView> posters = new ArrayList<>();
         for (String[] it : items) {
             LinearLayout tile = new LinearLayout(this);
@@ -1155,9 +1315,12 @@ public class DetailActivity extends Activity {
             caption.setText(it[2]);
             caption.setSingleLine(true);
             caption.setEllipsize(TextUtils.TruncateAt.END);
-            caption.setMaxWidth(posterW);
+            caption.setGravity(Gravity.CENTER_HORIZONTAL);
             caption.setAlpha(0f);
-            LinearLayout.LayoutParams cl = new LinearLayout.LayoutParams(posterW, -2);
+            // A little wider than the poster, as the poster is when focused, so a name like
+            // "Blade Runner 2049" fits; the tile keeps the poster's width.
+            LinearLayout.LayoutParams cl = new LinearLayout.LayoutParams(posterW + u(30), -2);
+            cl.leftMargin = cl.rightMargin = -u(15);
             cl.topMargin = u(8);
             tile.addView(caption, cl);
             // Focus lifts the poster by 40 px and shows its title beneath, as on tvOS.
@@ -1261,7 +1424,8 @@ public class DetailActivity extends Activity {
     void photos(boolean series, int tmdb, Map<String, FrameLayout> circles) {
         Map<String, String> paths = new HashMap<>();
         try {
-            JSONObject cr = Suggestions.get(this, "/" + (series ? "tv/" + tmdb + "/aggregate_credits" : "movie/" + tmdb + "/credits"));
+            JSONObject cr = tmdbCast != null ? tmdbCast
+                    : Suggestions.get(this, "/" + (series ? "tv/" + tmdb + "/aggregate_credits" : "movie/" + tmdb + "/credits"));
             for (String part : new String[]{"cast", "crew"}) {
                 JSONArray a = cr.optJSONArray(part);
                 for (int i = 0; a != null && i < a.length(); i++) {
@@ -1442,6 +1606,13 @@ public class DetailActivity extends Activity {
      * only when the next tile would cross the margin, by just enough to show it, on the Apple TV
      * app's row curve (Android's own would jump, or fling).
      */
+    /** Left or Right with nothing more that way in this row (the focus would leave it sideways). */
+    static boolean rowEnd(ViewGroup row, View from, int key) {
+        if (key != KeyEvent.KEYCODE_DPAD_LEFT && key != KeyEvent.KEYCODE_DPAD_RIGHT) return false;
+        return android.view.FocusFinder.getInstance().findNextFocus(row, from,
+                key == KeyEvent.KEYCODE_DPAD_RIGHT ? View.FOCUS_RIGHT : View.FOCUS_LEFT) == null;
+    }
+
     final class Row extends HorizontalScrollView {
         final LinearLayout items;
         final int edge;
@@ -1452,14 +1623,14 @@ public class DetailActivity extends Activity {
             this.edge = edge;
             setHorizontalScrollBarEnabled(false);
             setOverScrollMode(OVER_SCROLL_NEVER);
-            // Room above and below for a focused tile's lift. The room above is inside the tiles'
-            // own row: left on the scroller, a lifted cast circle was still cut flat at the row's top.
-            setPadding(0, 0, 0, bottom);
+            // Room above and below for a focused tile's lift and its title, inside the tiles' own
+            // row: the scroller cuts the row off at the row's edges, so room left on the scroller
+            // went unused (a lifted cast circle was cut flat at the top, a title in half at the bottom).
             setClipToPadding(false);
             items = new LinearLayout(DetailActivity.this);
             items.setClipChildren(false);
             items.setClipToPadding(false);
-            items.setPadding(edge, top, edge, 0);
+            items.setPadding(edge, top, edge, bottom);
             addView(items);
         }
 
@@ -1471,6 +1642,14 @@ public class DetailActivity extends Activity {
         @Override
         public boolean executeKeyEvent(KeyEvent e) {
             return false;
+        }
+
+        @Override
+        public boolean dispatchKeyEvent(KeyEvent e) {
+            // At the row's end, Left and Right stay put rather than leap to another row.
+            View f = findFocus();
+            if (e.getAction() == KeyEvent.ACTION_DOWN && f != null && rowEnd(items, f, e.getKeyCode())) return true;
+            return super.dispatchKeyEvent(e);
         }
 
         @Override

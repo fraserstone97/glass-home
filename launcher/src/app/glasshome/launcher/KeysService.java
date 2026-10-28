@@ -36,8 +36,12 @@ public class KeysService extends AccessibilityService {
     protected boolean onKeyEvent(KeyEvent e) {
         int k = e.getKeyCode();
         if (k == KeyEvent.KEYCODE_SEARCH || k == KeyEvent.KEYCODE_VOICE_ASSIST || k == KeyEvent.KEYCODE_ASSIST) {
-            // Hold to talk: Search opens listening on the press and searches what you said on
-            // release, like the Siri button.
+            // Search opens listening on the press. A remote that reports the button being held
+            // searches what was said when it's let go, like the Siri button. This TV's remote
+            // (TCL RC833) doesn't: it sends its press and release together the moment it's
+            // pressed, and nothing when let go or pressed again mid-sentence, because Google's
+            // remote service tells only Google Assistant about holds. There, listening ends at
+            // the first pause after you speak (SearchActivity).
             if (e.getAction() == KeyEvent.ACTION_DOWN && e.getRepeatCount() == 0 && SearchActivity.stopIfListening()) {
                 return true;  // a second press while listening stops it
             }

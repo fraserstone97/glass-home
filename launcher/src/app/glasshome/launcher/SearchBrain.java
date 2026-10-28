@@ -895,9 +895,10 @@ final class SearchBrain {
             + " popularTitles(country: $country, filter: $filter, first: $first, sortBy: $sort) {"
             + " edges { node {" + NODE_FIELDS + " } } } }";
 
-    /** JustWatch's "people also watch" for a title, in the UK. */
+    /** JustWatch's "people also watch" for a title, in the UK, and the title's own genres. */
     static final String JW_SIMILAR = "query M($id: ID!, $country: Country!, $language: Language!) { node(id: $id) { ... on MovieOrShow {"
-            + " similarTitlesV2(country: $country, first: 24) { edges { node {" + NODE_FIELDS + " } } } } } }";
+            + " content(country: $country, language: $language) { genres { shortName } }"
+            + " similarTitlesV2(country: $country, first: 40) { edges { node {" + NODE_FIELDS + " } } } } } }";
 
     JSONArray popular(JSONObject filter, int first, String sort) throws Exception {
         JSONObject vars = new JSONObject().put("country", "GB").put("language", "en")
@@ -928,6 +929,20 @@ final class SearchBrain {
         for (int i = 0; i < edges.length(); i++) {
             Result r = parse(edges.getJSONObject(i).getJSONObject("node"), mine());
             if (!r.offers.isEmpty() && popular(r)) merge(out, r);
+        }
+        return out;
+    }
+
+    /** A genre's best-known titles on your services now, for its Browse tile's picture. */
+    List<Result> genreTop(String genre) throws Exception {
+        JSONObject filter = new JSONObject().put("genres", new JSONArray().put(genre)).put("packages", packages(null))
+                .put("monetizationTypes", new JSONArray().put("FLATRATE").put("FREE").put("ADS"))
+                .put("productionCountries", new JSONArray(WEST));
+        List<Result> out = new ArrayList<>();
+        JSONArray edges = popular(filter, 8, "POPULAR");
+        for (int i = 0; i < edges.length(); i++) {
+            Result r = parse(edges.getJSONObject(i).getJSONObject("node"), mine());
+            if (popular(r)) out.add(r);
         }
         return out;
     }
@@ -1106,7 +1121,16 @@ final class SearchBrain {
                 kept.remove(meant);
                 kept.add(0, meant);
             }
-            double votes = Math.max(5000, meant.votes / 50.0), pop = Math.max(5, meant.pop / 10);
+            // Beside the best known of them all, not only the one meant: next to Gladiator (2000)
+            // and Gladiator II, a 1992 boxing film called Gladiator is a namesake nobody means,
+            // whether "gladiator" or BBC's "gladiators" was asked for. What's new and much watched
+            // stays however few its votes (the 2026 Moana, Dune: Part Three).
+            double most = 0, hot = 0;
+            for (Result r : kept) {
+                most = Math.max(most, r.votes);
+                hot = Math.max(hot, r.pop);
+            }
+            double votes = Math.max(5000, most / 50.0), pop = Math.max(15, hot / 4);
             kept.removeIf(r -> r != meant && r.votes < votes && r.pop < pop);
             if (match.get(meant) >= 100) {
                 // An exact title (The Office, Dune): its other versions and its sequels and
@@ -1209,28 +1233,163 @@ final class SearchBrain {
         return s;
     }
 
-    /** Titles like the one found: what people who watch it also watch, Western and watchable here. */
+    /**
+     * Titles like the one found, as Netflix picks them: from what people who watch it also watch
+     * (JustWatch), only those of the same kind, closest first. JustWatch's list mixes in whatever
+     * its audience also liked (2001 and Fight Club beside Gladiator), so each is scored on the
+     * genres it shares and, with a TMDB key, on being among TMDB's recommendations for it, and the
+     * loose ones go. Western, watchable here and well known, like every result.
+     */
     List<Result> similar(Result to, BooleanSupplier stale) {
         List<Result> out = new ArrayList<>();
         if (to == null || to.id == null || stale.getAsBoolean()) return out;
+        boolean tv = "tv".equals(to.type);
+        // TMDB's recommendations, best first, asked for alongside: {tmdb id, name}.
+        Future<List<String[]>> recs = to.tmdbId > 0 && Suggestions.hasToken(c) ? LOOKUPS.submit(() -> {
+            List<String[]> l = new ArrayList<>();
+            JSONArray a = Suggestions.get(c, "/" + (tv ? "tv" : "movie") + "/" + to.tmdbId
+                    + "/recommendations?language=en-GB").optJSONArray("results");
+            for (int i = 0; a != null && i < a.length(); i++) {
+                JSONObject o = a.getJSONObject(i);
+                l.add(new String[]{String.valueOf(o.optInt("id")), o.optString(tv ? "name" : "title")});
+            }
+            return l;
+        }) : null;
         try {
             JSONObject vars = new JSONObject().put("id", to.id).put("country", "GB").put("language", "en");
             JSONObject res = Suggestions.post("https://apis.justwatch.com/graphql",
                     new JSONObject().put("query", JW_SIMILAR).put("variables", vars).toString());
-            JSONArray edges = res.getJSONObject("data").getJSONObject("node").getJSONObject("similarTitlesV2").getJSONArray("edges");
-            for (int i = 0; i < edges.length() && out.size() < MAX; i++) {
+            JSONObject node = res.getJSONObject("data").getJSONObject("node");
+            List<String> genres = new ArrayList<>(to.genres);
+            JSONArray own = node.optJSONObject("content") == null ? null : node.getJSONObject("content").optJSONArray("genres");
+            if (genres.isEmpty()) for (int k = 0; own != null && k < own.length(); k++) genres.add(own.getJSONObject(k).optString("shortName"));
+            Result kind = new Result();
+            kind.genres.addAll(genres);
+            List<String[]> rec = Collections.emptyList();
+            try {
+                if (recs != null) rec = recs.get(3, TimeUnit.SECONDS);
+            } catch (Exception e) {
+                // without TMDB's view: genres alone
+            }
+            List<Integer> liked = new ArrayList<>();
+            for (String[] x : rec) liked.add(Suggestions.parseInt(x[0]));
+            List<Result> found = new ArrayList<>();
+            Set<Integer> have = new HashSet<>();
+            JSONArray edges = node.getJSONObject("similarTitlesV2").getJSONArray("edges");
+            for (int i = 0; i < edges.length(); i++) {
                 Result r = parse(edges.getJSONObject(i).getJSONObject("node"), mine());
-                if (!western(r) || (r.offers.isEmpty() && !r.rentBuy)) continue;
-                if (!popular(r)) continue;
-                // The same kind of thing: an animated film's are animated, a documentary's are
-                // documentaries (no Evil Dead beside Moana); otherwise a genre in common.
-                if (!alike(to, r)) continue;
+                found.add(r);
+                if (r.type.equals(to.type)) have.add(r.tmdbId);
+            }
+            // When JustWatch's list is thin on titles really like it (Gladiator's), TMDB's
+            // favourites that it left out (Troy, Conan) are found on JustWatch by name, a few at
+            // once. When it has plenty (Moana's), TMDB's extras only add noise (SpongeBob).
+            int strong = 0;
+            for (Result r : found) if (fits(kind, r) && closeness(genres, r.genres) >= 0.6) strong++;
+            List<Future<Result>> more = new ArrayList<>();
+            for (int k = 0; strong < 10 && k < rec.size() && k < 10 && more.size() < 6; k++) {
+                int id = liked.get(k);
+                String name = rec.get(k)[1];
+                if (id <= 0 || id == to.tmdbId || have.contains(id) || name.isEmpty()) continue;
+                more.add(LOOKUPS.submit(() -> byTmdb(name, id, to.type)));
+            }
+            long until = System.currentTimeMillis() + 2500;
+            for (Future<Result> f : more) {
+                try {
+                    Result r = f.get(Math.max(1, until - System.currentTimeMillis()), TimeUnit.MILLISECONDS);
+                    if (r != null) found.add(r);
+                } catch (Exception e) {
+                    f.cancel(true);
+                }
+            }
+            Map<Result, Double> score = new HashMap<>();
+            for (int i = 0; i < found.size(); i++) {
+                Result r = found.get(i);
+                if (r.tmdbId == to.tmdbId && r.type.equals(to.type)) continue;
+                if (!fits(kind, r)) continue;
+                double near = closeness(genres, r.genres);
+                int rank = r.type.equals(to.type) ? liked.indexOf(r.tmdbId) : -1;
+                // TMDB recommends it: a looser genre match will do (Saving Private Ryan beside
+                // Gladiator). Otherwise half its genres in common, or more, and what it's about
+                // too, not only that it's an action film (no Hunt for Red October beside Blade Runner).
+                if (near < (rank >= 0 ? 0.25 : 0.45)) continue;
+                if (rank < 0 && !sameSubject(genres, r.genres)) continue;
+                double sc = near + (rank >= 0 ? 0.4 + 0.4 * (1 - rank / 20.0) : 0)
+                        + Math.min(0.15, Math.log10(1 + r.votes) / 40) - Math.min(i, 40) * 0.004;
+                score.put(r, sc);
                 out.add(r);
             }
+            out.sort((a, b) -> Double.compare(score.get(b), score.get(a)));
+            if (out.size() > MAX) out.subList(MAX, out.size()).clear();
         } catch (Exception ignored) {
             // no suggestions this time
         }
         return out;
+    }
+
+    /**
+     * r could sit beside a title of this kind at all: Western, watchable here, well known, and the
+     * same kind of thing (an animated film's are animated, a documentary's are documentaries: no
+     * Evil Dead beside Moana).
+     */
+    static boolean fits(Result kind, Result r) {
+        return western(r) && (!r.offers.isEmpty() || r.rentBuy) && popular(r) && alike(kind, r);
+    }
+
+    /** A title TMDB knows by id, found on JustWatch by its name: null if it isn't there. */
+    Result byTmdb(String name, int tmdbId, String type) throws Exception {
+        JSONObject filter = new JSONObject().put("searchQuery", name)
+                .put("objectTypes", new JSONArray().put("tv".equals(type) ? "SHOW" : "MOVIE"));
+        JSONArray edges = popular(filter, 5, "POPULAR");
+        for (int i = 0; i < edges.length(); i++) {
+            Result r = parse(edges.getJSONObject(i).getJSONObject("node"), mine());
+            if (r.tmdbId == tmdbId) return r;
+        }
+        return null;
+    }
+
+    /**
+     * Lookups made from inside another (similar runs on POOL): a pool of their own, so they never
+     * wait behind the lookup that's waiting for them.
+     */
+    static final ExecutorService LOOKUPS;
+
+    static {
+        ThreadPoolExecutor pool = new ThreadPoolExecutor(8, 8, 30, TimeUnit.SECONDS, new LinkedBlockingQueue<>());
+        pool.allowCoreThreadTimeOut(true);
+        LOOKUPS = pool;
+    }
+
+    /** Genres that say only how a title plays, not what it's about. */
+    static final Set<String> BROAD = new HashSet<>(Arrays.asList("act", "drm", "trl", "fml", "eur"));
+
+    /**
+     * b is about what a is about: when a has a genre beyond the broad ones (science fiction, war,
+     * crime, comedy...), b has one of those too.
+     */
+    static boolean sameSubject(List<String> a, List<String> b) {
+        boolean any = false;
+        for (String g : a) {
+            if (BROAD.contains(g)) continue;
+            any = true;
+            if (b.contains(g)) return true;
+        }
+        return !any;
+    }
+
+    /**
+     * How alike two titles' genres are, 0 to 1: those shared over all of them (Jaccard). "Made in
+     * Europe" (eur) is where it's from, not what it is, so it doesn't count.
+     */
+    static double closeness(List<String> a, List<String> b) {
+        Set<String> x = new HashSet<>(a), y = new HashSet<>(b);
+        x.remove("eur");
+        y.remove("eur");
+        if (x.isEmpty() || y.isEmpty()) return 0.5;
+        Set<String> both = new HashSet<>(x);
+        both.retainAll(y);
+        x.addAll(y);
+        return both.size() / (double) x.size();
     }
 
     // ---------------------------------------------------------------- people
@@ -1599,18 +1758,18 @@ final class SearchBrain {
     /**
      * The bar every result clears, whatever the search: well enough known (IMDb votes) or much
      * watched now (TMDB popularity, for what's new), so nothing obscure is shown. Series get far
-     * fewer votes than films, and British series on their own channels fewer still (Gladiators,
-     * Race Across the World), so their bars are lower.
+     * fewer votes than films, British films fewer than Hollywood's, and British series on their
+     * own channels fewer still (Gladiators, Race Across the World), so their bars are lower.
      */
     static boolean popular(Result r) {
-        boolean tv = "tv".equals(r.type);
-        if (r.votes >= (tv ? 1500 : 10000) || r.pop >= (tv ? 8 : 15)) return true;
-        return tv && r.ukChannel && r.countries.contains("GB") && r.votes >= 300;
+        boolean tv = "tv".equals(r.type), british = r.countries.contains("GB");
+        if (r.votes >= (tv ? 2000 : british ? 10000 : 20000) || r.pop >= (tv ? 8 : 15)) return true;
+        return tv && r.ukChannel && british && r.votes >= 300;
     }
 
-    /** As popular, for a TMDB title (an actor's work, a subject's): TMDB's own counts, about a thirtieth of IMDb's. */
+    /** As popular, for a TMDB title (an actor's work, a subject's): TMDB's own counts, a thirtieth to a hundredth of IMDb's. */
     static boolean popularOnTmdb(JSONObject w, boolean tv) {
-        return w.optInt("vote_count") >= (tv ? 60 : 300) || w.optDouble("popularity") >= (tv ? 8 : 15);
+        return w.optInt("vote_count") >= (tv ? 80 : 500) || w.optDouble("popularity") >= (tv ? 8 : 15);
     }
 
     /** How well known a title is: its audience (IMDb votes) and how much it's watched now (TMDB). */

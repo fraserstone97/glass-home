@@ -136,6 +136,17 @@
             android:screenOrientation="landscape"
             android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenSize|smallestScreenSize|screenLayout|uiMode|density" />
 
+        <!-- A title page's trailer, played full screen; in a process of its own, so the web engine
+             it plays in never stays in Home's. -->
+        <activity
+            android:name=".TrailerActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:process=":trailer"
+            android:screenOrientation="landscape"
+            android:theme="@style/PageTheme"
+            android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenSize|smallestScreenSize|screenLayout|uiMode|density" />
+
         <!-- A show or film's page, opened from Search. -->
         <activity
             android:name=".DetailActivity"

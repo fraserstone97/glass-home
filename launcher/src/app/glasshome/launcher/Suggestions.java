@@ -632,6 +632,11 @@ final class Suggestions {
     static String[] tmdbArt(Context c, String type, int tmdbId) {
         String[] art = new String[2];
         if (tmdbId <= 0 || !hasToken(c)) return art;
+        // Each title's answer is kept: Search asks again as you move back and forth, and its
+        // title page asks once more.
+        String key = type + tmdbId;
+        String[] known = ART.get(key);
+        if (known != null) return known.clone();
         try {
             JSONObject r = get(c, "/" + ("tv".equals(type) ? "tv" : "movie") + "/" + tmdbId
                     + "/images?include_image_language=null,en");
@@ -654,10 +659,19 @@ final class Suggestions {
             if (best != null && !best.isEmpty()) art[0] = "https://image.tmdb.org/t/p/original" + best;
             String logo = bestLogo(r.optJSONArray("logos"));
             if (!logo.isEmpty()) art[1] = "https://image.tmdb.org/t/p/w500" + logo;
+            ART.put(key, art.clone());
         } catch (Exception e) {
             // no artwork from TMDB this time
         }
         return art;
+    }
+
+    /** TMDB's artwork answers (tmdbArt), by type and id, while Home is running. */
+    static final java.util.Map<String, String[]> ART = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** A TMDB picture at one of its own sizes ("w1280") rather than the original upload. */
+    static String tmdbSized(String url, String size) {
+        return url == null ? null : url.replace("/t/p/original/", "/t/p/" + size + "/");
     }
 
     /**

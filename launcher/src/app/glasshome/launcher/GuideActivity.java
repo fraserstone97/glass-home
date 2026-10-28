@@ -905,7 +905,9 @@ public class GuideActivity extends Activity {
                 if (fi >= 0) {
                     float y = px(rowsY) + (fi - top) * px(pitch);
                     c.save();
-                    c.clipRect(gx - px(2), px(rowsY) - px(4), getWidth(), getHeight());
+                    // Its row's right edge too: a programme running on past the window stops there
+                    // with the rest, not at the screen's edge.
+                    c.clipRect(gx - px(2), px(rowsY) - px(4), gr + px(8), getHeight());
                     cell(c, focus, y, focusIn * (1f - 0.75f * dayFocus), now, gx);
                     c.restore();
                 }
@@ -970,14 +972,10 @@ public class GuideActivity extends Activity {
             if (x1 - x0 < px(2)) return;
             boolean past = s.end <= now, live = s.onNow(now);
             c.save();
-            if (f > 0f) {
-                // Lifted about its middle (or the middle of what's on screen of it).
-                float vx0 = Math.max(x0, gx), vx1 = Math.min(x1, px(right));
-                float cx = (vx0 + vx1) / 2f, cy = y + px(rowH) / 2f;
-                float sc = 1f + 0.06f * f;
-                c.scale(sc, sc, cx, cy);
-            }
             r.set(x0, y, x1, y + px(rowH));
+            // Lifted: the plate grows by a few pixels all round, as the Glass pills do. Scaled
+            // instead, a film's ends grew past the grid's edge and were cut flat there.
+            if (f > 0f) r.inset(-px(3) * f, -px(2) * f);
             if (f > 0f) {
                 fill.setColor(Color.argb(Math.round(70 * f), 0, 0, 0));
                 RectF sh = new RectF(r);
@@ -1012,8 +1010,10 @@ public class GuideActivity extends Activity {
                 fill.setColor(blend(0xCCFFFFFF, 0xB3000000, f));
                 c.drawRoundRect(bx0, r.bottom - px(5), bx0 + (bx1 - bx0) * p, r.bottom - px(3), px(1), px(1), fill);
             }
+            // The words start just inside the grid's edge when the programme began before it. A
+            // slot too narrow for a word shows none, rather than a letter and dots.
             float tx = Math.max(x0, gx) + px(9), room = x1 - px(9) - tx;
-            if (room > px(12)) {
+            if (room > px(26)) {
                 text.setTypeface(medium);
                 text.setTextSize(11 * unit);
                 text.setColor(blend(past ? 0x99FFFFFF : 0xFFFFFFFF, 0xFF111114, f));
@@ -1034,8 +1034,11 @@ public class GuideActivity extends Activity {
                     c.drawPath(tri, fill);
                     sx += px(10);
                 }
+                // Both times when they fit, else when it starts, else nothing: never a time cut short.
                 String when = time(s.start) + " \u2013 " + time(s.end);
-                if (room - (sx - tx) > px(20)) c.drawText(fit(when, small, room - (sx - tx)), sx, y + px(29.5f), small);
+                float left = room - (sx - tx);
+                if (small.measureText(when) > left) when = time(s.start);
+                if (small.measureText(when) <= left) c.drawText(when, sx, y + px(29.5f), small);
             }
             c.restore();
         }
