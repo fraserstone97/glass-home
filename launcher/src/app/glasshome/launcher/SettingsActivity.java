@@ -373,6 +373,7 @@ public class SettingsActivity extends Activity {
             case SAVER: return "Aerials, and when the screen saver and the TV switch off.";
             case PERMS: return "What " + app + " is allowed to do on this TV.";
             case ABOUT: return "Version, and where pictures and forecasts come from.";
+            case JELLYFIN: return "Your library, in Search and on the Top Shelf.";
             default: return "";
         }
     }
