@@ -57,6 +57,8 @@ public class ControlCentreActivity extends Activity {
     FrameLayout root;
     /** The sheet is the dock's glass: it redraws as it moves, so the picture in it stays put. */
     boolean liquid;
+    /** The sheet's glass (when it's Home's picture behind it), for pinning where it samples. */
+    MainActivity.LiquidGlass liquidGlass;
     LinearLayout sheet, header, buttons, body;
     View shade;
     TextClock clock, dateLine;
@@ -98,6 +100,7 @@ public class ControlCentreActivity extends Activity {
         sheet.setClipToPadding(false);
         sheet.setPadding(dp(PAD), dp(PAD), dp(PAD), dp(PAD));
         sheet.setBackground(glassSheet());
+        if (liquidGlass != null) liquidGlass.owner = sheet;  // (inside Cached, it's told where it is)
         sheet.forceHasOverlappingRendering(false);  // fades as one alpha, without an off-screen pass
         // No elevation: a 16 dp shadow over the live Home behind costs this GPU more than the rim is worth.
         // Inside the TV safe area (Apple: 60 pt top and bottom, 80 pt sides), so overscan never trims
@@ -177,7 +180,7 @@ public class ControlCentreActivity extends Activity {
                 // opening scale puts it, so the panel can grow in as one cached picture (slide).
                 int[] at = new int[2];
                 root.getLocationOnScreen(at);
-                ((MainActivity.LiquidGlass) sheet.getBackground()).fixedLoc = new int[]{at[0] + sheet.getLeft(), at[1] + sheet.getTop()};
+                liquidGlass.fixedLoc = new int[]{at[0] + sheet.getLeft(), at[1] + sheet.getTop()};
             }
             shade.animate().alpha(1f).setDuration(300).setInterpolator(new android.view.animation.LinearInterpolator()).start();
             slide(sheet.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(300).setInterpolator(OPEN)).start();
@@ -509,7 +512,8 @@ public class ControlCentreActivity extends Activity {
                     home.screenW, home.screenH, home.unit);
             g.lens = home.dp(7);
             liquid = true;
-            return g;
+            liquidGlass = g;
+            return Cached.of(g);
         }
         // Over an app there's no picture to borrow: the same dark material, solid enough to read on.
         GradientDrawable body = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
@@ -522,6 +526,79 @@ public class ControlCentreActivity extends Activity {
         LayerDrawable l = new LayerDrawable(new Drawable[]{body, sheen});
         l.setLayerInsetBottom(1, dp(160));
         return l;
+    }
+
+    /**
+     * A drawable kept as a GPU layer of its own: put on screen as one ready picture each frame, and
+     * drawn again only when the view it's on redraws itself. The sheet's glass is a stack of
+     * full-size shader fills, which otherwise ran in every frame of a tile's focus animation and
+     * took those frames just past their slot. Before Android 10 (no RenderNode) it's drawn as it is.
+     */
+    static final class Cached extends Drawable implements Drawable.Callback {
+        final Drawable inner;
+        android.graphics.RenderNode node;
+
+        static Drawable of(Drawable d) {
+            return android.os.Build.VERSION.SDK_INT >= 29 ? new Cached(d) : d;
+        }
+
+        Cached(Drawable inner) {
+            this.inner = inner;
+            inner.setCallback(this);
+        }
+
+        @Override protected void onBoundsChange(Rect b) {
+            inner.setBounds(b);
+        }
+
+        @Override public void draw(android.graphics.Canvas c) {
+            Rect b = getBounds();
+            if (android.os.Build.VERSION.SDK_INT < 29 || !(c instanceof android.graphics.RecordingCanvas) || b.isEmpty()) {
+                inner.draw(c);
+                return;
+            }
+            if (node == null) {
+                node = new android.graphics.RenderNode("glass");
+                node.setUseCompositingLayer(true, null);
+            }
+            node.setPosition(b);
+            android.graphics.RecordingCanvas rc = node.beginRecording();
+            try {
+                rc.translate(-b.left, -b.top);
+                inner.draw(rc);
+            } finally {
+                node.endRecording();
+            }
+            ((android.graphics.RecordingCanvas) c).drawRenderNode(node);
+        }
+
+        @Override public void invalidateDrawable(Drawable who) {
+            invalidateSelf();
+        }
+
+        @Override public void scheduleDrawable(Drawable who, Runnable what, long when) {
+            scheduleSelf(what, when);
+        }
+
+        @Override public void unscheduleDrawable(Drawable who, Runnable what) {
+            unscheduleSelf(what);
+        }
+
+        @Override public void getOutline(android.graphics.Outline o) {
+            inner.getOutline(o);
+        }
+
+        @Override public void setAlpha(int a) {
+            inner.setAlpha(a);
+        }
+
+        @Override public void setColorFilter(android.graphics.ColorFilter cf) {
+            inner.setColorFilter(cf);
+        }
+
+        @Override public int getOpacity() {
+            return android.graphics.PixelFormat.TRANSLUCENT;
+        }
     }
 
     /** A control's glass, with a white plate over it that fades in on focus. */
