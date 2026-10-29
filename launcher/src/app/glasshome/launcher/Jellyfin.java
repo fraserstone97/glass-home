@@ -216,6 +216,97 @@ final class Jellyfin {
         return out;
     }
 
+    // ---------------------------------------------------------------- what's in the library
+
+    /**
+     * Every film and series in the library, {id, name, year, "movie" or "tv", TMDB id}: a short
+     * line a title, kept on the TV, so a title's page knows at once whether it's yours however it
+     * was reached (a search for its name, an actor's, Related), with no wait for the server.
+     */
+    static File indexFile(Context c) {
+        return new File(c.getFilesDir(), "jellyfin_index.json");
+    }
+
+    private static List<String[]> owned = new ArrayList<>();
+    private static long ownedStamp = -1;
+    /** When the list was last asked for, so a server that's away is asked at most once a minute. */
+    static volatile long indexTried;
+
+    /** The saved list (empty before it's first fetched), read from disk only when it has changed. */
+    static synchronized List<String[]> owned(Context c) {
+        File f = indexFile(c);
+        if (!connected(c) || !f.exists()) return new ArrayList<>();
+        if (f.lastModified() != ownedStamp) {
+            try {
+                JSONArray a = new JSONArray(new String(Suggestions.readAll(new FileInputStream(f)), StandardCharsets.UTF_8));
+                List<String[]> out = new ArrayList<>();
+                for (int i = 0; i < a.length(); i++) {
+                    JSONArray t = a.getJSONArray(i);
+                    out.add(new String[]{t.optString(0), t.optString(1), t.optString(2), t.optString(3), t.optString(4)});
+                }
+                owned = out;
+                ownedStamp = f.lastModified();
+            } catch (Exception e) {
+                return new ArrayList<>();
+            }
+        }
+        return owned;
+    }
+
+    /** Out of date, and not asked for in the last minute. */
+    static boolean indexDue(Context c) {
+        long now = System.currentTimeMillis();
+        File f = indexFile(c);
+        return connected(c) && now - indexTried > 60_000L && (!f.exists() || now - f.lastModified() > FRESH_MS);
+    }
+
+    /** Fetches the list again (off the main thread): true when it was. */
+    static boolean fetchIndex(Context c) {
+        if (!connected(c)) return false;
+        indexTried = System.currentTimeMillis();
+        try {
+            String u = prefs(c).getString(K_USER, "");
+            JSONArray a = call(c, "GET", "/Users/" + u + "/Items?Recursive=true&IncludeItemTypes=Movie,Series"
+                    + "&Fields=ProductionYear,ProviderIds&EnableImages=false&EnableUserData=false", null).optJSONArray("Items");
+            JSONArray out = new JSONArray();
+            for (int i = 0; a != null && i < a.length(); i++) {
+                JSONObject o = a.getJSONObject(i);
+                JSONObject ids = o.optJSONObject("ProviderIds");
+                out.put(new JSONArray().put(o.optString("Id")).put(o.optString("Name"))
+                        .put(String.valueOf(o.optInt("ProductionYear", 0)))
+                        .put("Series".equals(o.optString("Type")) ? "tv" : "movie")
+                        .put(ids == null ? "" : ids.optString("Tmdb")));
+            }
+            Suggestions.save(indexFile(c), out.toString());
+            owned(c);  // read here, not on the page that asks next
+            return true;
+        } catch (SecurityException e) {
+            prefs(c).edit().putBoolean(K_REJECTED, true).apply();
+        } catch (Exception e) {
+            lookAgain(c);  // asleep, away or moved: the saved list stands meanwhile
+        }
+        return false;
+    }
+
+    /**
+     * Your copy of a title: by its TMDB id where both know it (whatever either calls it), else by
+     * its name, kind and year (a year either side, as release dates differ).
+     */
+    static String find(List<String[]> all, String title, int year, boolean series, int tmdb) {
+        String want = SearchBrain.norm(Suggestions.cleanTitle(title));
+        for (String[] m : all) {
+            if (series != "tv".equals(m[3])) continue;
+            int theirs = Suggestions.parseInt(m[4]);
+            if (tmdb > 0 && theirs > 0) {
+                if (theirs == tmdb) return m[0];
+                continue;
+            }
+            int y = Suggestions.parseInt(m[2]);
+            if (!want.isEmpty() && SearchBrain.norm(m[1]).equals(want) && (year <= 0 || y <= 0 || Math.abs(y - year) <= 1)) return m[0];
+        }
+        return null;
+    }
+
     static String poster(Context c, String id) {
         return server(c) + "/Items/" + id + "/Images/Primary?maxHeight=450&quality=90";
     }
@@ -305,6 +396,7 @@ final class Jellyfin {
         } catch (Exception ignored) {
             // shown this time, fetched again next time
         }
+        if (indexDue(c)) fetchIndex(c);  // the list of what's yours, kept as fresh as the shelf
         return out;
     }
 

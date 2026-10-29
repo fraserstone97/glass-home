@@ -521,6 +521,14 @@ public class DetailActivity extends Activity {
             side.execute(() -> backdrop(knownBackdrop));
         }
         if (id == null) return;
+        // The list of what's in your library, when it's out of date: a title that has just come
+        // into it gets its button when the list is back (libraryLate).
+        if (Jellyfin.indexDue(this)) {
+            Context app = getApplicationContext();
+            Jellyfin.BACKGROUND.execute(() -> {
+                if (Jellyfin.fetchIndex(app)) ui.post(this::libraryLate);
+            });
+        }
         // The details, cast and trailers: usually asked for already, while its result had focus.
         Ahead a = ahead(this, id, tmdb, type);
         io.execute(() -> {
@@ -543,7 +551,11 @@ public class DetailActivity extends Activity {
                 // Without them in time, JustWatch's cast list and clips.
                 tmdbCast = got(a.cast, 2500);
                 tmdbVideos = got(a.clips, 1000);
-                ui.post(() -> show(n, offers));
+                String mine = library(n);
+                ui.post(() -> {
+                    yours = mine;
+                    show(n, offers);
+                });
             } catch (Exception e) {
                 ui.post(() -> {
                     if (isDestroyed()) return;
@@ -835,6 +847,8 @@ public class DetailActivity extends Activity {
 
         actions.removeAllViews();
         View first = primary(offers);
+        shown = n;
+        main = first;
         ways.items.removeAllViews();
         tiles.clear();
         for (Offer o : offers) way(o);
@@ -868,9 +882,10 @@ public class DetailActivity extends Activity {
             ways.items.addView(none);
         }
         // The main button; else the first button there is (Trailer); else the first way to watch.
-        View placed = first != null ? first : actions.getChildCount() > 0 ? actions.getChildAt(0)
+        placed = first != null ? first : actions.getChildCount() > 0 ? actions.getChildAt(0)
                 : offers.isEmpty() ? null : ways.items.getChildAt(0);
         if (placed != null) placed.requestFocus();
+        if (listNew) libraryLate();
         fadeIn(actions, 120);
         fadeIn(waysLabel, 160);
         fadeIn(ways, 200);
@@ -897,8 +912,60 @@ public class DetailActivity extends Activity {
     /** Offers there were, but only from shops whose apps aren't on the TV. */
     volatile boolean elsewhere;
 
+    /** Your own copy in your Jellyfin library (its id there), when there is one. */
+    String yours;
+    /** The title's details once the page is built, the main button, and where focus was put. */
+    JSONObject shown;
+    View main, placed;
+    /** The list came back while the page was still loading. */
+    boolean listNew;
+
+    /**
+     * Your copy: the one Search found for it, else looked up in the saved list of your library by
+     * the title itself, so the page has it however it was reached. Off the main thread.
+     */
+    String library(JSONObject n) {
+        String found = getIntent().getStringExtra("jellyfin");
+        JSONObject c = n.optJSONObject("content");
+        if (found != null || c == null || !Jellyfin.connected(this)) return found;
+        JSONObject ext = c.optJSONObject("externalIds");
+        int tmdb = ext == null ? 0 : Suggestions.parseInt(ext.optString("tmdbId"));
+        if (tmdb <= 0) tmdb = getIntent().getIntExtra("tmdb", 0);
+        return Jellyfin.find(Jellyfin.owned(this), c.optString("title", ""), c.optInt("originalReleaseYear", 0),
+                "SHOW".equals(n.optString("objectType")), tmdb);
+    }
+
+    /**
+     * The list of your library came back after the page was built (it was out of date): a copy
+     * found only now takes the main button's place, and its focus if you hadn't moved.
+     */
+    void libraryLate() {
+        if (shown == null) {
+            listNew = true;  // the page is still on its way: it looks again once it's built
+            return;
+        }
+        if (isDestroyed() || yours != null) return;
+        String mine = library(shown);
+        if (mine == null) return;
+        yours = mine;
+        View old = main;
+        boolean focus = old != null ? old.hasFocus() : placed != null && placed.hasFocus();
+        View b = pill("▶  Play from Your Library", v -> Jellyfin.play(this, mine));
+        actions.removeView(b);
+        actions.addView(b, old == null ? 0 : actions.indexOfChild(old));
+        if (focus) b.requestFocus();
+        if (old != null) actions.removeView(old);
+        for (int i = 0; i < actions.getChildCount(); i++) {
+            ((LinearLayout.LayoutParams) actions.getChildAt(i).getLayoutParams()).leftMargin = i == 0 ? 0 : u(8);
+        }
+        actions.requestLayout();
+        main = b;
+        b.setAlpha(0f);
+        b.animate().alpha(1f).setDuration(240).setInterpolator(LINEAR).start();
+    }
+
     View primary(List<Offer> offers) {
-        String mine = getIntent().getStringExtra("jellyfin");
+        String mine = yours;
         if (mine != null) return pill("▶  Play from Your Library", v -> Jellyfin.play(this, mine));
         // Ranked: anything free comes before a subscription.
         for (Offer o : offers) {
