@@ -274,9 +274,9 @@ public class SearchActivity extends Activity {
         tileRadius = getIntent().getFloatExtra(EXTRA_TILE_RADIUS, 0f);
         FrameLayout root = new FrameLayout(this);
         page = root;
-        GradientDrawable bg = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
+        pageFill = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
                 new int[]{0xFF040405, 0xFF050506, 0xFF000000});
-        root.setBackground(bg);
+        root.setBackground(pageFill);
         int sw = Ui.screen(this).x;
 
         // The Apple TV app's field is 139 px down, under its sidebar's pill; with no pill above it
@@ -287,7 +287,15 @@ public class SearchActivity extends Activity {
         // Behind everything, as on tvOS: the focused title's artwork, soft and dim.
         ambient = ambientLayer();
         ambient.setAlpha(0f);
-        root.addView(ambient, new FrameLayout.LayoutParams(-1, -1));
+        // Its layer at half the screen's size, drawn twice as large: a new picture is drawn into a
+        // quarter of the pixels (with its shade), which at full size took the frame it changed in
+        // past its slot on every move along the results. It's a soft, dark picture: the same.
+        int sh = Ui.screen(this).y;
+        ambient.setPivotX(0);
+        ambient.setPivotY(0);
+        ambient.setScaleX(2f);
+        ambient.setScaleY(2f);
+        root.addView(ambient, new FrameLayout.LayoutParams((sw + 1) / 2, (sh + 1) / 2));
 
         // The results column, beside the keyboard: suggestions directly under the field (no band
         // when there are none), then the shelves. It clips at its own edges, so posters scrolled
@@ -2087,15 +2095,30 @@ public class SearchActivity extends Activity {
         List<Slot> l = waiting.remove(url);
         if (l == null) return;
         long now = SystemClock.uptimeMillis();
+        // A picture that covers its card whole: the grey placeholder under it goes once it's in,
+        // rather than being drawn beneath it every frame.
+        boolean covers = !bm.hasAlpha();
         for (Slot s : l) {
             s.art.setImageBitmap(bm);
+            boolean bare = covers && s.art.getScaleType() == ImageView.ScaleType.CENTER_CROP;
             // In a shelf rising as one picture it's simply there: a fade would make the whole
             // picture be drawn again every frame.
-            if (s.sec != null && s.sec.riseAt > 0 && now - s.sec.riseAt < 600) continue;
+            if (s.sec != null && s.sec.riseAt > 0 && now - s.sec.riseAt < 600) {
+                if (bare) s.art.setBackground(null);
+                continue;
+            }
             s.art.setImageAlpha(0);
             ObjectAnimator a = ObjectAnimator.ofInt(s.art, "imageAlpha", 0, 255);
             a.setDuration(240);
             a.setInterpolator(new LinearInterpolator());
+            if (bare) {
+                ImageView art = s.art;
+                a.addListener(new android.animation.AnimatorListenerAdapter() {
+                    @Override public void onAnimationEnd(android.animation.Animator an) {
+                        if (art.getDrawable() != null) art.setBackground(null);
+                    }
+                });
+            }
             a.start();
         }
     }
@@ -2236,8 +2259,7 @@ public class SearchActivity extends Activity {
             ui.postDelayed(ambientTop, 400);
         } else {
             ambientFor = null;
-            ambient.animate().cancel();
-            ambient.animate().alpha(0f).setDuration(300).setInterpolator(MainActivity.EASE).start();
+            ambientTo(0f, 300).start();
         }
         // Focus was on a card that's gone: the same title's new card, else the new first one, or
         // (nothing found) the keyboard, never the empty page itself.
@@ -2425,6 +2447,11 @@ public class SearchActivity extends Activity {
         return new ViewOutlineProvider() {
             @Override public void getOutline(View v, Outline o) {
                 o.setRoundRect(0, 0, v.getWidth(), v.getHeight(), radius);
+                // It clips, and its lift still raises a focused card over its neighbours, but it
+                // casts no shadow: over Search's near-black page a shadow is all but invisible, and
+                // drawing it (its soft edge spread wide by the lift) kept the TV's GPU busy past
+                // its slot in a frame of nearly every move along the results.
+                o.setAlpha(0f);
             }
         };
     }
@@ -2625,6 +2652,21 @@ public class SearchActivity extends Activity {
      * A card's glass sheen and rim fading in or out with its focus. Each fade stops the last: after
      * a quick Right and Left, a fade out still running would otherwise end the sheen at nothing.
      */
+    /**
+     * A card's sheen, drawn only while it shows: at nothing it was still a full-size draw over
+     * every card on the page, every frame, which with the picture's placeholder under it made each
+     * poster cost the TV's GPU four fills where one shows.
+     */
+    static final class Sheen extends GradientDrawable {
+        Sheen(int[] colours) {
+            super(Orientation.TL_BR, colours);
+        }
+
+        @Override public void draw(android.graphics.Canvas c) {
+            if (getAlpha() > 0) super.draw(c);
+        }
+    }
+
     static void sheen(Drawable sheen, boolean f) {
         ObjectAnimator a = ObjectAnimator.ofInt(sheen, "alpha", sheen.getAlpha(), f ? 255 : 0);
         a.setAutoCancel(true);
@@ -2722,8 +2764,7 @@ public class SearchActivity extends Activity {
         art.setBackgroundColor(0xFF2A2A30);
         art.setOutlineProvider(round(radius));
         art.setClipToOutline(true);
-        GradientDrawable sheen = new GradientDrawable(GradientDrawable.Orientation.TL_BR,
-                new int[]{0x40FFFFFF, 0x0AFFFFFF, 0x00FFFFFF});
+        GradientDrawable sheen = new Sheen(new int[]{0x40FFFFFF, 0x0AFFFFFF, 0x00FFFFFF});
         sheen.setCornerRadius(radius);
         sheen.setStroke(Math.max(1, u(0.6f)), 0x55FFFFFF);
         sheen.setAlpha(0);
@@ -2751,8 +2792,12 @@ public class SearchActivity extends Activity {
         }
         TextView under = kind;
         Bitmap ready = r.poster == null ? null : POSTERS.get(r.poster);
-        if (ready != null) art.setImageBitmap(ready);
-        else await(r.poster, art, s);
+        if (ready != null) {
+            art.setImageBitmap(ready);
+            if (!ready.hasAlpha()) art.setBackground(null);  // covered: no placeholder under it
+        } else {
+            await(r.poster, art, s);
+        }
         art.setOnFocusChangeListener((v, f) -> {
             lift(art, f, 1.1f, u(14));
             sheen(sheen, f);
@@ -2779,8 +2824,7 @@ public class SearchActivity extends Activity {
         art.setImageDrawable(r.appBanner);
         art.setOutlineProvider(round(radius));
         art.setClipToOutline(true);
-        GradientDrawable sheen = new GradientDrawable(GradientDrawable.Orientation.TL_BR,
-                new int[]{0x40FFFFFF, 0x0AFFFFFF, 0x00FFFFFF});
+        GradientDrawable sheen = new Sheen(new int[]{0x40FFFFFF, 0x0AFFFFFF, 0x00FFFFFF});
         sheen.setCornerRadius(radius);
         sheen.setStroke(Math.max(1, u(0.6f)), 0x55FFFFFF);
         sheen.setAlpha(0);
@@ -2923,8 +2967,12 @@ public class SearchActivity extends Activity {
         thumb.setOutlineProvider(round(u(5)));
         thumb.setClipToOutline(true);
         Bitmap ready = r.poster == null ? null : POSTERS.get(r.poster);
-        if (ready != null) thumb.setImageBitmap(ready);
-        else await(r.poster, thumb, s);
+        if (ready != null) {
+            thumb.setImageBitmap(ready);
+            if (!ready.hasAlpha()) thumb.setBackground(null);
+        } else {
+            await(r.poster, thumb, s);
+        }
         card.addView(thumb, new LinearLayout.LayoutParams(u(40), u(60)));
         LinearLayout words = new LinearLayout(this);
         words.setOrientation(LinearLayout.VERTICAL);
@@ -3142,8 +3190,7 @@ public class SearchActivity extends Activity {
             box.addView(label, ll);
         }
         box.setContentDescription(r.title);
-        GradientDrawable sheen = new GradientDrawable(GradientDrawable.Orientation.TL_BR,
-                new int[]{0x40FFFFFF, 0x0AFFFFFF, 0x00FFFFFF});
+        GradientDrawable sheen = new Sheen(new int[]{0x40FFFFFF, 0x0AFFFFFF, 0x00FFFFFF});
         sheen.setCornerRadius(radius);
         sheen.setStroke(Math.max(1, u(0.6f)), 0x55FFFFFF);
         sheen.setAlpha(0);
@@ -3420,9 +3467,10 @@ public class SearchActivity extends Activity {
      */
     void showAmbient(Bitmap b, long ms) {
         ambient.animate().cancel();
+        page.setBackground(pageFill);  // (before it dims: see ambientTo)
         ambient.setImageBitmap(b);
         ambient.setAlpha(Math.min(ambient.getAlpha(), 0.5f));
-        ambient.animate().alpha(1f).setDuration(ms).setInterpolator(MainActivity.EASE).start();
+        ambientTo(1f, ms).start();
     }
 
     /** Nothing behind the page: Browse's tiles are pictures themselves, so a title's stays not. */
@@ -3430,8 +3478,24 @@ public class SearchActivity extends Activity {
         if (ambientFor == null) return;
         ambientFor = null;
         ui.removeCallbacks(ambientRun);
+        ambientTo(0f, 300).start();
+    }
+
+    /** The page's own dark fill, under the picture. */
+    GradientDrawable pageFill;
+
+    /**
+     * The picture fading: the page's dark fill under it is drawn only while the picture doesn't
+     * cover it whole. Under a picture fully there it was a second full-screen fill every frame.
+     */
+    android.view.ViewPropertyAnimator ambientTo(float a, long ms) {
         ambient.animate().cancel();
-        ambient.animate().alpha(0f).setDuration(300).setInterpolator(MainActivity.EASE).start();
+        page.setBackground(pageFill);
+        android.view.ViewPropertyAnimator an = ambient.animate().alpha(a).setDuration(ms).setInterpolator(MainActivity.EASE);
+        if (a >= 1f) an.withEndAction(() -> {
+            if (ambient.getAlpha() >= 1f && ambient.getDrawable() != null) page.setBackground(null);
+        });
+        return an;
     }
 
     Runnable ambientRun = () -> { }, ambientTop = () -> { }, aheadRun = () -> { };
