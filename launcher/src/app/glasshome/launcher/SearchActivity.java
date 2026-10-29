@@ -522,6 +522,30 @@ public class SearchActivity extends Activity {
         if (closing) return;
         closing = true;
         stopListening();
+        dropOpening();
+        // Nothing changes inside the page once it's one still picture, or the picture is drawn again
+        // every frame: results still on their way and the next background are dropped, and what's
+        // still moving (the page, a row, the keyboard and results sliding) ends where it was going.
+        generation++;
+        ui.removeCallbacks(debounced);
+        ui.removeCallbacks(pendingShow);
+        ui.removeCallbacks(relanded);
+        ui.removeCallbacks(ambientTop);
+        ui.removeCallbacks(ambientRun);
+        ui.removeCallbacks(ambientBatch);
+        ui.removeCallbacks(vStart);
+        ambientFor = null;  // a picture still being opened isn't shown
+        ambient.animate().cancel();
+        if (vScroll != null && vScroll.isRunning()) vScroll.end();
+        for (int i = 0; i < grid.getChildCount(); i++) {
+            Object t = grid.getChildAt(i).getTag();
+            if (t instanceof Sec && ((Sec) t).scroller != null && ((Sec) t).scroller.isRunning()) ((Sec) t).scroller.end();
+        }
+        keys.animate().cancel();
+        results.animate().cancel();
+        keys.setTranslationX(slid ? -KEYS_W : 0);
+        results.setTranslationX(slid ? 0 : KEYS_W);
+        if (barAnim != null && barAnim.isRunning()) barAnim.end();  // the waveform, fading as listening stops
         if (android.os.Build.VERSION.SDK_INT >= 30) {
             setTranslucent(true);
             // Home comes back to the front under it: there already, not faded up by the system
@@ -572,6 +596,7 @@ public class SearchActivity extends Activity {
         super.onUserLeaveHint();
         if (asking) return;  // the system's microphone question, over the page: Search stays for the answer
         stopListening();
+        dropOpening();
         finish();
         overridePendingTransition(0, R.anim.page_out);
     }
@@ -624,6 +649,7 @@ public class SearchActivity extends Activity {
         ui.removeCallbacks(relanded);
         ui.removeCallbacks(listenRun);
         stopListening();
+        dropOpening();
         setStatus("");
         lastResult = null;
         if (field.length() > 0 || !lastQuery.isEmpty()) setQuery("");
@@ -643,6 +669,7 @@ public class SearchActivity extends Activity {
         super.onStop();
         stoppedAt = SystemClock.uptimeMillis();
         stopped = true;
+        dropOpening();  // a title still being found doesn't open when Search is back
     }
 
     /** Out of sight: under a title page, or behind another app. */
@@ -940,6 +967,7 @@ public class SearchActivity extends Activity {
     }
 
     void stopListening() {
+        ui.removeCallbacks(listenRun);  // a microphone still settling (listenSoon) doesn't open after this
         ui.removeCallbacks(quietStop);
         ui.removeCallbacks(pauseStop);
         ui.removeCallbacks(maxStop);
@@ -1047,6 +1075,8 @@ public class SearchActivity extends Activity {
             heard = false;
             before = field.getText().toString();
         }
+        // Room at the field's right for the waveform while it's there, so the words heard never run under it.
+        field.setPadding(0, 0, on ? u(170) : u(4), 0);
         animateBar(on ? 1f : 0f);
         fieldChanged();
     }
@@ -1713,7 +1743,7 @@ public class SearchActivity extends Activity {
     void fillHints(List<String> next) {
         View f = getCurrentFocus();
         int at = f != null && f.getParent() == hints ? hints.indexOfChild(f) : -1;
-        hints.removeAllViews();
+        withoutFocus(hints::removeAllViews);
         for (String s : next) {
             LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, u(32));
             if (hints.getChildCount() > 0) lp.leftMargin = u(10);
@@ -1727,6 +1757,23 @@ public class SearchActivity extends Activity {
         if (at >= 0) {
             if (show) hints.getChildAt(Math.min(at, hints.getChildCount() - 1)).requestFocus();
             else showKeys();
+        }
+    }
+
+    /**
+     * Takes views away with focus held nowhere meanwhile, if one of them has it: Android would hand
+     * it to the first view it finds (the first card, a suggestion), whose focus code would then run
+     * for nothing (the background changing, a row scrolling, the keyboard sliding, a pill twitching).
+     * Focus is then put where it's wanted.
+     */
+    void withoutFocus(Runnable remove) {
+        ViewGroup root = (ViewGroup) page;
+        int was = root.getDescendantFocusability();
+        root.setDescendantFocusability(ViewGroup.FOCUS_BLOCK_DESCENDANTS);
+        try {
+            remove.run();
+        } finally {
+            root.setDescendantFocusability(was);
         }
     }
 
@@ -1747,8 +1794,10 @@ public class SearchActivity extends Activity {
     View pill(String s) {
         Glass white = new Glass(u(16), u(0.6f), Glass.REGULAR);
         TextView t = new TextView(this);
-        String typed = lastQuery.toLowerCase(Locale.UK).trim();
-        int from = typed.isEmpty() ? -1 : s.indexOf(typed);
+        String typed = SearchBrain.unaccent(lastQuery).toLowerCase(Locale.UK).trim();
+        // Found accents aside ("pokemon" in "pokémon"), where that leaves every letter in its place.
+        String bare = SearchBrain.unaccent(s);
+        int from = typed.isEmpty() ? -1 : (bare.length() == s.length() ? bare : s).indexOf(typed);
         SpannableString sp = new SpannableString(s);
         List<Ink> rest = new ArrayList<>();
         if (from >= 0) {
@@ -1822,6 +1871,7 @@ public class SearchActivity extends Activity {
 
     void search(String q) {
         if (isDestroyed()) return;
+        dropOpening();
         lastQuery = q;
         int gen = ++generation;
         if (running != null) running.cancel(true);
@@ -1960,10 +2010,10 @@ public class SearchActivity extends Activity {
     List<Result> matchApps(String q) {
         List<Result> out = new ArrayList<>();
         PackageManager pm = getPackageManager();
-        String lq = q.toLowerCase(Locale.UK);
+        String lq = SearchBrain.unaccent(q).toLowerCase(Locale.UK);
         for (Object[] app : apps()) {
             String label = (String) app[0];
-            boolean hit = label.toLowerCase(Locale.UK).contains(lq) || SearchBrain.matchScore(q, label) >= 85;
+            boolean hit = SearchBrain.unaccent(label).toLowerCase(Locale.UK).contains(lq) || SearchBrain.matchScore(q, label) >= 85;
             if (!hit) continue;
             ResolveInfo r = (ResolveInfo) app[1];
             Result a = new Result();
@@ -2033,7 +2083,7 @@ public class SearchActivity extends Activity {
     }
 
     void fill(String url, Bitmap bm) {
-        if (isDestroyed()) return;
+        if (isDestroyed() || closing) return;  // closing: the page is one still picture now
         List<Slot> l = waiting.remove(url);
         if (l == null) return;
         long now = SystemClock.uptimeMillis();
@@ -2114,11 +2164,15 @@ public class SearchActivity extends Activity {
      * said in their place (failed: it couldn't connect).
      */
     void show(List<SearchBrain.Shelf> data, boolean failed) {
-        if (isDestroyed()) return;
+        if (isDestroyed() || closing) return;  // closing: the page is one still picture now
         ui.removeCallbacks(pendingShow);
         long now = SystemClock.uptimeMillis();
         if (entering && !data.isEmpty() && now < enterEnd) {
-            pendingShow = () -> show(data, failed);
+            // Shown only if nothing has been searched since: never under a newer query.
+            int gen = generation;
+            pendingShow = () -> {
+                if (gen == generation) show(data, failed);
+            };
             ui.postDelayed(pendingShow, enterEnd - now);
             return;
         }
@@ -2126,27 +2180,37 @@ public class SearchActivity extends Activity {
         List<SearchBrain.Shelf> shelves = new ArrayList<>(lastQuery.isEmpty() ? landing(data) : data);
         shelves.removeIf(sh -> sh.items.isEmpty());
         if (!lastQuery.isEmpty()) suggestFrom(shelves);
+        boolean same = lastQuery.equals(shownFor);
+        shownFor = lastQuery;
         if (extend(shelves)) {
             jumpIn();
             return;
         }
         boolean hadFocus = grid.hasFocus();
+        // The same search laid out again (a shelf added after Top Results shown as a grid): the card
+        // that had focus keeps it, found by its title and year, and the page stays where it was.
+        String[] heading = {""};
+        Result was = hadFocus && same && !jump ? focusedResult(heading) : null;
+        boolean still = false;
+        for (SearchBrain.Shelf sh : shelves) for (Result r : sh.items) still |= was != null && sameCard(r, was);
+        if (!still) was = null;
         showing = new ArrayList<>(shelves);
-        grid.removeAllViews();
+        withoutFocus(grid::removeAllViews);
         waiting.clear();
         tiles.clear();
         firstCard = null;
         lastResult = null;
         if (vScroll != null) vScroll.cancel();
         ui.removeCallbacks(vStart);
-        scroll.scrollTo(0, 0);
-        vTarget = 0;
+        if (was == null) scroll.scrollTo(0, 0);
+        vTarget = scroll.getScrollY();
         // One shelf of results fills the screen as a grid, as Apple's does.
         int found = 0;
         for (SearchBrain.Shelf sh : shelves) if (!isApps(sh)) found++;
         boolean asGrid = !lastQuery.isEmpty() && found == 1;
         int[] delay = {0};
         List<Result> all = new ArrayList<>();
+        refocus = was;
         for (SearchBrain.Shelf sh : shelves) {
             markDupes(sh);
             // Before a search, Browse is Apple's grid of tiles, under Recently Searched's row.
@@ -2154,6 +2218,7 @@ public class SearchActivity extends Activity {
             section(sh, delay, -1, browse || asGrid && !isApps(sh));
             all.addAll(sh.items);
         }
+        refocus = null;
         if (!lastQuery.isEmpty() && shelves.isEmpty()) nothingFound(failed);
         // Backgrounds are got ready for results; before a search they load as you move to one.
         if (!lastQuery.isEmpty()) prepareAmbient(all);
@@ -2174,13 +2239,80 @@ public class SearchActivity extends Activity {
             ambient.animate().cancel();
             ambient.animate().alpha(0f).setDuration(300).setInterpolator(MainActivity.EASE).start();
         }
-        // Focus was on a card that's gone: the new first one, or (nothing found) the keyboard, never
-        // the empty page itself.
-        if (hadFocus && (!jump || firstCard == null)) {
+        // Focus was on a card that's gone: the same title's new card, else the new first one, or
+        // (nothing found) the keyboard, never the empty page itself.
+        View back = was == null ? null : cardFor(was, heading[0]);
+        if (back != null) {
+            back.requestFocus();
+            // Where it is is known once it's laid out (the next thing on the main thread).
+            ui.post(() -> {
+                if (back.isFocused()) bringIntoView(back);
+            });
+        } else if (hadFocus && (!jump || firstCard == null)) {
             if (firstCard != null) firstCard.requestFocus();
             else showKeys();
         }
         jumpIn();
+    }
+
+    /** What the last results shown were for, to tell the same search shown again from a new one. */
+    String shownFor;
+    /** While a page is laid out again: the title whose card had focus, made at once (section). */
+    Result refocus;
+
+    static boolean sameCard(Result a, Result b) {
+        return TextUtils.equals(a.title, b.title) && TextUtils.equals(a.year, b.year);
+    }
+
+    /** The result whose card has focus, and its shelf's heading (into heading[0]); null off the cards. */
+    Result focusedResult(String[] heading) {
+        View f = getCurrentFocus(), row = f == null ? null : rowOf(f);
+        if (row == null) return null;
+        View card = f, sec = row;
+        while (card.getParent() != row) card = (View) card.getParent();
+        while (sec != null && sec.getParent() != grid) sec = sec.getParent() instanceof View ? (View) sec.getParent() : null;
+        if (sec == null || !(sec.getTag() instanceof Sec)) return null;
+        Sec s = (Sec) sec.getTag();
+        // A grid's rows come after its heading, six cards each.
+        int k = ((ViewGroup) row).indexOfChild(card) + (s.grid ? (s.view.indexOfChild(row) - 1) * COLS : 0);
+        if (k < 0 || k >= s.items.size()) return null;
+        heading[0] = s.heading.getText().toString();
+        return s.items.get(k);
+    }
+
+    /** The card made for this title (the same name and year), in the shelf with that heading if it has one. */
+    View cardFor(Result was, String heading) {
+        View any = null;
+        for (int i = 0; i < grid.getChildCount(); i++) {
+            Object tag = grid.getChildAt(i).getTag();
+            if (!(tag instanceof Sec)) continue;
+            Sec s = (Sec) tag;
+            for (int k = 0; k < s.built; k++) {
+                if (!sameCard(s.items.get(k), was)) continue;
+                ViewGroup row = s.grid ? (ViewGroup) s.view.getChildAt(1 + k / COLS) : s.row;
+                View card = focusable(row.getChildAt(s.grid ? k % COLS : k));
+                if (heading.equals(s.heading.getText().toString())) return card;
+                if (any == null) any = card;
+                break;
+            }
+        }
+        return any;
+    }
+
+    /**
+     * A card focused as soon as it was made, brought into view once it's laid out: its row straight
+     * to it (the row has only just been made), and the page to its row as focus moving there would.
+     */
+    void bringIntoView(View v) {
+        View row = rowOf(v), card = v, sec = v;
+        if (row == null || !v.isLaidOut()) return;
+        while (card.getParent() != row) card = (View) card.getParent();
+        while (sec.getParent() != grid) sec = (View) sec.getParent();
+        Sec s = (Sec) sec.getTag();
+        scrollRow(s, card);
+        if (s.scroller != null && s.scroller.isRunning()) s.scroller.end();
+        ui.removeCallbacks(vStart);  // the page's move worked out when the card had no place yet
+        keepInView(card);
     }
 
     void jumpIn() {
@@ -2353,7 +2485,15 @@ public class SearchActivity extends Activity {
         if (rises) s.riseAt = SystemClock.uptimeMillis() + s.riseDelay;
         s.firstBuild = sh.items.size();
         if (rises && asGrid) rise(s.heading, s.riseDelay, 0.5f);
-        queue(s, sh.items, asGrid ? COLS : COLS + 1);
+        int atOnce = asGrid ? COLS : COLS + 1;
+        // The card that had focus is made now, with those before it, so focus can go straight back to it.
+        for (int k = atOnce; refocus != null && k < sh.items.size(); k++) {
+            if (sameCard(sh.items.get(k), refocus)) {
+                atOnce = k + 1;
+                break;
+            }
+        }
+        queue(s, sh.items, atOnce);
         if (rises && !asGrid) rise(v, s.riseDelay, 1f);
     }
 
@@ -2388,7 +2528,7 @@ public class SearchActivity extends Activity {
         for (int from = now; from < rs.size(); from += COLS) {
             List<Result> part = new ArrayList<>(rs.subList(from, Math.min(rs.size(), from + COLS)));
             ui.post(() -> {
-                if (s.view.getParent() != grid) return;  // replaced by newer results meanwhile
+                if (s.view.getParent() != grid || closing) return;  // replaced by newer results meanwhile, or closing
                 build(s, part);
             });
         }
@@ -2934,7 +3074,7 @@ public class SearchActivity extends Activity {
             String code = g[1];
             ui.post(() -> {
                 ImageView v = tiles.get(code);
-                if (v == null || isDestroyed()) return;
+                if (v == null || isDestroyed() || closing) return;
                 v.setImageBitmap(soft);
                 v.setImageAlpha(0);
                 ObjectAnimator a = ObjectAnimator.ofInt(v, "imageAlpha", 0, 255);
@@ -3237,7 +3377,11 @@ public class SearchActivity extends Activity {
     void ambientFor(Result r) {
         if (isDestroyed()) return;
         String url = r.backdrop != null ? r.backdrop : r.poster;
-        if (url == null || url.equals(ambientFor)) return;
+        if (url == null) {
+            ambientNone();  // nothing to show for it: not the last title's picture either
+            return;
+        }
+        if (url.equals(ambientFor)) return;
         ambientFor = url;
         ui.removeCallbacks(ambientRun);
         Bitmap ready = AMBIENT.get(url);
@@ -3259,8 +3403,10 @@ public class SearchActivity extends Activity {
                 ambientGetting.remove(url);
             }
             ui.post(() -> {
-                if (bm == null || !url.equals(ambientFor) || isDestroyed()) return;
-                showAmbient(bm, 320);
+                if (!url.equals(ambientFor) || isDestroyed()) return;
+                // It wouldn't open: no picture rather than the last title's, and focus back on it tries again.
+                if (bm == null) ambientNone();
+                else showAmbient(bm, 320);
             });
         });
         // A moment's wait, so moving quickly along a row doesn't fetch each picture on the way.
@@ -3292,8 +3438,21 @@ public class SearchActivity extends Activity {
 
     // ---------------------------------------------------------------- opening
 
+    /** Moves on whenever a title being found to open (an actor's film) is no longer wanted. */
+    int opening;
+    /** The title being found now: OK on it again waits for it rather than opening it twice. */
+    Result resolving;
+
+    /** A new search, a new visit or leaving: whatever is being found to open won't open. */
+    void dropOpening() {
+        opening++;
+        resolving = null;
+    }
+
     /** An app opens; a show or film opens its page, with the synopsis and every way to watch it. */
     void open(Result r) {
+        if (r == resolving) return;  // still being found
+        dropOpening();
         if (r.appLaunch != null) {
             Suggestions.start(this, r.appLaunch);
             return;
@@ -3301,10 +3460,16 @@ public class SearchActivity extends Activity {
         if (r.id == null && r.tmdbId > 0) {
             // (Remembered once found, as the title its page is for, not twice.)
             // An actor's film from TMDB: find it on JustWatch for its page (where to watch it).
+            int token = opening;
+            resolving = r;
             io.execute(() -> {
                 Result found = brain.resolve(r);
                 ui.post(() -> {
-                    if (isDestroyed()) return;  // left meanwhile: no page popping up over somewhere else
+                    // Only if nothing has happened since: no page popping up over Home or over a
+                    // newer search, and nothing typed meanwhile replaced.
+                    if (token != opening) return;
+                    resolving = null;
+                    if (isDestroyed() || isFinishing() || closing || stopped) return;
                     if (found != null) {
                         found.backdrop = r.backdrop != null ? r.backdrop : found.backdrop;
                         open(found);

@@ -81,6 +81,13 @@ final class SearchBrain {
         boolean implicit;
         /** A whole request searched as a title just in case ("films about sharks"): not one to retry for typos. */
         boolean worded;
+        /** Spoken filler taken off the front ("search", "hey"), which may be a title's own first word (Search Party). */
+        String lead = "";
+
+        /** What its answer is kept by: the request as read, the filler too (Search Party isn't Party). */
+        String key() {
+            return lead.isEmpty() ? full : lead + " " + full;
+        }
         /** Nothing left but genres, kind, decade and freshness: browse rather than search. */
         boolean browse() {
             return text.isEmpty() && about == null && !like;
@@ -216,10 +223,11 @@ final class SearchBrain {
 
     static Query read(String raw) {
         Query q = new Query();
-        String s = " " + raw.toLowerCase(Locale.UK).replace("&", " and ").replace("+", " plus ")
+        String s = " " + unaccent(raw).toLowerCase(Locale.UK).replace("&", " and ").replace("+", " plus ")
                 .replaceAll("[^a-z0-9' ]", " ").replace("'", "").replaceAll("\\s+", " ").trim() + " ";
         // Spoken filler at the start, as many as there are ("can you please show me ..."), but not the
         // "something" of "something like Slow Horses".
+        String said = s;
         boolean again = true;
         while (again) {
             again = false;
@@ -232,6 +240,7 @@ final class SearchBrain {
                 again = true;
             }
         }
+        q.lead = said.substring(0, said.length() - s.length()).trim();
         s = s.replace(" for me ", " ").replace(" please ", " ");
         q.full = s.trim();
         // "something like Slow Horses", "films similar to Inception": the title to go by.
@@ -469,15 +478,15 @@ final class SearchBrain {
 
     /**
      * Answers from the last few minutes, so going back a letter or repeating a search is instant.
-     * Kept by what was asked once the filler's gone: "Slow Horses", "slow horses!" and "search for
-     * slow horses" are one answer.
+     * Kept by what was asked as it's read: "Slow Horses" and "slow horses!" are one answer. Filler
+     * at the front keeps its own ("search party" may be Search Party, not "party").
      */
     static final android.util.LruCache<String, Object[]> ANSWERS = new android.util.LruCache<>(24);
 
     /** The answer kept for this, while it's fresh; null otherwise. */
     @SuppressWarnings("unchecked")
     static List<Shelf> cached(String raw) {
-        Object[] hit = ANSWERS.get(read(raw).full);
+        Object[] hit = ANSWERS.get(read(raw).key());
         if (hit == null || System.currentTimeMillis() - (Long) hit[0] >= 10 * 60_000L) return null;
         return copy((List<Shelf>) hit[1]);
     }
@@ -490,7 +499,7 @@ final class SearchBrain {
         List<Shelf> kept = cached(raw);
         if (kept != null) return kept;
         List<Shelf> out = work(raw, early, stale);
-        if (!out.isEmpty() && !stale.getAsBoolean()) ANSWERS.put(read(raw).full, new Object[]{System.currentTimeMillis(), copy(out)});
+        if (!out.isEmpty() && !stale.getAsBoolean()) ANSWERS.put(read(raw).key(), new Object[]{System.currentTimeMillis(), copy(out)});
         return out;
     }
 
@@ -549,10 +558,35 @@ final class SearchBrain {
         Query fq = q;
         Future<Person> people = q.text.length() >= 4 && Suggestions.hasToken(c)
                 && (q.text.contains(" ") || q.text.length() >= 5 || q.person) ? POOL.submit(() -> people(fq)) : null;
+        // The filler taken off the front may have been the title's own first word (Search Party,
+        // Hey Duggee, Start Up): the words as they were are looked up too, beside it.
+        Query whole = q.lead.isEmpty() || q.person ? null : plain(q.lead + " " + q.text);
+        Future<List<Result>> wholeTitles = null;
+        if (whole != null) {
+            whole.type = q.type;
+            whole.service = q.service;
+            whole.year = q.year;
+            whole.worded = true;  // only a second reading: no typo retries
+            wholeTitles = POOL.submit(() -> titles(whole, stale));
+        }
         List<Result> top = titles(q, stale);
         if (stale.getAsBoolean()) return out;
         Result best = top.isEmpty() ? null : top.get(0);
         double bm = best == null ? 0 : matchScore(q.text, best.title);
+        if (wholeTitles != null) {
+            List<Result> named = new ArrayList<>();
+            try {
+                named = wholeTitles.get(8, TimeUnit.SECONDS);
+            } catch (Exception ignored) {
+                // the words without the filler, then
+            }
+            if (stale.getAsBoolean()) return out;
+            // They name a title at least as well as the rest alone does ("start up" is StartUp, not Up).
+            if (!named.isEmpty() && matchScore(whole.text, named.get(0).title) >= Math.max(85, bm)) {
+                if (people != null) people.cancel(true);
+                return titleShelves(whole, named, null, null, null, early, null, false, stale);
+            }
+        }
         boolean clear = bm >= 85;
         // Titles related to a clear match are asked for now, beside the people lookup, not after it.
         Future<List<Result>> related = clear ? POOL.submit(() -> similar(best, stale)) : null;
@@ -1649,7 +1683,15 @@ final class SearchBrain {
     }
 
     static String literal(String s) {
-        return s.toLowerCase(Locale.UK).replaceAll("[^a-z0-9]", "");
+        return unaccent(s).toLowerCase(Locale.UK).replaceAll("[^a-z0-9]", "");
+    }
+
+    /** Accents taken off ("Pokémon" is "Pokemon", "Amélie" "Amelie"), so a letter with one is still that letter. */
+    static String unaccent(String s) {
+        for (int i = 0; i < s.length(); i++) {
+            if (s.charAt(i) >= 0x80) return java.text.Normalizer.normalize(s, java.text.Normalizer.Form.NFD).replaceAll("\\p{M}+", "");
+        }
+        return s;  // plain letters already: most titles, and no work
     }
 
     static List<String> keyWords(String s) {
@@ -1787,9 +1829,9 @@ final class SearchBrain {
         return false;
     }
 
-    /** Lower case, no punctuation, a leading "the" and trailing year dropped: for matching titles. */
+    /** Lower case, no accents or punctuation, a leading "the" and trailing year dropped: for matching titles. */
     static String norm(String t) {
-        String s = t.toLowerCase(Locale.UK).replaceAll("\\(\\d{4}\\)", " ").replace("&", " and ").replaceAll("['\u2019]", "")
+        String s = unaccent(t).toLowerCase(Locale.UK).replaceAll("\\(\\d{4}\\)", " ").replace("&", " and ").replaceAll("['\u2019]", "")
                 .replaceAll("[^a-z0-9 ]", " ").replaceAll("\\s+", " ").trim();
         return s.startsWith("the ") ? s.substring(4) : s;
     }
