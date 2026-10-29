@@ -368,6 +368,7 @@ public class DetailActivity extends Activity {
         header = new LinearLayout(this);
         header.setGravity(Gravity.CENTER_VERTICAL);
         header.setAlpha(0f);
+        header.forceHasOverlappingRendering(false);  // see fadeIn
         headerText = text(13, "medium", 0xE6FFFFFF);
         header.addView(headerText);
         age = text(11, "semibold", 0xE6FFFFFF);
@@ -386,6 +387,7 @@ public class DetailActivity extends Activity {
         synopsis.setMaxWidth(u(360));
         synopsis.setMaxLines(4);
         synopsis.setEllipsize(TextUtils.TruncateAt.END);
+        quick(synopsis);
         synopsis.setLineSpacing(0, 1.15f);
         synopsis.setAlpha(0f);
         hero.addView(synopsis, margins(u(8)));
@@ -401,6 +403,7 @@ public class DetailActivity extends Activity {
         // A button's height even before (or without) one, so a late one (Trailer, your library's)
         // never lifts everything above it.
         actions.setMinimumHeight(u(37));
+        actions.forceHasOverlappingRendering(false);  // see fadeIn
         row.addView(actions, new FrameLayout.LayoutParams(-2, -2, Gravity.START | Gravity.BOTTOM));
         credits = text(12, "regular", 0xE6FFFFFF);
         credits.setMaxWidth(u(300));
@@ -410,6 +413,8 @@ public class DetailActivity extends Activity {
         // It sits on the artwork's light side, with no shade behind it: a soft shadow keeps it legible.
         credits.setShadowLayer(u(5), 0, u(0.5f), 0xB3000000);
         credits.setAlpha(0f);
+        credits.forceHasOverlappingRendering(false);  // (its shadow made it one: see fadeIn)
+        quick(credits);
         row.addView(credits, new FrameLayout.LayoutParams(-2, -2, Gravity.END | Gravity.BOTTOM));
         LinearLayout.LayoutParams rl = new LinearLayout.LayoutParams(-1, -2);
         rl.topMargin = u(18);
@@ -421,6 +426,7 @@ public class DetailActivity extends Activity {
         hero.addView(waysLabel, margins(u(24)));
         ways = new Row(u(40), u(7), u(10));
         ways.setAlpha(0f);
+        ways.forceHasOverlappingRendering(false);  // see fadeIn
         // Edge to edge, so cards that run past the screen scroll under the margins rather than
         // being cut off at them.
         LinearLayout.LayoutParams wl = new LinearLayout.LayoutParams(-1, -2);
@@ -464,6 +470,15 @@ public class DetailActivity extends Activity {
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, -2);
         lp.topMargin = top;
         return lp;
+    }
+
+    /**
+     * Laid out by Android's quick line breaking: the default (balanced, and hyphenated before
+     * Android 13) made measuring the synopsis and credits much of the frame the page filled in.
+     */
+    static void quick(TextView t) {
+        t.setBreakStrategy(android.text.Layout.BREAK_STRATEGY_SIMPLE);
+        t.setHyphenationFrequency(android.text.Layout.HYPHENATION_FREQUENCY_NONE);
     }
 
     TextView text(float size, String weight, int color) {
@@ -516,7 +531,7 @@ public class DetailActivity extends Activity {
                 PackageManager pm = getPackageManager();
                 for (Offer o : offers) {
                     o.installed = o.pkg != null && Suggestions.installed(this, o.pkg);
-                    o.art = o.installed ? banner(pm, o.pkg) : null;
+                    o.art = o.installed ? onGpu(banner(pm, o.pkg), u(56), u(32)) : null;
                     o.rank = (o.free || o.ads ? 0 : o.subscription ? 1 : o.addon != null || o.part != null ? 2 : 3) + (o.installed ? 0 : 1);
                 }
                 // Only what you could watch it with: your apps, and services you could sign up
@@ -627,6 +642,27 @@ public class DetailActivity extends Activity {
 
     void dim(int y) {
         if (settled) backdrop.setAlpha(arrived * dimmed(y));
+    }
+
+    /**
+     * A banner drawn at its card's size (filling it, as the card crops it) and handed to the GPU
+     * here, off the UI thread: as Android gives it, it was uploaded in the frames the page opened in.
+     */
+    Drawable onGpu(Drawable d, int w, int h) {
+        if (d == null || w <= 0 || h <= 0) return d;
+        int iw = d.getIntrinsicWidth(), ih = d.getIntrinsicHeight();
+        Bitmap b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+        android.graphics.Canvas c = new android.graphics.Canvas(b);
+        if (iw > 0 && ih > 0) {
+            float s = Math.max(w / (float) iw, h / (float) ih);
+            int dw = Math.round(iw * s), dh = Math.round(ih * s);
+            d.setBounds((w - dw) / 2, (h - dh) / 2, (w - dw) / 2 + dw, (h - dh) / 2 + dh);
+        } else {
+            d.setBounds(0, 0, w, h);
+        }
+        d.draw(c);
+        Bitmap g = Suggestions.onGpu(b);
+        return new BitmapDrawable(getResources(), g != null ? g : b);
     }
 
     /** An installed app's TV banner (its icon if it has none). */
@@ -1346,6 +1382,12 @@ public class DetailActivity extends Activity {
         if (launch != null) Suggestions.start(this, launch);
     }
 
+    /**
+     * Rises and fades in. What fades this way is set to fade its parts (forceHasOverlappingRendering
+     * false): a group (the buttons, How to Watch's row) or text with a shadow (credits) was otherwise
+     * drawn off screen and faded as one picture, every frame of the fade (How to Watch's row alone
+     * took 9 ms a frame on this TV as the page opened). Their parts don't overlap, so it looks the same.
+     */
     void fadeIn(View v, long delay) {
         v.setAlpha(0f);
         v.setTranslationY(u(6));
