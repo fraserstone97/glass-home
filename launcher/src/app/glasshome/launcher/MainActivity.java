@@ -286,6 +286,9 @@ public class MainActivity extends Activity {
     final int[] focusLoc = new int[2];
 
     final Runnable shelfUpdate = () -> {
+        // Full screen shows every service's titles: an app's own shelf comes back with the dock
+        // (exitIdle), never from a refresh or a press that landed on the way to full screen.
+        if (idle) return;
         if (focusedIndex >= 0 && focusedIndex < shown.size()) {
             shelfFor(shown.get(focusedIndex), hasDock() && focusedIndex < COLS);
         }
