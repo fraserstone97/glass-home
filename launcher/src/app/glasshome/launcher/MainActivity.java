@@ -2615,7 +2615,14 @@ public class MainActivity extends Activity {
     /** A new full carousel: kept as the mix, shown unless an app's own shelf is up. */
     void setHeroBase(List<Suggestions.Item> items) {
         heroAll = items;
-        if (shelfPkg == null) setHeroItems(mix());
+        if (shelfPkg == null) {
+            setHeroItems(mix());
+            return;
+        }
+        // An app's own shelf on screen takes its new titles too (kept where it was), rather than
+        // waiting for focus to leave its app and come back, which can be days.
+        List<Suggestions.Item> own = Suggestions.forService(this, shelfPkg);
+        if (own.size() >= 2) setHeroItems(own);
     }
 
     /** The mix as it's shown: from today's lead (Suggestions.turned). */
@@ -2630,9 +2637,13 @@ public class MainActivity extends Activity {
     void turnShelf() {
         Suggestions.turn++;
         if (heroItems.size() < 2) return;
-        List<Suggestions.Item> next = new ArrayList<>(heroItems);
-        // The shelf as it would be read now, one on (the mix, or the app's shelf: both are turned).
-        java.util.Collections.rotate(next, -1);
+        // The shelf read afresh (the latest refresh), from its new lead.
+        List<Suggestions.Item> next = shelfPkg == null ? mix() : Suggestions.forService(this, shelfPkg);
+        if (next.size() < 2) {
+            // A shelf that isn't saved by service: the one on screen, moved on one.
+            next = new ArrayList<>(heroItems);
+            java.util.Collections.rotate(next, -1);
+        }
         heroItems = new ArrayList<>();  // nothing to keep the place of: it opens on the first
         setHeroItems(next);
     }
