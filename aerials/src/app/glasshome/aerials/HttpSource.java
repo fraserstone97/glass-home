@@ -190,6 +190,8 @@ final class HttpSource extends MediaDataSource {
         closed = true;
         pool.shutdownNow();
         synchronized (this) {
+            // A read waiting on a chunk fails now rather than when its download times out.
+            for (Future<byte[]> f : chunks.values()) f.cancel(true);
             chunks.clear();
         }
     }

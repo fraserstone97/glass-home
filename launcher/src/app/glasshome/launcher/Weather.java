@@ -64,8 +64,10 @@ final class Weather {
         return prefs(c).getBoolean(K_MANUAL, false);
     }
 
+    /** The city chosen; else (automatic) the one found from the internet address. */
     static String place(Context c) {
-        return prefs(c).getString(K_PLACE, "");
+        SharedPreferences p = prefs(c);
+        return manual(c) ? p.getString(K_PLACE, "") : p.getString(K_AUTO_PLACE, p.getString(K_PLACE, ""));
     }
 
     static String source(Context c) {
@@ -349,6 +351,8 @@ final class Weather {
         new Thread(() -> {
             android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
             boolean saved = false;
+            // What it's fetched for (units, source, place), read once at the start.
+            String k = key(c);
             try {
                 SharedPreferences p = prefs(c);
                 double lat, lon;
@@ -394,14 +398,20 @@ final class Weather {
                         // try the next source
                     }
                 }
-                if (d != null) {
+                if (d != null && !k.equals(key(c))) {
+                    // Settings changed while it was fetching (units, the city): it's for the old
+                    // ones, so it isn't kept, and the new ones are fetched next.
+                    again = true;
+                } else if (d != null) {
                     if (!place.isEmpty() || d.place.isEmpty()) d.place = place;
                     d.fetchedAt = System.currentTimeMillis();
                     d.fahrenheit = f;
                     d.lat = lat;
                     d.lon = lon;
-                    p.edit().putString(K_CACHE, d.toJson().toString()).putString(K_PLACE, d.place)
-                            .putLong(K_CACHE_AT, d.fetchedAt).putString(K_CACHE_KEY, key(c)).apply();
+                    SharedPreferences.Editor e = p.edit().putString(K_CACHE, d.toJson().toString())
+                            .putLong(K_CACHE_AT, d.fetchedAt).putString(K_CACHE_KEY, k);
+                    if (!auto) e.putString(K_PLACE, d.place);  // (the city you chose keeps its own name)
+                    e.apply();
                     saved = true;
                 } else if (auto) {
                     p.edit().putLong(K_AUTO_AT, 0).apply();  // every source failed: look the place up again next time

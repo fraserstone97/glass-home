@@ -108,6 +108,9 @@ final class AerialPlayer {
             mp = null;
             src = null;
             prepared = rendering = false;
+            // The download first: a player reading a chunk that's still coming can't be reset
+            // until that read returns, which on a slow connection held up the screen for seconds.
+            if (s != null) s.close();
             if (m != null) {
                 try {
                     m.reset();
@@ -116,7 +119,6 @@ final class AerialPlayer {
                 }
                 m.release();
             }
-            if (s != null) s.close();
         }
     }
 

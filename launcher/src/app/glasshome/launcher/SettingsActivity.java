@@ -474,6 +474,7 @@ public class SettingsActivity extends Activity {
         };
         bg.tint.at(0f);
         in.setOnFocusChangeListener((v, has) -> {
+            if (!has && v.getParent() != list) return;  // the page going: it leaves lit, as it was
             if (has) setAbout(pageLine);
             if (snap) bg.setFocus(has ? 1f : 0f);
             else Glass.focus(bg, has, 100, 200, ROW_IN, ROW_OUT);
@@ -990,6 +991,9 @@ public class SettingsActivity extends Activity {
         }
 
         r.setOnFocusChangeListener((view, has) -> {
+            // The page going (a new one has taken focus): the row you pressed leaves still lit,
+            // rather than going dark the moment its page starts to fade.
+            if (!has && view.getParent() != list) return;
             if (has) setAbout(hints.containsKey(view) ? hints.get(view) : pageLine);
             if (snap) {
                 if (bg.anim != null) bg.anim.cancel();
