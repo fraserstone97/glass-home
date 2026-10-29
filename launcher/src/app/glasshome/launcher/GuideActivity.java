@@ -102,6 +102,8 @@ public class GuideActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        // Nothing waiting runs after this: it would hand work to the threads shut down here.
+        ui.removeCallbacksAndMessages(null);
         work.shutdownNow();
         images.shutdownNow();
         super.onDestroy();
@@ -255,7 +257,7 @@ public class GuideActivity extends Activity {
         }
         title.setText(s.title);
         StringBuilder m = new StringBuilder();
-        m.append(dayWord(s.start, now)).append("  ").append(time(s.start)).append(" \u2013 ").append(time(s.end));
+        m.append(dayWord(s.start, now)).append("  ").append(s.times);
         liveBadge.setVisibility(s.onNow(now) ? View.VISIBLE : View.GONE);
         if (s.onNow(now)) {
             long left = (s.end - now + 59_999) / 60_000;
@@ -286,10 +288,11 @@ public class GuideActivity extends Activity {
         return m == 0 ? h + (h == 1 ? " hr" : " hrs") : h + " hr " + m + " min";
     }
 
-    static String time(long t) {
-        SimpleDateFormat f = new SimpleDateFormat("HH:mm", Locale.UK);
-        f.setTimeZone(GuideData.LONDON);
-        return f.format(new Date(t));
+    /** One, for the screen's thread only: the ruler's times are drawn every frame. */
+    final SimpleDateFormat hm = GuideData.format("HH:mm");
+
+    String time(long t) {
+        return hm.format(new Date(t));
     }
 
     /** Today, Yesterday, Tomorrow, or the day's name and date. */
@@ -298,9 +301,7 @@ public class GuideActivity extends Activity {
         if (day == today) return "Today";
         if (day == GuideData.addDays(today, -1)) return "Yesterday";
         if (day == GuideData.addDays(today, 1)) return "Tomorrow";
-        SimpleDateFormat f = new SimpleDateFormat("EEE d MMM", Locale.UK);
-        f.setTimeZone(GuideData.LONDON);
-        return f.format(new Date(t));
+        return GuideData.format("EEE d MMM").format(new Date(t));
     }
 
     /** The picture behind the header, a moment after focus settles (not for every programme passed). */
@@ -309,7 +310,9 @@ public class GuideActivity extends Activity {
         artUrl = url;
         ui.removeCallbacks(artLoad);
         if (url == null) {
+            // Both: this stops a fade-in that would have hidden the back one at its end.
             artFront.animate().alpha(0f).setDuration(300).start();
+            artBack.animate().alpha(0f).setDuration(300).start();
             return;
         }
         ui.postDelayed(artLoad, 220);
@@ -317,21 +320,23 @@ public class GuideActivity extends Activity {
 
     final Runnable artLoad = () -> {
         String url = artUrl;
-        if (url == null) return;
+        if (url == null || images.isShutdown()) return;
         images.execute(() -> {
             Bitmap b = Suggestions.screenImage(this, GuideData.sized(url, 800), Math.round(screenW * 0.64f));
             ui.post(() -> {
                 if (b == null || !url.equals(artUrl) || isFinishing()) return;
                 // The new picture fades in over the one shown, which then becomes the back layer.
-                ImageView old = artFront;
+                // A fade-in still going on the one shown stops where it is: its end would hide the new picture.
+                ImageView back = artFront;
                 artFront = artBack;
-                artBack = old;
+                artBack = back;
+                back.animate().cancel();
                 artFront.bringToFront();
                 ((View) artFront.getParent()).invalidate();
                 artFront.setImageBitmap(b);
                 artFront.setAlpha(0f);
                 artFront.animate().alpha(1f).setDuration(350).setInterpolator(MainActivity.EASE)
-                        .withEndAction(() -> artBack.setAlpha(0f)).start();
+                        .withEndAction(() -> back.setAlpha(0f)).start();
                 // The shades stay on top of both pictures.
                 FrameLayout box = (FrameLayout) artFront.getParent();
                 for (int i = 0; i < box.getChildCount(); i++) {
@@ -351,6 +356,7 @@ public class GuideActivity extends Activity {
             java.util.Map<String, List<GuideData.Show>> day = GuideData.day(this, today);
             GuideData.merge(list, day);
             ui.post(() -> {
+                if (isDestroyed()) return;  // left while it loaded
                 channels.clear();
                 channels.addAll(list);
                 loaded.add(today);
@@ -380,6 +386,7 @@ public class GuideActivity extends Activity {
         long today = GuideData.dayStart(System.currentTimeMillis());
         if (midnight < GuideData.addDays(today, -GuideData.DAYS_BACK) || midnight > GuideData.addDays(today, GuideData.DAYS_AHEAD)) return;
         if (loaded.contains(midnight) || loading.contains(midnight) || channels.isEmpty()) return;
+        if (work.isShutdown()) return;  // the guide has closed
         loading.add(midnight);
         List<GuideData.Channel> list = new ArrayList<>(channels);
         work.execute(() -> {
@@ -391,6 +398,7 @@ public class GuideActivity extends Activity {
                 return;
             }
             ui.post(() -> {
+                if (isDestroyed()) return;
                 // Merged here, on the screen's thread, so a frame never draws a list mid-change.
                 GuideData.merge(list, day);
                 loading.remove(midnight);
@@ -402,7 +410,7 @@ public class GuideActivity extends Activity {
 
     Bitmap logo(GuideData.Channel ch) {
         Bitmap b = logos.get(ch.id);
-        if (b == null && ch.logo != null && logosAsked.add(ch.id)) {
+        if (b == null && ch.logo != null && !images.isShutdown() && logosAsked.add(ch.id)) {
             images.execute(() -> {
                 Bitmap got = Suggestions.image(this, GuideData.sized(ch.logo, 400), "", 400);
                 if (got == null) return;
@@ -532,7 +540,9 @@ public class GuideActivity extends Activity {
 
         /** The window: its first moment (left edge) and first row, where they're heading, and now. */
         long start, startTarget;
-        float top, topTarget, startF;
+        float top, topTarget;
+        /** The left edge as it moves: a double, as a float holds today's time only to two minutes. */
+        double startF;
         int row;
         GuideData.Show focus, lastFocus;
         /** The time up and down keep to (Freely's: the programme you moved to across). */
@@ -544,6 +554,9 @@ public class GuideActivity extends Activity {
         ValueAnimator dayFade;
         ValueAnimator scroll, fade;
         long lastKey;
+        /** The day over the channels, worked out when the window or the date moves, not every frame. */
+        String dayText;
+        long dayKey = Long.MIN_VALUE, dayUntil;
 
         android.graphics.Shader bottomFade, backing;
         float backingTop;
@@ -552,7 +565,7 @@ public class GuideActivity extends Activity {
         final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG), text = new Paint(Paint.ANTI_ALIAS_FLAG),
                 small = new Paint(Paint.ANTI_ALIAS_FLAG), line = new Paint(Paint.ANTI_ALIAS_FLAG),
                 bitmaps = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
-        final RectF r = new RectF();
+        final RectF r = new RectF(), spare = new RectF();  // spare: a shadow, a logo's box (a frame makes none)
         final Path tri = new Path();
         final Typeface medium, semibold;
 
@@ -578,7 +591,7 @@ public class GuideActivity extends Activity {
         }
 
         float x(long t) {
-            return px(gridX) + (t - startF) * pxPerMs();
+            return px(gridX) + (float) ((t - startF) * pxPerMs());
         }
 
         GuideData.Channel focusChannel() {
@@ -645,10 +658,13 @@ public class GuideActivity extends Activity {
 
         void setFocus(GuideData.Show s) {
             if (s == focus) return;
+            // The one left fades out from as lit as it is now (half way in on a held arrow, or dimmed
+            // under the day), all the way to nothing.
+            float from = focus == null ? 0f : focusIn * (1f - 0.75f * dayFocus);
             lastFocus = focus;
             focus = s;
             if (fade != null) fade.cancel();
-            focusOut = lastFocus == null ? 0f : 1f;
+            focusOut = from;
             focusIn = 0f;
             fade = ValueAnimator.ofFloat(0f, 1f);
             fade.setDuration(170);
@@ -656,7 +672,7 @@ public class GuideActivity extends Activity {
             fade.addUpdateListener(a -> {
                 float f = (float) a.getAnimatedValue();
                 focusIn = f;
-                focusOut = 1f - Math.min(1f, f * 170f / 180f);
+                focusOut = from * (1f - f);
                 invalidate();
             });
             fade.start();
@@ -671,14 +687,10 @@ public class GuideActivity extends Activity {
             if (r < topAt) topAt = r;
             if (r > topAt + visibleRows - 1) topAt = r - visibleRows + 1;
             topAt = Math.max(0, Math.min(Math.max(0, channels.size() - visibleRows), topAt));
-            if (focus == s && s != null) describe(s, focusChannel());
-            if (s == null) {
-                lastFocus = focus;
-                focus = null;
-                describe(null, focusChannel());
-            } else {
-                setFocus(s);
-            }
+            // The same programme (or still none, on another row): only the header changes. Else
+            // focus moves, fading off the one left even when there's nothing to go to.
+            if (focus == s) describe(s, focusChannel());
+            setFocus(s);
             scrollTo(startAt, topAt, animate);
             needAround(startAt, startAt + SPAN);
         }
@@ -694,7 +706,8 @@ public class GuideActivity extends Activity {
                 invalidate();
                 return;
             }
-            float fromS = startF, fromT = top;
+            double fromS = startF;
+            float fromT = top;
             scroll = ValueAnimator.ofFloat(0f, 1f);
             scroll.setDuration(320);
             scroll.setInterpolator(MainActivity.EASE);
@@ -844,9 +857,15 @@ public class GuideActivity extends Activity {
             // The day, over the channels; the times, over the grid.
             small.setTypeface(semibold);
             small.setTextSize(9.5f * unit);
-            String day = dayWord(startTarget + SPAN / 2, now);
+            if (startTarget != dayKey || now >= dayUntil) {
+                dayKey = startTarget;
+                dayUntil = GuideData.addDays(GuideData.dayStart(now), 1);  // at midnight Today becomes Yesterday
+                dayText = dayWord(startTarget + SPAN / 2, now);
+            }
+            String day = dayText;
             float dw = small.measureText(day) + px(20);
             r.set(px(chanX), px(rulerY) - px(2), px(chanX) + Math.max(dw, px(chanW)), px(rulerY) + px(16));
+            float pillRight = r.right;
             c.save();
             float ds = 1f + 0.06f * dayFocus;
             c.scale(ds, ds, r.centerX(), r.centerY());
@@ -873,6 +892,9 @@ public class GuideActivity extends Activity {
             boolean nowShown = nx >= gx && nx <= gr;
             String nowText = time(now);
             float nowHalf = (small.measureText(nowText) + px(12)) / 2f;
+            // Its capsule keeps clear of the day (now, just after a half hour, is close to it); the
+            // stem stays at now, still under the capsule.
+            float cx = Math.max(nx, pillRight + nowHalf + px(4));
             line.setColor(0x33FFFFFF);
             line.setStrokeWidth(Math.max(1f, px(0.6f)));
             for (long t = floor30((long) startF); t < end; t += HALF_HOUR) {
@@ -882,7 +904,7 @@ public class GuideActivity extends Activity {
                 c.drawLine(tx, px(rulerY) + px(9), tx, px(rulerY) + px(15), line);
                 String label = time(t);
                 float lw = small.measureText(label);
-                if (nowShown && tx + px(4) < nx + nowHalf + px(4) && tx + px(4) + lw > nx - nowHalf - px(4)) continue;
+                if (nowShown && tx + px(4) < cx + nowHalf + px(4) && tx + px(4) + lw > cx - nowHalf - px(4)) continue;
                 small.setColor(0x8CFFFFFF);
                 c.drawText(label, tx + px(4), px(rulerY) + px(12), small);
             }
@@ -935,13 +957,13 @@ public class GuideActivity extends Activity {
                 line.setColor(0xFFFF453A);
                 line.setStrokeWidth(Math.max(2f, px(1f)));
                 c.drawLine(nx, px(rulerY) + px(14), nx, px(rowsY) - px(2), line);
-                r.set(nx - nowHalf, px(rulerY) - px(1), nx + nowHalf, px(rulerY) + px(15));
+                r.set(cx - nowHalf, px(rulerY) - px(1), cx + nowHalf, px(rulerY) + px(15));
                 fill.setColor(0xFFFF453A);
                 c.drawRoundRect(r, r.height() / 2, r.height() / 2, fill);
                 small.setTypeface(semibold);
                 small.setColor(Color.WHITE);
                 small.setTextAlign(Paint.Align.CENTER);
-                c.drawText(nowText, nx, r.centerY() + small.getTextSize() * 0.36f, small);
+                c.drawText(nowText, cx, r.centerY() + small.getTextSize() * 0.36f, small);
                 small.setTextAlign(Paint.Align.LEFT);
             }
         }
@@ -964,7 +986,8 @@ public class GuideActivity extends Activity {
                 float w = b.getWidth() * scale, h = b.getHeight() * scale;
                 float bx = lx + (lw - w) / 2f, by = r.centerY() - h / 2f;
                 bitmaps.setAlpha(current ? 255 : 190);
-                c.drawBitmap(b, null, new RectF(bx, by, bx + w, by + h), bitmaps);
+                spare.set(bx, by, bx + w, by + h);
+                c.drawBitmap(b, null, spare, bitmaps);
             } else {
                 text.setTypeface(medium);
                 text.setTextSize(9 * unit);
@@ -985,9 +1008,9 @@ public class GuideActivity extends Activity {
             if (f > 0f) r.inset(-px(3) * f, -px(2) * f);
             if (f > 0f) {
                 fill.setColor(Color.argb(Math.round(70 * f), 0, 0, 0));
-                RectF sh = new RectF(r);
-                sh.offset(0, px(4) * f);
-                c.drawRoundRect(sh, px(8), px(8), fill);
+                spare.set(r);
+                spare.offset(0, px(4) * f);
+                c.drawRoundRect(spare, px(8), px(8), fill);
             }
             float rad = px(8);
             fill.setColor(past ? 0x0DFFFFFF : live ? 0x26FFFFFF : 0x17FFFFFF);
@@ -1017,9 +1040,10 @@ public class GuideActivity extends Activity {
                 fill.setColor(blend(0xCCFFFFFF, 0xB3000000, f));
                 c.drawRoundRect(bx0, r.bottom - px(5), bx0 + (bx1 - bx0) * p, r.bottom - px(3), px(1), px(1), fill);
             }
-            // The words start just inside the grid's edge when the programme began before it. A
+            // The words start just inside the grid's edge when the programme began before it, and
+            // end inside its right edge when it runs on past (cut there, a letter was sliced). A
             // slot too narrow for a word shows none, rather than a letter and dots.
-            float tx = Math.max(x0, gx) + px(9), room = x1 - px(9) - tx;
+            float tx = Math.max(x0, gx) + px(9), room = Math.min(x1, px(right)) - px(9) - tx;
             if (room > px(26)) {
                 text.setTypeface(medium);
                 text.setTextSize(11 * unit);
@@ -1042,9 +1066,9 @@ public class GuideActivity extends Activity {
                     sx += px(10);
                 }
                 // Both times when they fit, else when it starts, else nothing: never a time cut short.
-                String when = time(s.start) + " \u2013 " + time(s.end);
+                String when = s.times;
                 float left = room - (sx - tx);
-                if (small.measureText(when) > left) when = time(s.start);
+                if (small.measureText(when) > left) when = s.startText;
                 if (small.measureText(when) <= left) c.drawText(when, sx, y + px(29.5f), small);
             }
             c.restore();

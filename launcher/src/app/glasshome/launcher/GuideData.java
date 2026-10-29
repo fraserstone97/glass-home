@@ -14,6 +14,7 @@ import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.Collections;
+import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
@@ -58,6 +59,8 @@ final class GuideData {
     static final class Show {
         String title, subtitle, image, catchUp;
         long start, end;
+        /** Its times as the guide shows them (21:00, and 21:00 to 22:30): made once, not every frame. */
+        String startText, times;
         Channel channel;
         /** Catch-up: from when until when it can be watched in the channel's app. */
         long availableFrom, availableTo;
@@ -92,21 +95,21 @@ final class GuideData {
         return c.getTimeInMillis();
     }
 
+    /** A date format in London's time. */
+    static SimpleDateFormat format(String pattern) {
+        SimpleDateFormat f = new SimpleDateFormat(pattern, Locale.UK);
+        f.setTimeZone(LONDON);
+        return f;
+    }
+
     // ---------------------------------------------------------------- channels
 
     /** The channels the Guide can open, in channel-number order; from disk when fresh. */
     static List<Channel> channels(Context c) throws Exception {
-        File f = new File(c.getFilesDir(), "guide_channels.json");
-        String json = fresh(f, DAY) ? read(f) : null;
-        if (json == null) {
-            try {
-                json = get(API + "channel-list?nid=" + NID);
-                Suggestions.save(f, json);
-            } catch (Exception e) {
-                if (!f.exists()) throw e;
-                json = read(f);  // offline: the last list
-            }
-        }
+        return load(new File(c.getFilesDir(), "guide_channels.json"), DAY, API + "channel-list?nid=" + NID, GuideData::parseChannels);
+    }
+
+    static List<Channel> parseChannels(String json) throws Exception {
         JSONArray a = new JSONObject(json).getJSONObject("data").getJSONArray("services");
         List<Channel> out = new ArrayList<>();
         for (int i = 0; i < a.length(); i++) {
@@ -143,20 +146,13 @@ final class GuideData {
         // A day that is over doesn't change, but its catch-up does: kept for a day, then fetched again.
         long now = System.currentTimeMillis();
         boolean past = addDays(midnight, 1) < now;
-        String json = fresh(f, past ? DAY : FRESH_MS) ? read(f) : null;
-        if (json == null) {
-            try {
-                json = get(API + "tv-guide?nid=" + NID + "&start=" + midnight / 1000);
-                if (json.isEmpty()) throw new java.io.IOException("empty");
-                Suggestions.save(f, json);
-            } catch (Exception e) {
-                if (!f.exists()) throw e;
-                json = read(f);
-            }
-        }
+        return load(f, past ? DAY : FRESH_MS, API + "tv-guide?nid=" + NID + "&start=" + midnight / 1000, GuideData::parseDay);
+    }
+
+    static Map<String, List<Show>> parseDay(String json) throws Exception {
         Map<String, List<Show>> out = new HashMap<>();
         JSONArray progs = new JSONObject(json).getJSONObject("data").getJSONArray("programs");
-        SimpleDateFormat iso = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssZ", Locale.UK);
+        SimpleDateFormat iso = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssZ", Locale.UK), hm = format("HH:mm");
         for (int i = 0; i < progs.length(); i++) {
             JSONObject p = progs.getJSONObject(i);
             JSONArray events = p.optJSONArray("events");
@@ -172,6 +168,8 @@ final class GuideData {
                 }
                 s.end = s.start + duration(e.optString("duration"));
                 if (s.end <= s.start) continue;
+                s.startText = hm.format(new Date(s.start));
+                s.times = s.startText + " \u2013 " + hm.format(new Date(s.end));
                 s.title = e.optString("main_title");
                 String sub = e.optString("secondary_title", "");
                 // BBC's "subtitle" is often just the date; that's on screen already.
@@ -249,6 +247,34 @@ final class GuideData {
     }
 
     // ---------------------------------------------------------------- network and disk
+
+    interface Parse<T> {
+        T from(String json) throws Exception;
+    }
+
+    /**
+     * The copy on disk while it's fresh, else fetched; the last copy when offline. A reply is kept
+     * only once it reads (an empty or broken one would otherwise be the copy for hours), and a
+     * fresh copy that doesn't read is thrown away and fetched again.
+     */
+    static <T> T load(File f, long freshFor, String url, Parse<T> parse) throws Exception {
+        if (fresh(f, freshFor)) {
+            try {
+                return parse.from(read(f));
+            } catch (Exception bad) {
+                f.delete();
+            }
+        }
+        try {
+            String json = get(url);
+            T out = parse.from(json);
+            Suggestions.save(f, json);
+            return out;
+        } catch (Exception e) {
+            if (!f.exists()) throw e;
+            return parse.from(read(f));  // offline: the last copy
+        }
+    }
 
     static boolean fresh(File f, long ms) {
         return f.exists() && System.currentTimeMillis() - f.lastModified() < ms;
