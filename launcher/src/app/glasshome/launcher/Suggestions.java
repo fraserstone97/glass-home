@@ -79,7 +79,7 @@ final class Suggestions {
             new Provider(350, "Apple TV", "com.apple.atve.androidtv.appletv", "atp", "appletvplus"),
             new Provider(39, "NOW", "com.bskyb.nowtv.beta", "ntv", "nowtv"),
             new Provider(1899, "HBO Max", "com.wbd.stream", "mxx", "max"),
-            new Provider(531, "Paramount+", "com.cbs.ott", "pmp", "paramountplus"));
+            new Provider(531, "Paramount+", "com.cbs.ca", "pmp", "paramountplus"));  // the UK app, not the US one (com.cbs.ott)
 
     /**
      * The services that are free to watch (iPlayer, ITVX, Channel 4): their shelves take free and

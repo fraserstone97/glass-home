@@ -69,8 +69,8 @@ public class DetailActivity extends Activity {
             + " ageCertification genres { shortName } productionCountries backdrops { backdropUrl }"
             + " credits { name role characterName } scoring { imdbScore tomatoMeter certifiedFresh } externalIds { tmdbId } }"
             + " offers(country: $c, platform: WEB) { monetizationType presentationType retailPrice(language: $l) standardWebURL"
-            + " package { clearName technicalName icon(profile: S100)"
-            + " addonParent(country: $c, platform: WEB) { technicalName clearName icon(profile: S100) } } } }"
+            + " package { clearName technicalName icon(profile: S166)"
+            + " addonParent(country: $c, platform: WEB) { technicalName clearName icon(profile: S166) } } } }"
             + " ... on Show { totalSeasonCount seasons { totalEpisodeCount content(country: $c, language: $l) { seasonNumber }"
             + " offers(country: $c, platform: WEB, filter: {monetizationTypes: [FREE, ADS, BUY]}) { monetizationType"
             + " presentationType elementCount retailPrice(language: $l) retailPriceValue package { technicalName } } } } } }";
@@ -195,7 +195,7 @@ public class DetailActivity extends Activity {
         APPS.put("my5", "com.channel5.my5");
         APPS.put("nowtv", "com.bskyb.nowtv.beta");
         APPS.put("max", "com.wbd.stream");
-        APPS.put("paramountplus", "com.cbs.ott");
+        APPS.put("paramountplus", "com.cbs.ca");  // Paramount+ outside the US (com.cbs.ott is the US app)
         APPS.put("discoverypluseurope", "com.discovery.dplay");
         APPS.put("youtube", "com.google.android.youtube.tv");
         APPS.put("plex", "com.plexapp.android");
@@ -206,6 +206,9 @@ public class DetailActivity extends Activity {
      * where the title is free with ads, so the tier never turns that free run into a sample.
      */
     static final Set<String> PREMIUM_TIERS = new HashSet<>(Arrays.asList("itvpremium", "all4plus"));
+
+    /** Left out of How to Watch altogether (by JustWatch's name for them): Pluto TV. */
+    static final Set<String> NEVER = new HashSet<>(Collections.singletonList("plutotv"));
 
     /** The Apple TV app's row and page scroll (its stiffness 150, damping 30 spring as a curve). */
     static final PathInterpolator SCROLL = new PathInterpolator(0.2f, 0.7f, 0.25f, 1f);
@@ -272,7 +275,7 @@ public class DetailActivity extends Activity {
     String titleText, id;
     /** How many title pages deep this one is, opened from Related. */
     int depth;
-    int screenW, posterW, iconW, logoW;
+    int screenW, posterW, logoW;
 
     int u(float units) {
         return Ui.px(this, units);
@@ -288,7 +291,6 @@ public class DetailActivity extends Activity {
         depth = in.getIntExtra("depth", 0);
         screenW = Math.min(1920, Ui.screen(this).x);
         posterW = u(130);
-        iconW = u(28);
         logoW = u(280);
         // No fill of its own: the window's black is already behind the backdrop.
         FrameLayout root = new FrameLayout(this);
@@ -606,26 +608,87 @@ public class DetailActivity extends Activity {
 
     /**
      * Those logos, fetched once the page is up (each is a download the first time, so the page
-     * doesn't wait for them): each fades in over its initial.
+     * doesn't wait for them): each fades in over its initial, made into a banner like the
+     * installed apps' (bannerFrom).
      */
     void logos(List<Offer> want) {
+        int w = u(56), h = u(32);
         for (Offer o : want) {
             if (gone()) return;
-            Bitmap b = Suggestions.onGpu(Suggestions.image(this, "https://images.justwatch.com" + o.icon.replace("{format}", "png"), "", iconW));
+            Bitmap icon = Suggestions.image(this, "https://images.justwatch.com" + o.icon.replace("{format}", "png"), "", w);
+            Bitmap b = icon == null ? null : Suggestions.onGpu(bannerFrom(icon, w, h));
             if (b == null) continue;
             ui.post(() -> {
                 FrameLayout tile = tiles.get(o);
                 if (tile == null || isDestroyed()) return;
-                ImageView icon = new ImageView(this);
-                icon.setImageBitmap(b);
-                icon.setScaleType(ImageView.ScaleType.FIT_CENTER);
-                icon.setAlpha(0f);
-                tile.addView(icon, new FrameLayout.LayoutParams(iconW, iconW, Gravity.CENTER));
+                ImageView banner = new ImageView(this);
+                banner.setImageBitmap(b);
+                banner.setScaleType(ImageView.ScaleType.FIT_XY);
+                banner.setClipToOutline(true);
+                GradientDrawable shape = new GradientDrawable();
+                shape.setCornerRadius(u(7));
+                banner.setBackground(shape);
+                banner.setAlpha(0f);
+                tile.addView(banner, new FrameLayout.LayoutParams(-1, -1));
                 View initial = tile.getChildAt(0);
-                icon.animate().alpha(1f).setDuration(240).setInterpolator(LINEAR).start();
+                // The glass tile goes once it's covered, so no grey shows at the banner's corners.
+                banner.animate().alpha(1f).setDuration(240).setInterpolator(LINEAR)
+                        .withEndAction(() -> tile.setBackground(null)).start();
                 initial.animate().alpha(0f).setDuration(240).setInterpolator(LINEAR).start();
             });
         }
+    }
+
+    /**
+     * A service's square icon (JustWatch's: its logo on its own colour) as a TV banner for a card,
+     * like the installed apps' banners beside it: the colour fills the card and the logo sits
+     * across the middle, rather than a small square on grey. An icon whose edge isn't one colour
+     * (a picture) is shown whole, at the card's height, on its edge's average.
+     */
+    static Bitmap bannerFrom(Bitmap icon, int w, int h) {
+        int iw = icon.getWidth(), ih = icon.getHeight();
+        int[] px = new int[iw * ih];
+        icon.getPixels(px, 0, iw, 0, 0, iw, ih);
+        // Its colour: the edge all round.
+        long r = 0, g = 0, b = 0;
+        int n = 0;
+        for (int i = 0; i < px.length; i++) {
+            int x = i % iw, y = i / iw;
+            if (x != 0 && y != 0 && x != iw - 1 && y != ih - 1) continue;
+            r += Color.red(px[i]);
+            g += Color.green(px[i]);
+            b += Color.blue(px[i]);
+            n++;
+        }
+        int bg = Color.rgb((int) (r / n), (int) (g / n), (int) (b / n));
+        // The logo: whatever differs from it. Edge pixels that differ make it a picture.
+        int left = iw, top = ih, right = -1, bottom = -1, odd = 0;
+        for (int i = 0; i < px.length; i++) {
+            int p = px[i];
+            int d = Math.max(Math.abs(Color.red(p) - Color.red(bg)),
+                    Math.max(Math.abs(Color.green(p) - Color.green(bg)), Math.abs(Color.blue(p) - Color.blue(bg))));
+            if (d <= 40) continue;
+            int x = i % iw, y = i / iw;
+            if (x == 0 || y == 0 || x == iw - 1 || y == ih - 1) odd++;
+            left = Math.min(left, x);
+            right = Math.max(right, x);
+            top = Math.min(top, y);
+            bottom = Math.max(bottom, y);
+        }
+        Bitmap out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+        android.graphics.Canvas c = new android.graphics.Canvas(out);
+        c.drawColor(bg);
+        android.graphics.Paint paint = new android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG);
+        if (right < 0 || odd > n / 10) {
+            c.drawBitmap(icon, null, new Rect((w - h) / 2, 0, (w + h) / 2, h), paint);
+            return out;
+        }
+        // The logo as large as the installed apps' are on theirs: most of the card's height.
+        Rect from = new Rect(left, top, right + 1, bottom + 1);
+        float s = Math.min(w * 0.8f / from.width(), h * 0.72f / from.height());
+        float dw = from.width() * s, dh = from.height() * s;
+        c.drawBitmap(icon, from, new android.graphics.RectF((w - dw) / 2, (h - dh) / 2, (w + dw) / 2, (h + dh) / 2), paint);
+        return out;
     }
 
     void show(JSONObject n, List<Offer> offers) {
@@ -969,6 +1032,8 @@ public class DetailActivity extends Activity {
             String own = pk.optString("technicalName"), tech = own, clear = str(pk, "clearName"), icon = str(pk, "icon");
             // Sky Go comes with a Sky TV subscription, not one you'd take out to watch this.
             if ("skygo".equals(own) || clear.equalsIgnoreCase("Sky Go")) continue;
+            // Services never suggested as a way to watch, whatever they have.
+            if (NEVER.contains(own)) continue;
             JSONObject parent = pk.optJSONObject("addonParent");
             String addon = null;
             if ("amazonprimevideowithads".equals(own) || "amazonimdbtv".equals(own)) {
