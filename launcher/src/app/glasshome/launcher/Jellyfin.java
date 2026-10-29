@@ -236,7 +236,8 @@ final class Jellyfin {
     static synchronized List<String[]> owned(Context c) {
         File f = indexFile(c);
         if (!connected(c) || !f.exists()) return new ArrayList<>();
-        if (f.lastModified() != ownedStamp) {
+        long stamp = f.lastModified();  // before reading: a newer file swapped in meanwhile is read next time
+        if (stamp != ownedStamp) {
             try {
                 JSONArray a = new JSONArray(new String(Suggestions.readAll(new FileInputStream(f)), StandardCharsets.UTF_8));
                 List<String[]> out = new ArrayList<>();
@@ -245,7 +246,7 @@ final class Jellyfin {
                     out.add(new String[]{t.optString(0), t.optString(1), t.optString(2), t.optString(3), t.optString(4)});
                 }
                 owned = out;
-                ownedStamp = f.lastModified();
+                ownedStamp = stamp;
             } catch (Exception e) {
                 return new ArrayList<>();
             }
@@ -302,7 +303,7 @@ final class Jellyfin {
                 continue;
             }
             int y = Suggestions.parseInt(m[2]);
-            if (!want.isEmpty() && SearchBrain.norm(m[1]).equals(want) && (year <= 0 || y <= 0 || Math.abs(y - year) <= 1)) return m[0];
+            if (!want.isEmpty() && SearchBrain.norm(Suggestions.cleanTitle(m[1])).equals(want) && (year <= 0 || y <= 0 || Math.abs(y - year) <= 1)) return m[0];
         }
         return null;
     }
@@ -331,13 +332,14 @@ final class Jellyfin {
     static synchronized List<Suggestions.Item> cached(Context c) {
         File f = file(c);
         if (!connected(c) || !f.exists()) return null;
-        if (f.lastModified() != shelfStamp) {
+        long stamp = f.lastModified();  // before reading, as owned() does
+        if (stamp != shelfStamp) {
             try {
                 JSONArray a = new JSONArray(new String(Suggestions.readAll(new FileInputStream(f)), StandardCharsets.UTF_8));
                 List<Suggestions.Item> out = new ArrayList<>();
                 for (int i = 0; i < a.length(); i++) out.add(Suggestions.Item.fromJson(a.getJSONObject(i)));
                 shelf = out;
-                shelfStamp = f.lastModified();
+                shelfStamp = stamp;
             } catch (Exception e) {
                 return null;
             }

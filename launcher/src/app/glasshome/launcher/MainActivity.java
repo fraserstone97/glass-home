@@ -2769,11 +2769,10 @@ public class MainActivity extends Activity {
                 Jellyfin.cached(this);  // the new shelf read here, not when Wholphin is next focused
                 handler.post(() -> {
                     jellyfinLoading = false;
-                    if (fresh != null && fresh.size() > 1 && Jellyfin.WHOLPHIN.equals(shelfPkg)) {
-                        heroDissolve = true;
-                        setHeroItems(fresh);
-                        heroDissolve = false;
-                    } else if (fresh != null && fresh.size() > 1 && shelfPkg == null) {
+                    // A new draw isn't put over the shelf on screen (it dissolved to other titles a
+                    // moment after Wholphin was settled on, or while you browsed it): it's saved,
+                    // and shown next time. Only a first one, with nothing saved before, shows now.
+                    if (fresh != null && fresh.size() > 1 && shelfPkg == null) {
                         handler.post(shelfUpdate);  // first fetch: show it if Wholphin is in focus
                     }
                 });

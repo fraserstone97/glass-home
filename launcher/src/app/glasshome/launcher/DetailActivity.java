@@ -927,6 +927,8 @@ public class DetailActivity extends Activity {
     String library(JSONObject n) {
         String found = getIntent().getStringExtra("jellyfin");
         JSONObject c = n.optJSONObject("content");
+        // (Played in Wholphin: without it the button would do nothing.)
+        if (!Suggestions.installed(this, Jellyfin.WHOLPHIN)) return null;
         if (found != null || c == null || !Jellyfin.connected(this)) return found;
         JSONObject ext = c.optJSONObject("externalIds");
         int tmdb = ext == null ? 0 : Suggestions.parseInt(ext.optString("tmdbId"));
