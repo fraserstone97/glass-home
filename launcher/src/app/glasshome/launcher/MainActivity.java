@@ -287,8 +287,11 @@ public class MainActivity extends Activity {
 
     final Runnable shelfUpdate = () -> {
         // Full screen shows every service's titles: an app's own shelf comes back with the dock
-        // (exitIdle), never from a refresh or a press that landed on the way to full screen.
-        if (MainActivity.this.idle) return;
+        // (exitIdle), never from a refresh or a press that landed on the way to full screen. Nor
+        // while Home is away (an app opening, the screen saver) or the App Switcher is up: its
+        // return asks again (resumeWork, AppSwitcher.close).
+        MainActivity h = MainActivity.this;
+        if (h.idle || !h.resumed || h.appOpened || h.switcher != null) return;
         if (focusedIndex >= 0 && focusedIndex < shown.size()) {
             shelfFor(shown.get(focusedIndex), hasDock() && focusedIndex < COLS);
         }
@@ -842,7 +845,8 @@ public class MainActivity extends Activity {
         // Home's focus tick, as tvOS plays it: only for a move an arrow made (none for focus Home
         // puts somewhere itself, nor for a press into a wall), panned to where focus landed.
         root.getViewTreeObserver().addOnGlobalFocusChangeListener((was, now) -> {
-            if (now == null || SystemClock.uptimeMillis() - arrowAt > 150) return;
+            // (The ScrollView itself holds focus for a moment while move mode rebuilds the grid.)
+            if (now == null || now == scroll || SystemClock.uptimeMillis() - arrowAt > 150) return;
             float x = 0.5f;
             if (now.isLaidOut()) {
                 now.getLocationOnScreen(focusLoc);
@@ -1299,13 +1303,48 @@ public class MainActivity extends Activity {
     }
 
     void invalidateGlass() {
-        if (dockRow != null) dockRow.invalidate();
+        // Not while the dock is slid away (full screen): out of sight, its glass would be drawn
+        // again for nothing, from the wrong part of the picture.
+        if (dockRow != null && !dockAway) dockRow.invalidate();
         // Each glass view redraws itself: invalidating a parent doesn't redraw its children, which
         // left the gear and clock showing an old picture (the wallpaper) behind them.
         invalidateTree(clockBox);
         invalidateTree(weatherCard);
         if (menuLayer != null && menuLayer.getChildCount() > 1) menuLayer.getChildAt(1).invalidate();
         if (hintView != null && hintView.getParent() != null) hintView.invalidate();
+    }
+
+    /** The dock is slid away below the screen, or on its way there. */
+    boolean dockAway;
+
+    /**
+     * While the dock slides away and back, its glass shows the picture where the dock rests
+     * (pinned there), so it comes back showing what's behind it rather than the bottom of the
+     * screen it passed, then brightening as it landed.
+     */
+    void pinDockGlass(boolean pin) {
+        if (dockRow == null || !(dockRow.getBackground() instanceof LiquidGlass)) return;
+        LiquidGlass g = (LiquidGlass) dockRow.getBackground();
+        if (!pin) {
+            g.fixedLoc = null;
+            return;
+        }
+        int[] at = new int[2];
+        dockRow.getLocationOnScreen(at);
+        g.fixedLoc = new int[]{at[0], at[1] - Math.round(scroll.getTranslationY())};
+    }
+
+    /** The dock on its way back: its glass drawn afresh (for where it rests) as it comes. */
+    void dockBack() {
+        dockAway = false;
+        pinDockGlass(true);
+        if (dockRow != null) dockRow.invalidate();
+    }
+
+    /** The dock has landed: its glass follows the picture where it is again. */
+    void dockLanded() {
+        pinDockGlass(false);
+        invalidateGlass();
     }
 
     static void invalidateTree(View v) {
@@ -2347,7 +2386,9 @@ public class MainActivity extends Activity {
         mlp.topMargin = dp(10);
         heroInfo.addView(heroMeta, mlp);
         heroOverview = text(12.5f, Ui.font(this, "regular"), 0.8f);
-        heroOverview.setMaxLines(2);
+        // Always two lines tall, shown or not: coming and going (GONE) it changed the block's
+        // height, and the title above jumped by it as the carousel took focus or let it go.
+        heroOverview.setLines(2);
         heroOverview.setEllipsize(TextUtils.TruncateAt.END);
         heroOverview.setLineSpacing(0, 1.15f);
         LinearLayout.LayoutParams olp = new LinearLayout.LayoutParams(dp(380), ViewGroup.LayoutParams.WRAP_CONTENT);
@@ -2375,7 +2416,7 @@ public class MainActivity extends Activity {
         // Overview and button only show while the carousel itself is focused (tvOS).
         heroOverview.setAlpha(0f);
         heroButton.setAlpha(0f);
-        heroOverview.setVisibility(View.GONE);
+        heroOverview.setVisibility(View.INVISIBLE);
         heroButton.setVisibility(View.GONE);
         FrameLayout.LayoutParams ilp = new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM | Gravity.START);
@@ -2482,7 +2523,20 @@ public class MainActivity extends Activity {
 
     /** Info block sits just above the dock while a dock app is focused. */
     float heroInfoRestY() {
-        return -(screenH - shelfH) + dp(40) - dp(36);
+        // (Lower by the summary's room, which it keeps while hidden: the title stays where it was.)
+        return -(screenH - shelfH) + dp(40) - dp(36) + overviewRoom();
+    }
+
+    /** The summary's room in the info block, two lines and the gap above them, as laid out. */
+    int overviewRoom;
+
+    int overviewRoom() {
+        if (overviewRoom == 0) {
+            heroOverview.measure(View.MeasureSpec.makeMeasureSpec(dp(380), View.MeasureSpec.EXACTLY),
+                    View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED));
+            overviewRoom = heroOverview.getMeasuredHeight() + ((LinearLayout.LayoutParams) heroOverview.getLayoutParams()).topMargin;
+        }
+        return overviewRoom;
     }
 
     /** Where the info block is headed: a slide change cancels its animator, so it puts it back on course. */
@@ -2557,7 +2611,7 @@ public class MainActivity extends Activity {
             heroItems = new ArrayList<>();
             shelfPkg = null;  // no app's own shelf left for a refresh to bring back
             shelfView.setFocusable(false);
-            setHeroShown(false);
+            noShelf();
             reportDrawn();  // no carousel: Home is complete with its dock
             return;
         }
@@ -2617,6 +2671,8 @@ public class MainActivity extends Activity {
 
     /** A new full carousel: kept as the mix, shown unless an app's own shelf is up. */
     void setHeroBase(List<Suggestions.Item> items) {
+        // (A fetch still on its way when the shelf was turned off doesn't bring it back.)
+        if (!Suggestions.showRecs(this) || !Suggestions.ready(this)) return;
         heroAll = items;
         if (shelfPkg == null) {
             setHeroItems(mix());
@@ -2703,21 +2759,32 @@ public class MainActivity extends Activity {
             }
         }
         if (items.isEmpty()) {
-            setHeroShown(false);
+            noShelf();
             if (!idle) heroChrome(0, 200);
             return;
         }
         // The carousel shows unless focus is down in the app grid: a list refreshed while the
         // status row (gear, weather) or nothing had focus used to hide it behind the drawer's glass.
-        View f = getCurrentFocus();
+        // With a menu open, where it was opened from (the menu's rows aren't the grid's).
+        View f = menuLayer != null && menuReturnFocus != null ? menuReturnFocus : getCurrentFocus();
         int i = tiles.indexOf(f);
         boolean inGrid = i >= 0 && !(hasDock() && i < COLS);
         setHeroShown(f == null ? heroShown || tiles.isEmpty() || focusedIndex < COLS : !inGrid);
         // The side chevrons, for a shelf refreshed to one title or to more. Not going idle, which
         // switches to the mix on its way and brings the extras up on its own, slower timing.
         if (!idle) heroChrome(0, 200);
-        if (!(same && items.get(keep).title.equals(curTitle))) showHero(keep, heroDissolve && heroShown ? 2 : 0);
-        else dotRow.select(keep, false);
+        // A shelf on screen changing (a refresh, another app's) dissolves; only a first one, or
+        // one restarted out of sight (turnShelf), is put up at once.
+        if (!(same && items.get(keep).title.equals(curTitle))) {
+            showHero(keep, heroShown && (heroDissolve || same) ? 2 : 0);
+        } else {
+            dotRow.select(keep, true);
+            // The same title, but the new list's (another service's badge, its own link).
+            if (items.get(keep) != shownItem) {
+                Drawable d = heroLogo.getDrawable();
+                fillHeroInfo(items.get(keep), d instanceof BitmapDrawable ? ((BitmapDrawable) d).getBitmap() : null);
+            }
+        }
         // Fetching the rest of the shelf's artwork ahead happens in its own lane, so the picture
         // you're about to see never waits behind it; a newer shelf stops an older one's fetching.
         List<Suggestions.Item> pre = items;
@@ -2737,12 +2804,30 @@ public class MainActivity extends Activity {
         });
     }
 
+    /**
+     * No shelf to show (Top Shelf off, or nothing on it): the wallpaper comes back behind
+     * everything, with its glass, and the last picture goes. Its blurred copy stayed behind the
+     * apps as Home's background, and the wallpaper never came back.
+     */
+    void noShelf() {
+        setHeroShown(false);
+        heroReq++;  // a picture still on its way is for the shelf that's gone
+        heroDrawer = null;
+        heroBlur = null;
+        for (ImageView v : heroLayers()) releaseHeroLayer(v);
+        wallView.setVisibility(View.VISIBLE);
+        drawerBack.animate().cancel();
+        drawerBack.animate().alpha(0f).setDuration(420).setInterpolator(HERO_EASE)
+                .withEndAction(() -> drawerBack.setImageDrawable(null)).start();
+        glassTo(wallBlur, 420);
+    }
+
     /** Carousel vs launcher background: crossfade between them. */
     void setHeroShown(boolean show) {
         show = show && !heroItems.isEmpty() && !folderMode;
         if (show == heroShown) return;
         heroShown = show;
-        boolean glassy = !show && heroDrawer != null;
+        boolean glassy = !show && heroDrawer != null && !heroItems.isEmpty();
         glassTo((show || glassy) && heroBlur != null ? heroBlur : wallBlur, show ? 480 : 420);
         float a = show ? 1f : 0f;
         drawerBack.animate().cancel();
@@ -2776,7 +2861,10 @@ public class MainActivity extends Activity {
             drawerBack.animate().alpha(0f).setDuration(420).setInterpolator(HERO_EASE).start();
             heroFront.animate().cancel();
             heroFront.animate().alpha(a).setDuration(show ? 480 : 420).setInterpolator(HERO_EASE).withEndAction(() -> {
-                if (heroShown && heroFront.getAlpha() >= 1f) wallView.setVisibility(View.INVISIBLE);
+                // Only once there's a picture to cover it: the first can still be on its way.
+                if (heroShown && heroFront.getAlpha() >= 1f && heroFront.getDrawable() != null) {
+                    wallView.setVisibility(View.INVISIBLE);
+                }
             }).start();
             for (ImageView v : heroLayers()) {
                 if (v != heroFront) v.animate().alpha(0f).setDuration(show ? 480 : 420).setInterpolator(HERO_EASE).start();
@@ -2890,7 +2978,10 @@ public class MainActivity extends Activity {
         int sec = Suggestions.advanceSeconds(this);
         // Not while a card is being moved: the picture holds still, as tvOS's top shelf does in edit
         // mode, and each step's grid rebuild doesn't share its frames with a dissolve.
-        if (sec > 0 && heroShown && resumed && switcher == null && moveIndex < 0) handler.postDelayed(heroAdvance, sec * 1000L);
+        // Nor behind the forecast: its glass would keep the old picture's colours.
+        if (sec > 0 && heroShown && resumed && switcher == null && moveIndex < 0 && forecastLayer == null) {
+            handler.postDelayed(heroAdvance, sec * 1000L);
+        }
     }
 
     void heroStep(int dir, boolean user) {
@@ -3105,7 +3196,11 @@ public class MainActivity extends Activity {
                 }).start();
     }
 
+    /** The title the info block shows now (its own item: badge, button, link). */
+    Suggestions.Item shownItem;
+
     void fillHeroInfo(Suggestions.Item it, Bitmap logo) {
+        shownItem = it;
         // Full screen keeps its own: no capsule, and every title's summary (see enterIdle).
         if (shelfView.isFocused() && !idle) {
             heroButton.setVisibility(View.VISIBLE);
@@ -3114,7 +3209,7 @@ public class MainActivity extends Activity {
         if (!shelfView.isFocused() && !idle) {  // tvOS: the overview shows only when the shelf is focused
             heroOverview.animate().cancel();
             heroOverview.setAlpha(0f);
-            heroOverview.setVisibility(View.GONE);
+            heroOverview.setVisibility(View.INVISIBLE);
         }
         heroTitle.setText(it.title);
         heroTitle.setVisibility(View.VISIBLE);
@@ -3129,7 +3224,7 @@ public class MainActivity extends Activity {
         heroOverview.setText(it.overview);
         if (idle) {
             // After the text, so it follows the new title's (some have no summary).
-            heroOverview.setVisibility(heroOverview.getText().length() > 0 ? View.VISIBLE : View.GONE);
+            heroOverview.setVisibility(heroOverview.getText().length() > 0 ? View.VISIBLE : View.INVISIBLE);
             heroOverview.setAlpha(0.85f);
         }
         Suggestions.Provider p = it.provider();
@@ -3175,6 +3270,9 @@ public class MainActivity extends Activity {
      * a little together towards the side you pressed, as one movement.
      */
     void crossfadeHero(Bitmap bd, int dir) {
+        // Nothing on screen yet (the first picture): it dissolves in over the wallpaper rather
+        // than popping up.
+        if (dir == 0 && heroShown && heroFront.getDrawable() == null) dir = 2;
         ImageView next = heroUnder;
         if (next.getAlpha() > 0f && heroBack.getAlpha() < 1f) {
             // A third press mid-fade: the oldest picture is needed for the new one, so the one
@@ -3273,6 +3371,8 @@ public class MainActivity extends Activity {
             heroButton.animate().scaleX(1.08f).scaleY(1.08f).setStartDelay(0).setDuration(420).setInterpolator(LIFT).start();
             heroButton.setElevation(dp(10));
             scrollToY(0, true);
+            dockAway = true;
+            pinDockGlass(true);
             // Slid as it is, not as a GPU layer: the dock card settling inside it would have the
             // whole grid re-rendered into the layer every frame (the dock's glass has its own).
             scroll.animate().translationY(screenH - shelfH + dp(30)).setDuration(500).setInterpolator(EASE)
@@ -3287,11 +3387,12 @@ public class MainActivity extends Activity {
         } else {
             heroButton.animate().scaleX(1f).scaleY(1f).setStartDelay(0).setDuration(240).setInterpolator(EASE).start();
             heroButton.setElevation(0);
+            dockBack();
             scroll.animate().translationY(0).setDuration(450).setInterpolator(EASE)
-                    .setUpdateListener(null).withEndAction(this::invalidateGlass).start();
+                    .setUpdateListener(null).withEndAction(this::dockLanded).start();
             moveHeroInfo(heroInfoRestY(), 450, EASE);
             heroOverview.animate().alpha(0f).setDuration(160).setStartDelay(0).setInterpolator(EASE)
-                    .withEndAction(() -> heroOverview.setVisibility(View.GONE)).start();
+                    .withEndAction(() -> heroOverview.setVisibility(View.INVISIBLE)).start();
             heroButton.animate().alpha(0f).setDuration(160).setStartDelay(0).setInterpolator(EASE)
                     .withEndAction(() -> heroButton.setVisibility(View.GONE)).start();
             heroChrome(120, 400);  // the chevron and hint come back up with the dock
@@ -3665,31 +3766,38 @@ public class MainActivity extends Activity {
             weatherCard.setAlpha(0f);
             buildGrid();
             scrollToY(0, false);
+            // Already up under the zoom in, as on the way out: lifting during it had the whole
+            // grid drawn afresh each frame.
+            snapFocus = true;
             focusIndex(0);
+            snapFocus = false;
         });
     }
 
     void exitFolder() {
         animateGridSwap(() -> {
             folderMode = false;
-            weatherCard.animate().alpha(weatherAlpha()).setDuration(250).setInterpolator(EASE).start();
             buildGrid();
             // Under the zoom back in: the folder's card is already up and its row in view.
             int i = indexOfKey(FOLDER_KEY);
             snapFocus = true;
             focusIndex(i >= 0 ? i : 0, false);
             snapFocus = false;
+            // The weather pill for where the grid has scrolled to (read before, it came back over
+            // the apps' cards), once focusIndex's scroll has been made.
+            scroll.post(() -> weatherCard.animate().alpha(weatherAlpha()).setDuration(250).setInterpolator(EASE).start());
         });
     }
 
     /** Quick zoom-through between home and folder, so it reads as "opening" the folder. */
     void animateGridSwap(Runnable swap) {
-        scroll.animate().alpha(0f).scaleX(0.94f).scaleY(0.94f).setDuration(140).setInterpolator(EASE)
+        // On a layer each way: the grid, still while it zooms, is drawn once rather than every frame.
+        scroll.animate().alpha(0f).scaleX(0.94f).scaleY(0.94f).setDuration(140).setInterpolator(EASE).withLayer()
                 .withEndAction(() -> {
                     swap.run();
                     scroll.setScaleX(1.04f);
                     scroll.setScaleY(1.04f);
-                    scroll.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(260).setInterpolator(EASE)
+                    scroll.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(260).setInterpolator(EASE).withLayer()
                             .withEndAction(null).start();
                 }).start();
     }
@@ -4724,6 +4832,8 @@ public class MainActivity extends Activity {
         idleInfoY = heroInfoY;
         idleOverviewShown = heroOverview.getVisibility() == View.VISIBLE;
         scroll.animate().cancel();
+        dockAway = true;
+        pinDockGlass(true);
         // The apps slide away whole, as on tvOS: no fade, so no full-screen layer to blend. Only as
         // far as the carousel focused takes them (the dock just out of sight), so the whole move is
         // seen, setting off gently: nothing was pressed for it. All the way down to the bottom of
@@ -4735,7 +4845,7 @@ public class MainActivity extends Activity {
         weatherCard.animate().alpha(0f).setDuration(500).setInterpolator(EASE).start();
         heroButton.animate().alpha(0f).setDuration(300).setInterpolator(EASE).start();
         heroOverview.animate().cancel();
-        heroOverview.setVisibility(heroOverview.getText().length() > 0 ? View.VISIBLE : View.GONE);
+        heroOverview.setVisibility(heroOverview.getText().length() > 0 ? View.VISIBLE : View.INVISIBLE);
         heroOverview.animate().alpha(0.85f).setDuration(600).setInterpolator(EASE).start();
         handler.removeCallbacks(heroAdvance);
         scheduleAdvance();
@@ -4772,8 +4882,11 @@ public class MainActivity extends Activity {
             snapFocus = false;
         }
         scroll.animate().cancel();
+        // (The carousel still focused: the dock stays away.)
+        boolean back = idleScrollY < screenH - shelfH;
+        if (back) dockBack();
         scroll.animate().translationY(idleScrollY).setDuration(450).setInterpolator(EASE)
-                .setUpdateListener(null).withEndAction(this::invalidateGlass).start();
+                .setUpdateListener(null).withEndAction(back ? this::dockLanded : this::invalidateGlass).start();
         moveHeroInfo(idleInfoY, 450, EASE);
         heroChrome(0, 200);
         weatherCard.animate().alpha(toGrid ? 0f : weatherAlpha()).setDuration(350).setInterpolator(EASE).start();
@@ -4783,7 +4896,7 @@ public class MainActivity extends Activity {
         }
         if (!idleOverviewShown) {
             heroOverview.animate().alpha(0f).setDuration(200).setInterpolator(EASE)
-                    .withEndAction(() -> heroOverview.setVisibility(View.GONE)).start();
+                    .withEndAction(() -> heroOverview.setVisibility(View.INVISIBLE)).start();
         }
         resetIdle();
         scanAfter(500);  // once the apps have slid back up
@@ -4868,6 +4981,7 @@ public class MainActivity extends Activity {
 
         root.addView(layer, match());
         forecastLayer = layer;
+        handler.removeCallbacks(heroAdvance);  // the carousel holds still behind it
         weatherOpen = true;
         // The forecast grows out of the pill, from its corner, as the Apple TV app's menus come
         // out of what opened them (from 0.35 of its size, fading up, easeOut 380 ms); the pill
@@ -4916,6 +5030,7 @@ public class MainActivity extends Activity {
                     .withEndAction(() -> root.removeView(l)).start();
         }
         weatherOpen = false;
+        scheduleAdvance();
         if (popoverReturn != null && popoverReturn.isAttachedToWindow()) popoverReturn.requestFocus();
         else goTop();
         popoverReturn = null;

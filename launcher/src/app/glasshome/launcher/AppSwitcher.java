@@ -354,6 +354,9 @@ final class AppSwitcher {
         backdrop.animate().alpha(0f).setStartDelay(60).setDuration(260).setInterpolator(MainActivity.EASE)
                 .withEndAction(() -> home.root.removeView(layer)).start();
         home.scheduleAdvance();
+        // The focused dock app's own shelf, held back while the switcher was up.
+        home.handler.removeCallbacks(home.shelfUpdate);
+        home.handler.postDelayed(home.shelfUpdate, 260);
     }
 
     /** Gone at once: an app opened from it is now in front. */
