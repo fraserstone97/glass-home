@@ -329,13 +329,33 @@ final class Suggestions {
         return new File(c.getFilesDir(), "suggestions_by_service_5.json");
     }
 
-    /** The titles for the app with this package (its own top shelf), or an empty list. */
+    /** The titles for the app with this package (its own top shelf, from today's lead), or an empty list. */
     static List<Item> forService(Context c, String pkg) {
         Provider p = null;
         for (Provider q : PROVIDERS) if (q.pkg.equals(pkg)) p = q;
         List<Item> l = p == null ? null : byService(c).get(p.id);
-        return l == null ? new ArrayList<>() : new ArrayList<>(l);
+        return l == null ? new ArrayList<>() : turned(new ArrayList<>(l));
     }
+
+    /**
+     * How far along the shelves start. A shelf is only re-drawn when it's refreshed (every two
+     * hours, and only while the TV is on and online), so on its own the same title could open it
+     * for days: instead the lead moves on every day and every time the TV goes off (Home turns
+     * it as the screen goes off), and starts somewhere new each time Home does.
+     */
+    static volatile int turn = new java.util.Random().nextInt(1 << 16);
+
+    /** A shelf from today's lead (turn), its order otherwise kept, so series and films still alternate. */
+    static List<Item> turned(List<Item> l) {
+        if (l.size() < 2) return l;
+        long now = System.currentTimeMillis();
+        long day = (now + java.util.TimeZone.getDefault().getOffset(now)) / 86_400_000L;
+        java.util.Collections.rotate(l, -(int) ((turn + day) % l.size()));
+        return l;
+    }
+
+    /** The last refresh of the shelves and how it went (dumpsys, for checking they do refresh). */
+    static volatile String lastRefresh = "none since Home started";
 
     static Map<Integer, List<Item>> byService = new java.util.HashMap<>();
     static long byServiceStamp = -1;

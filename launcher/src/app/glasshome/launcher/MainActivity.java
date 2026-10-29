@@ -2576,6 +2576,8 @@ public class MainActivity extends Activity {
             if (online && !fetching && stale) {
                 fetching = true;
                 net.execute(() -> {
+                    long began = System.currentTimeMillis();
+                    String at = new java.text.SimpleDateFormat("d MMM HH:mm", java.util.Locale.UK).format(new java.util.Date(began));
                     try {
                         // Queued behind another Home's refresh (after a recreate): just its result.
                         List<Suggestions.Item> fresh = Suggestions.cached(this, false);
@@ -2583,9 +2585,12 @@ public class MainActivity extends Activity {
                         Suggestions.byService(this);  // the new shelves read here, not when a dock app is next focused
                         List<Suggestions.Item> items = fresh;
                         handler.post(() -> setHeroBase(items));
+                        Suggestions.lastRefresh = at + ", " + items.size() + " titles in "
+                                + (System.currentTimeMillis() - began) / 1000 + " s";
                     } catch (Exception e) {
                         // Its kind only: a failed request's message carries its URL, and with it a TMDB key.
                         android.util.Log.w("GlassHome", "suggestions: " + e.getClass().getSimpleName());
+                        Suggestions.lastRefresh = at + ", failed: " + e.getClass().getSimpleName();
                     } finally {
                         fetching = false;
                     }
@@ -2610,7 +2615,26 @@ public class MainActivity extends Activity {
     /** A new full carousel: kept as the mix, shown unless an app's own shelf is up. */
     void setHeroBase(List<Suggestions.Item> items) {
         heroAll = items;
-        if (shelfPkg == null) setHeroItems(items);
+        if (shelfPkg == null) setHeroItems(mix());
+    }
+
+    /** The mix as it's shown: from today's lead (Suggestions.turned). */
+    List<Suggestions.Item> mix() {
+        return Suggestions.turned(new ArrayList<>(heroAll));
+    }
+
+    /**
+     * The TV going off: the shelf on screen moves on to start from its next title, out of sight,
+     * so the TV comes back on to a different one rather than the one it went off on.
+     */
+    void turnShelf() {
+        Suggestions.turn++;
+        if (heroItems.size() < 2) return;
+        List<Suggestions.Item> next = new ArrayList<>(heroItems);
+        // The shelf as it would be read now, one on (the mix, or the app's shelf: both are turned).
+        java.util.Collections.rotate(next, -1);
+        heroItems = new ArrayList<>();  // nothing to keep the place of: it opens on the first
+        setHeroItems(next);
     }
 
     /**
@@ -2625,7 +2649,7 @@ public class MainActivity extends Activity {
         if (own == null || own.size() < 2) pkg = null;
         if (java.util.Objects.equals(pkg, shelfPkg)) return;
         shelfPkg = pkg;
-        List<Suggestions.Item> next = pkg == null ? heroAll : own;
+        List<Suggestions.Item> next = pkg == null ? mix() : own;
         if (next.isEmpty()) return;
         heroDissolve = true;
         setHeroItems(next);
@@ -4317,9 +4341,27 @@ public class MainActivity extends Activity {
     }
 
     /**
+     * `adb shell dumpsys activity app.glasshome.launcher/.MainActivity`: the shelf and when the
+     * shelves were last refreshed, for checking on a TV that they do move on.
+     */
+    @Override
+    public void dump(String prefix, java.io.FileDescriptor fd, java.io.PrintWriter w, String[] args) {
+        long now = System.currentTimeMillis();
+        File mixFile = Suggestions.cacheFile(this), byFile = Suggestions.serviceFile(this);
+        w.println(prefix + "Shelf: " + (shelfPkg == null ? "the mix" : shelfPkg) + ", showing " + heroIndex + " of "
+                + heroItems.size() + ", turn " + Suggestions.turn);
+        for (int i = 0; i < heroItems.size(); i++) w.println(prefix + "  " + i + "  " + heroItems.get(i).title);
+        w.println(prefix + "Saved mix " + (mixFile.exists() ? (now - mixFile.lastModified()) / 60_000 + " min old" : "none")
+                + ", saved app shelves " + (byFile.exists() ? (now - byFile.lastModified()) / 60_000 + " min old" : "none"));
+        w.println(prefix + "Last refresh: " + Suggestions.lastRefresh + (fetching ? " (one running now)" : ""));
+        super.dump(prefix, fd, w, args);
+    }
+
+    /**
      * The TV switched off: a sleep timer ends with it, as TV sleep timers do, so it can't turn the
      * TV off mid-programme after it's switched back on. Only Home's own (running) receiver gets
-     * this; the screen saver doesn't send it, so the timer runs on through that.
+     * this; the screen saver doesn't send it, so the timer runs on through that. The shelf moves
+     * on too (turnShelf).
      */
     BroadcastReceiver screenOffReceiver;
 
@@ -4327,6 +4369,7 @@ public class MainActivity extends Activity {
         screenOffReceiver = new BroadcastReceiver() {
             @Override public void onReceive(Context c, Intent i) {
                 if (SleepReceiver.timerLeft(c) > 0) SleepReceiver.setTimer(c, 0);
+                turnShelf();
             }
         };
         IntentFilter f = new IntentFilter(Intent.ACTION_SCREEN_OFF);
