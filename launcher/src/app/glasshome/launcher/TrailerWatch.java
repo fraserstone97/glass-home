@@ -55,6 +55,8 @@ final class TrailerWatch {
     private static int task;
     /** When the trailer was asked for, so a session YouTube already had counts only once it plays it. */
     private static long askedAt;
+    /** The same, by the clock: what came to the front is read only from then on (youTubeInFront). */
+    private static long askedWall;
     /** YouTube's session, once it's playing the trailer, and what it calls it. */
     private static MediaController yt;
     private static String title;
@@ -85,6 +87,7 @@ final class TrailerWatch {
         listener = new ComponentName(application, MediaListener.class);
         task = page.getTaskId();
         askedAt = SystemClock.elapsedRealtime();
+        askedWall = System.currentTimeMillis();
         on = true;
         try {
             sessions.addOnActiveSessionsChangedListener(changed, listener, ui);
@@ -308,11 +311,15 @@ final class TrailerWatch {
         }
     }
 
-    /** YouTube last came to the front, by Android's usage history (Home's App Switcher reads the same). */
+    /**
+     * YouTube last came to the front, by Android's usage history (Home's App Switcher reads the
+     * same): only since the trailer was asked for, as it's read on Back, where hours of history
+     * cost the press its quickness.
+     */
     static boolean youTubeInFront() {
         UsageStatsManager um = application.getSystemService(UsageStatsManager.class);
         long now = System.currentTimeMillis();
-        UsageEvents events = um == null ? null : um.queryEvents(now - 6 * 3600_000L, now);
+        UsageEvents events = um == null ? null : um.queryEvents(Math.max(now - 6 * 3600_000L, askedWall - 10_000L), now);
         if (events == null) return true;
         String front = null;
         UsageEvents.Event e = new UsageEvents.Event();

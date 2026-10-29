@@ -294,9 +294,10 @@ public class TrailerActivity extends Activity {
     }
 
     @Override
-    protected void onPause() {
-        super.onPause();
+    protected void onStop() {
+        super.onStop();
         // Leaving (Home, another app): the trailer stops, and isn't waiting when Search comes back.
+        // Not on pause: Control Centre opens over it (it plays on beneath) and closes again.
         if (web != null) web.onPause();
         if (!isFinishing()) finish();
     }

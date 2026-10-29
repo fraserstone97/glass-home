@@ -236,6 +236,7 @@ final class Suggestions {
 
     /** Fetches fresh suggestions from the chosen source (blocking; call off the UI thread). */
     static List<Item> fetch(Context c) throws Exception {
+        pruneImages(c);  // here too, so it happens with the shelf off or failing as well
         List<Item> out = new ArrayList<>();
         Exception err = null;
         if (showRecs(c) && ready(c)) {
@@ -395,6 +396,11 @@ final class Suggestions {
         long cut = System.currentTimeMillis() - 3L * 24 * 60 * 60 * 1000;
         for (int i = 0; files != null && i < files.length; i++) {
             if (files[i].lastModified() < cut) files[i].delete();
+        }
+        // Each title's choice of TMDB artwork is asked again daily, so a logo added since shows.
+        if (System.currentTimeMillis() - artAsked > 24 * 60 * 60 * 1000L) {
+            ART.clear();
+            artAsked = System.currentTimeMillis();
         }
         for (String old : new String[]{"suggestions_" + SHELF_RECS + "_uk9.json", "suggestions_" + SHELF_NONE + "_uk9.json",
                 "suggestions_by_service_4.json"}) {
@@ -688,6 +694,7 @@ final class Suggestions {
 
     /** TMDB's artwork answers (tmdbArt), by type and id, while Home is running. */
     static final java.util.Map<String, String[]> ART = new java.util.concurrent.ConcurrentHashMap<>();
+    static volatile long artAsked = System.currentTimeMillis();
 
     /** A TMDB picture at one of its own sizes ("w1280") rather than the original upload. */
     static String tmdbSized(String url, String size) {
@@ -822,11 +829,13 @@ final class Suggestions {
             try {
                 if (con.getResponseCode() != 200) return null;
                 byte[] data = readAll(con.getInputStream());
-                File tmp = new File(dir, f.getName() + ".part");
+                // A file of its own: two lanes fetching one picture at once (a title's logo, asked
+                // for ahead and by its page) each wrote over the other's half-written copy.
+                File tmp = File.createTempFile(f.getName(), ".part", dir);
                 try (OutputStream os = new FileOutputStream(tmp)) {
                     os.write(data);
                 }
-                tmp.renameTo(f);
+                if (!tmp.renameTo(f)) tmp.delete();
             } finally {
                 con.disconnect();
             }

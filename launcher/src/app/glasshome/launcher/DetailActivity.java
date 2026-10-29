@@ -268,6 +268,9 @@ public class DetailActivity extends Activity {
      */
     final ExecutorService rel = Executors.newSingleThreadExecutor();
     ImageView backdrop, logo;
+    /** The title's name or logo; shown before the details came (nameEarly); the details shown. */
+    View nameSlot;
+    boolean nameEarly, filled;
     Pager page;
     LinearLayout content, hero, header, actions, sections;
     Row ways;
@@ -308,6 +311,9 @@ public class DetailActivity extends Activity {
         shade.setLayerGravity(1, Gravity.BOTTOM | Gravity.FILL_HORIZONTAL);
         shade.setLayerHeight(1, u(260));
         backdrop.setForeground(shade);
+        // Faded as one picture, shades and all, even while it's drawn without its layer (a
+        // dissolve): an ImageView otherwise fades each part on its own, and the shades thin out.
+        backdrop.forceHasOverlappingRendering(true);
         backdrop.setLayerType(View.LAYER_TYPE_HARDWARE, null);
         root.addView(backdrop, new FrameLayout.LayoutParams(-1, -1));
 
@@ -345,7 +351,18 @@ public class DetailActivity extends Activity {
         logo.setAlpha(0f);
         logo.setVisibility(View.GONE);
         slot.addView(logo, new FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM | Gravity.START));
+        // It comes in with the rest of the page (show): shown at once, it sat low on the empty
+        // page and jumped up as the synopsis and buttons filled in beneath it. Details slow to
+        // come: it shows meanwhile, and glides up to its place when they do (nameTo).
+        slot.setAlpha(0f);
+        slot.forceHasOverlappingRendering(false);  // faded as its two parts, without an off-screen pass
         hero.addView(slot);
+        nameSlot = slot;
+        ui.postDelayed(() -> {
+            if (filled || isDestroyed()) return;
+            nameEarly = true;
+            fadeIn(nameSlot, 0);
+        }, 300);
 
         // "TV Show · Crime · Drama", then the age rating in an outlined box.
         header = new LinearLayout(this);
@@ -381,6 +398,9 @@ public class DetailActivity extends Activity {
         row.setClipChildren(false);
         actions = new LinearLayout(this);
         actions.setClipChildren(false);
+        // A button's height even before (or without) one, so a late one (Trailer, your library's)
+        // never lifts everything above it.
+        actions.setMinimumHeight(u(37));
         row.addView(actions, new FrameLayout.LayoutParams(-2, -2, Gravity.START | Gravity.BOTTOM));
         credits = text(12, "regular", 0xE6FFFFFF);
         credits.setMaxWidth(u(300));
@@ -425,6 +445,7 @@ public class DetailActivity extends Activity {
         ui.removeCallbacksAndMessages(null);
         page.removeCallbacks(scrollStart);
         if (scroller != null) scroller.cancel();
+        if (arriving != null) arriving.cancel();
         io.shutdownNow();
         side.shutdownNow();
         rel.shutdownNow();
@@ -512,6 +533,8 @@ public class DetailActivity extends Activity {
                 ui.post(() -> {
                     if (isDestroyed()) return;
                     meta.setText("Details aren’t available right now.");
+                    filled = true;
+                    if (!nameEarly) fadeIn(nameSlot, 0);
                     fadeIn(meta, 0);
                 });
             }
@@ -567,12 +590,25 @@ public class DetailActivity extends Activity {
         backdrop.setImageBitmap(bm);
         backdrop.setScaleX(1.04f);
         backdrop.setScaleY(1.04f);
-        backdrop.animate().alpha(dimmed(page.getScrollY())).scaleX(1f).scaleY(1f).setDuration(900)
-                .setInterpolator(MainActivity.HERO_EASE).withEndAction(() -> {
-                    settled = true;
-                    dim(page.getScrollY());
-                }).start();
+        backdrop.animate().scaleX(1f).scaleY(1f).setDuration(900).setInterpolator(MainActivity.HERO_EASE).start();
+        // Its fade-in and the page's dim together, so scrolling while it comes in dims it as it
+        // goes rather than snapping to the dimmed value at the end.
+        settled = true;
+        if (arriving != null) arriving.cancel();
+        arrived = 0f;
+        arriving = ValueAnimator.ofFloat(0f, 1f);
+        arriving.setDuration(900);
+        arriving.setInterpolator(MainActivity.HERO_EASE);
+        arriving.addUpdateListener(a -> {
+            arrived = (float) a.getAnimatedValue();
+            dim(page.getScrollY());
+        });
+        arriving.start();
     }
+
+    /** How far the backdrop has faded in (1 once it has). */
+    float arrived = 1f;
+    ValueAnimator arriving;
 
     /** The title's logo takes the place of its name: the name fades out as the logo fades in. */
     void showLogo(Bitmap lb) {
@@ -590,7 +626,7 @@ public class DetailActivity extends Activity {
     }
 
     void dim(int y) {
-        if (settled) backdrop.setAlpha(dimmed(y));
+        if (settled) backdrop.setAlpha(arrived * dimmed(y));
     }
 
     /** An installed app's TV banner (its icon if it has none). */
@@ -649,22 +685,24 @@ public class DetailActivity extends Activity {
         int iw = icon.getWidth(), ih = icon.getHeight();
         int[] px = new int[iw * ih];
         icon.getPixels(px, 0, iw, 0, 0, iw, ih);
-        // Its colour: the edge all round.
+        // Its colour: the edge all round (what's see-through there is the card's own grey).
         long r = 0, g = 0, b = 0;
         int n = 0;
         for (int i = 0; i < px.length; i++) {
             int x = i % iw, y = i / iw;
-            if (x != 0 && y != 0 && x != iw - 1 && y != ih - 1) continue;
+            if (x != 0 && y != 0 && x != iw - 1 && y != ih - 1 || Color.alpha(px[i]) < 128) continue;
             r += Color.red(px[i]);
             g += Color.green(px[i]);
             b += Color.blue(px[i]);
             n++;
         }
-        int bg = Color.rgb((int) (r / n), (int) (g / n), (int) (b / n));
+        int bg = n == 0 ? 0xFF3A3A3C : Color.rgb((int) (r / n), (int) (g / n), (int) (b / n));
+        n = Math.max(n, 1);
         // The logo: whatever differs from it. Edge pixels that differ make it a picture.
         int left = iw, top = ih, right = -1, bottom = -1, odd = 0;
         for (int i = 0; i < px.length; i++) {
             int p = px[i];
+            if (Color.alpha(p) < 128) continue;
             int d = Math.max(Math.abs(Color.red(p) - Color.red(bg)),
                     Math.max(Math.abs(Color.green(p) - Color.green(bg)), Math.abs(Color.blue(p) - Color.blue(bg))));
             if (d <= 40) continue;
@@ -691,10 +729,24 @@ public class DetailActivity extends Activity {
         return out;
     }
 
+    /** The name, shown before the details, glides from where it was to its place above them. */
+    void nameTo(int was) {
+        nameSlot.getViewTreeObserver().addOnPreDrawListener(new android.view.ViewTreeObserver.OnPreDrawListener() {
+            @Override
+            public boolean onPreDraw() {
+                nameSlot.getViewTreeObserver().removeOnPreDrawListener(this);
+                nameSlot.setTranslationY(nameSlot.getTranslationY() + was - nameSlot.getTop());
+                nameSlot.animate().translationY(0).setDuration(420).setInterpolator(MainActivity.EASE).start();
+                return true;
+            }
+        });
+    }
+
     void show(JSONObject n, List<Offer> offers) {
         if (isDestroyed()) return;
         JSONObject c = n.optJSONObject("content");
         if (c == null) return;
+        filled = true;
         boolean series = "SHOW".equals(n.optString("objectType"));
         title.setText(Suggestions.cleanTitle(c.optString("title", titleText == null ? "" : titleText)));
         if (!artStarted) {
@@ -738,6 +790,8 @@ public class DetailActivity extends Activity {
         if (director != null) label(sb.length() > 0 ? sb.append('\n') : sb, "Director ").append(director);
         credits.setText(sb);
 
+        if (nameEarly) nameTo(nameSlot.getTop());
+        else fadeIn(nameSlot, 0);
         fadeIn(header, 0);
         fadeIn(synopsis, 40);
         fadeIn(meta, 80);
@@ -745,6 +799,15 @@ public class DetailActivity extends Activity {
 
         actions.removeAllViews();
         View first = primary(offers);
+        ways.items.removeAllViews();
+        tiles.clear();
+        for (Offer o : offers) way(o);
+        // The services' logos first: the trailer search below can take a while, and they're on
+        // the same lane.
+        if (!tiles.isEmpty()) {
+            List<Offer> want = new ArrayList<>(tiles.keySet());
+            io.execute(() -> logos(want));
+        }
         String trailer = trailer(tmdbVideos, null, c.optString("title", ""));
         if (trailer != null) pill("Trailer", v -> playTrailer(trailer));
         else if (tmdbVideos == null) {
@@ -758,15 +821,9 @@ public class DetailActivity extends Activity {
                     View b = pill("Trailer", v -> playTrailer(key));
                     b.setAlpha(0f);
                     b.animate().alpha(1f).setDuration(240).setInterpolator(LINEAR).start();
+                    if (getCurrentFocus() == null) b.requestFocus();  // nothing else to be on
                 });
             });
-        }
-        ways.items.removeAllViews();
-        tiles.clear();
-        for (Offer o : offers) way(o);
-        if (!tiles.isEmpty()) {
-            List<Offer> want = new ArrayList<>(tiles.keySet());
-            io.execute(() -> logos(want));
         }
         if (offers.isEmpty()) {
             TextView none = text(12.5f, "regular", 0x99FFFFFF);
@@ -774,15 +831,26 @@ public class DetailActivity extends Activity {
                     : "Not available to stream, rent or buy in the UK right now.");
             ways.items.addView(none);
         }
-        if (first != null) first.requestFocus();
-        else if (!offers.isEmpty()) ways.items.getChildAt(0).requestFocus();
+        // The main button; else the first button there is (Trailer); else the first way to watch.
+        View placed = first != null ? first : actions.getChildCount() > 0 ? actions.getChildAt(0)
+                : offers.isEmpty() ? null : ways.items.getChildAt(0);
+        if (placed != null) placed.requestFocus();
         fadeIn(actions, 120);
         fadeIn(waysLabel, 160);
         fadeIn(ways, 200);
         reportFullyDrawn();  // the page is whole: "Fully drawn" in the system log times its opening
         // The shelves below the fold once the page has settled, so their building and pictures
-        // stay out of the fade-ups.
-        ui.postDelayed(() -> sections(n, c, series, people), 700);
+        // stay out of the fade-ups, and out of the backdrop's own arrival too (a frame or two
+        // apiece on this TV), though never more than a second and a half on.
+        long latest = android.os.SystemClock.uptimeMillis() + 1500;
+        Runnable[] build = new Runnable[1];
+        build[0] = () -> {
+            if (isDestroyed()) return;
+            boolean moving = arriving != null && arriving.isRunning() || backdrop.getLayerType() == View.LAYER_TYPE_NONE;
+            if (moving && android.os.SystemClock.uptimeMillis() < latest) ui.postDelayed(build[0], 100);
+            else sections(n, c, series, people);
+        };
+        ui.postDelayed(build[0], 700);
     }
 
     /**
@@ -1426,9 +1494,16 @@ public class DetailActivity extends Activity {
         if (isDestroyed()) return;
         built = true;
         if (related != null) relatedRow(related);
+        // One shelf a frame: built together they took more than a frame between them, and the
+        // backdrop still fading in above stuttered.
         JSONObject ext = c.optJSONObject("externalIds");
-        if (!people.isEmpty()) castRow(people, series, ext == null ? 0 : Suggestions.parseInt(ext.optString("tmdbId")));
-        information(n, c, series);
+        ui.post(() -> {
+            if (isDestroyed()) return;
+            if (!people.isEmpty()) castRow(people, series, ext == null ? 0 : Suggestions.parseInt(ext.optString("tmdbId")));
+            ui.post(() -> {
+                if (!isDestroyed()) information(n, c, series);
+            });
+        });
     }
 
     /** A shelf below the fold: its title (grey, as the Apple TV app's), then whatever it holds. */
@@ -1502,11 +1577,32 @@ public class DetailActivity extends Activity {
             row.items.addView(tile, lp);
         }
         s.addView(row, new LinearLayout.LayoutParams(-1, -2));
+        // Arriving after you've gone down to a shelf below: the page moves down with it, so the
+        // shelf you're on stays where it is rather than being pushed down (or off) the screen.
+        boolean below = false;
+        for (View v = getCurrentFocus(); v != null; v = v.getParent() instanceof View ? (View) v.getParent() : null) {
+            if (v == sections) below = true;
+        }
         sections.addView(s, 0);
-        // The posters, one by one off the UI thread, each fading in as it's ready.
+        if (below) {
+            page.getViewTreeObserver().addOnPreDrawListener(new android.view.ViewTreeObserver.OnPreDrawListener() {
+                @Override
+                public boolean onPreDraw() {
+                    page.getViewTreeObserver().removeOnPreDrawListener(this);
+                    int h = s.getHeight();
+                    page.removeCallbacks(scrollStart);
+                    if (scroller != null) scroller.cancel();
+                    scrollTarget += h;
+                    page.scrollTo(0, page.getScrollY() + h);
+                    return true;
+                }
+            });
+        }
+        // The posters, one by one off the UI thread, each fading in as it's ready: in full colour
+        // and a size above, as they're shown 1.1 times larger when focused.
         side.execute(() -> {
             for (int i = 0; i < items.size() && !gone(); i++) {
-                Bitmap bm = Suggestions.screenImage(this, items.get(i)[3], posterW);
+                Bitmap bm = Suggestions.onGpu(Suggestions.image(this, items.get(i)[3], "", Math.round(posterW * 1.1f)));
                 ImageView iv = posters.get(i);
                 if (bm != null) ui.post(() -> {
                     if (isDestroyed()) return;
