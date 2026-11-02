@@ -54,6 +54,16 @@ public class GuideActivity extends Activity {
     final Handler ui = new Handler(Looper.getMainLooper());
     final ExecutorService work = Executors.newSingleThreadExecutor();
     final ExecutorService images = Executors.newFixedThreadPool(2);
+    /** The channels' logos, on a lane of their own: not queued behind the programmes' pictures. */
+    final ExecutorService logoLane = Executors.newSingleThreadExecutor();
+
+    /**
+     * Channel logos, by address, kept for as long as Home runs: the Guide opens again with them
+     * drawn, not arriving one by one. The screen's thread only.
+     */
+    static final Map<String, Bitmap> LOGOS = new HashMap<>();
+    /** Freely's logo width: enough for the 62 x 26 box even at 4K, with a quarter of the pixels of 400. */
+    static final int LOGO_W = 200;
 
     float unit;
     int screenW, screenH;
@@ -63,15 +73,22 @@ public class GuideActivity extends Activity {
     View actionPill;
     final List<GuideData.Channel> channels = new ArrayList<>();
     final Set<Long> loaded = new HashSet<>(), loading = new HashSet<>();
-    final Map<String, Bitmap> logos = new HashMap<>();
     final Set<String> logosAsked = new HashSet<>();
     String artUrl;
     boolean failed;
+    /** When the listings were read, and for which day: read again, coming back, once they're four hours old or it's another day. */
+    long readAt, readDay;
+    boolean reading;
+    /** Counts the readings: a day fetched for the list before is dropped, not merged into it. */
+    int reads;
 
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
         ClipAudit.watch(this);  // a development check, off unless asked for over adb
+        // No picture kept of it for coming back to: Android showed that (where it was left, the
+        // day before) until it drew again at now. Its black shows instead, for a frame or two.
+        if (android.os.Build.VERSION.SDK_INT >= 33) setRecentsScreenshotEnabled(false);
         unit = Ui.unit(this);
         android.graphics.Point p = Ui.screen(this);
         screenW = p.x;
@@ -86,6 +103,32 @@ public class GuideActivity extends Activity {
         grid.requestFocus();
         showLoading();
         work.execute(this::start);
+    }
+
+    /** Back from an app it opened, or from standby. */
+    @Override
+    protected void onRestart() {
+        super.onRestart();
+        backToNow();
+    }
+
+    /** Opened again from Home: it can still be there, paused, as Android stops it only once Home settles. */
+    @Override
+    protected void onNewIntent(Intent i) {
+        super.onNewIntent(i);
+        backToNow();
+    }
+
+    /**
+     * Back on screen: at what's on now, as when it opens, and the listings read again if they're
+     * old. It is an app of its own (singleTask), so otherwise it came back where it was left, a
+     * day or more behind.
+     */
+    void backToNow() {
+        if (channels.isEmpty()) return;  // still reading: it opens at now
+        grid.dayFocus(false);
+        grid.home(false);
+        readIfOld();
     }
 
     @Override
@@ -106,14 +149,20 @@ public class GuideActivity extends Activity {
         ui.removeCallbacksAndMessages(null);
         work.shutdownNow();
         images.shutdownNow();
+        logoLane.shutdownNow();
         super.onDestroy();
     }
 
-    /** Every half minute: the now line moves, and what's live changes. */
+    /**
+     * Every half minute: the now line moves, and what's live changes. Left at now, it stays at
+     * now: on at each half hour, and to what's on next as a programme ends.
+     */
     final Runnable tick = new Runnable() {
         @Override public void run() {
+            if (grid.atNow && !channels.isEmpty() && !grid.atHome()) grid.home(true);
             grid.invalidate();
             if (grid.focus != null) describe(grid.focus, grid.focusChannel());
+            readIfOld();
             ui.postDelayed(this, 30_000);
         }
     };
@@ -349,18 +398,31 @@ public class GuideActivity extends Activity {
 
     // ---------------------------------------------------------------- data
 
+    /** The channels and today's listings: on opening, and again when they're old (readIfOld). */
     void start() {
         try {
             List<GuideData.Channel> list = GuideData.channels(this);
+            // The logos as soon as the channels are known: under way while today's listings come.
+            ui.post(() -> {
+                for (GuideData.Channel ch : list) logo(ch);
+            });
             long today = GuideData.dayStart(System.currentTimeMillis());
             java.util.Map<String, List<GuideData.Show>> day = GuideData.day(this, today);
             GuideData.merge(list, day);
             ui.post(() -> {
+                reading = false;
                 if (isDestroyed()) return;  // left while it loaded
+                // Read again: at now if it was there, else the same place on the new listings.
+                boolean toNow = channels.isEmpty() || grid.atNow;
                 channels.clear();
                 channels.addAll(list);
+                reads++;
+                loaded.clear();
+                loading.clear();
                 loaded.add(today);
-                grid.home(false);
+                readAt = System.currentTimeMillis();
+                readDay = today;
+                grid.reread(toNow);
                 // The days either side, for scrolling there without a wait.
                 need(GuideData.addDays(today, -1));
                 need(GuideData.addDays(today, 1));
@@ -368,6 +430,8 @@ public class GuideActivity extends Activity {
             GuideData.prune(this);
         } catch (Exception e) {
             ui.post(() -> {
+                reading = false;
+                if (!channels.isEmpty()) return;  // read again, and failed: what's shown stays
                 failed = true;
                 channelLine.setText("TV GUIDE");
                 title.setText("What's On");
@@ -375,6 +439,15 @@ public class GuideActivity extends Activity {
                 liveBadge.setVisibility(View.GONE);
             });
         }
+    }
+
+    /** The listings read again once four hours old (as their copies on disk are) or on a new day. */
+    void readIfOld() {
+        long now = System.currentTimeMillis();
+        if (reading || channels.isEmpty() || work.isShutdown()) return;
+        if (now - readAt < GuideData.FRESH_MS && GuideData.dayStart(now) == readDay) return;
+        reading = true;
+        work.execute(this::start);
     }
 
     /** The days the window shows (and a little either side) are fetched, if they aren't yet. */
@@ -389,16 +462,19 @@ public class GuideActivity extends Activity {
         if (work.isShutdown()) return;  // the guide has closed
         loading.add(midnight);
         List<GuideData.Channel> list = new ArrayList<>(channels);
+        int read = reads;
         work.execute(() -> {
             java.util.Map<String, List<GuideData.Show>> day;
             try {
                 day = GuideData.day(this, midnight);
             } catch (Exception e) {
-                ui.post(() -> loading.remove(midnight));  // asked for again when next needed
+                ui.post(() -> {
+                    if (read == reads) loading.remove(midnight);  // asked for again when next needed
+                });
                 return;
             }
             ui.post(() -> {
-                if (isDestroyed()) return;
+                if (isDestroyed() || read != reads) return;  // the listings were read again meanwhile
                 // Merged here, on the screen's thread, so a frame never draws a list mid-change.
                 GuideData.merge(list, day);
                 loading.remove(midnight);
@@ -408,15 +484,19 @@ public class GuideActivity extends Activity {
         });
     }
 
+    /** The channel's logo if it's here; if not, fetched (from disk, once it has been seen) for the next frame. */
     Bitmap logo(GuideData.Channel ch) {
-        Bitmap b = logos.get(ch.id);
-        if (b == null && ch.logo != null && !images.isShutdown() && logosAsked.add(ch.id)) {
-            images.execute(() -> {
-                Bitmap got = Suggestions.image(this, GuideData.sized(ch.logo, 400), "", 400);
+        if (ch.logo == null) return null;
+        String url = GuideData.sized(ch.logo, LOGO_W);
+        Bitmap b = LOGOS.get(url);
+        if (b == null && !logoLane.isShutdown() && logosAsked.add(url)) {
+            logoLane.execute(() -> {
+                Bitmap got = Suggestions.image(this, url, "", LOGO_W);
                 if (got == null) return;
+                got.prepareToDraw();  // to the graphics chip now, not in the frame that first draws it
                 ui.post(() -> {
-                    logos.put(ch.id, got);
-                    grid.invalidate();
+                    LOGOS.put(url, got);
+                    if (!isDestroyed()) grid.invalidate();
                 });
             });
         }
@@ -433,7 +513,8 @@ public class GuideActivity extends Activity {
      * OK: on now, the channel live in its app; earlier, the programme in the app's catch-up; later,
      * nothing to open yet. The links are the ones each app answers on this TV: Freely's own TV-app
      * links where an app takes them (iPlayer, ITVX's catch-up), ITVX's channel links, Channel 4's web pages, and My5 (whose links go
-     * through its server, and show an error) opened at its start, or searched, instead.
+     * through its server, and show an error) opened at its start, or searched, instead. My5's TV
+     * app has no way in to a channel: it reads one from my5://watch/C7 and then never acts on it.
      */
     void open(GuideData.Show s, GuideData.Channel ch) {
         if (ch == null) return;
@@ -550,6 +631,10 @@ public class GuideActivity extends Activity {
         float focusIn = 1f, focusOut;
         /** Focus on the day, over the channels (up from the first one), as Freely's day strip. */
         boolean onDay;
+        /** At now and not moved from it since: the window keeps to now as time goes on (tick). */
+        boolean atNow;
+        /** OK went down here: it opens on the way up, so the app opened isn't handed the release. */
+        boolean okDown;
         float dayFocus;
         ValueAnimator dayFade;
         ValueAnimator scroll, fade;
@@ -622,6 +707,22 @@ public class GuideActivity extends Activity {
             if (row >= channels.size()) row = 0;
             GuideData.Show at = showAt(row, now);
             go(row, at, s, animate);
+            atNow = true;
+        }
+
+        /**
+         * The listings were read again: at now, or where it was. What had focus is the same
+         * programme in the new listings, so it's swapped in as it is, with no fade.
+         */
+        void reread(boolean toNow) {
+            if (row >= channels.size()) row = 0;
+            GuideData.Show same = focus == null ? null : showAt(row, focus.start + 1);
+            if (same != null && same.start == focus.start && same.end == focus.end) {
+                focus = same;
+                lastFocus = null;
+            }
+            if (toNow) home(false);
+            else go(row, same != null && same == focus ? same : showAt(row, anchor), startTarget, false);
         }
 
         boolean atHome() {
@@ -696,6 +797,7 @@ public class GuideActivity extends Activity {
         }
 
         void scrollTo(long s, float t, boolean animate) {
+            atNow = false;  // home() sets it again after
             startTarget = s;
             topTarget = t;
             if (scroll != null) scroll.cancel();
@@ -762,10 +864,24 @@ public class GuideActivity extends Activity {
                 case KeyEvent.KEYCODE_MEDIA_PREVIOUS: return days(-1);
                 case KeyEvent.KEYCODE_DPAD_CENTER:
                 case KeyEvent.KEYCODE_ENTER:
-                    if (ev.getRepeatCount() == 0) open(focus, focusChannel());
+                    if (ev.getRepeatCount() == 0) okDown = true;
                     return true;
                 default: return super.onKeyDown(k, ev);
             }
+        }
+
+        /**
+         * OK opens on its release, as a button does. Opened on the press, the app came up in time
+         * for the release: ITVX, already running, took it as OK on its own home screen and stayed
+         * there instead of going to the channel.
+         */
+        @Override
+        public boolean onKeyUp(int k, KeyEvent ev) {
+            if (k != KeyEvent.KEYCODE_DPAD_CENTER && k != KeyEvent.KEYCODE_ENTER) return super.onKeyUp(k, ev);
+            boolean down = okDown;
+            okDown = false;
+            if (down && !ev.isCanceled() && !channels.isEmpty()) open(focus, focusChannel());
+            return true;
         }
 
         boolean rows(int d, boolean fast) {
@@ -815,6 +931,7 @@ public class GuideActivity extends Activity {
         void dayFocus(boolean on) {
             if (onDay == on) return;
             onDay = on;
+            if (on) atNow = false;
             if (dayFade != null) dayFade.cancel();
             dayFade = ValueAnimator.ofFloat(dayFocus, on ? 1f : 0f);
             dayFade.setDuration(on ? 170 : 180);
