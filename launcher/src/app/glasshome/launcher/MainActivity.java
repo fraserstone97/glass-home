@@ -123,6 +123,8 @@ public class MainActivity extends Activity {
      */
     static final float PRESS_SCALE = 1f + (FOCUS_SCALE - 1f) * 0.5f;
     static final long PRESS_MS = 80;
+    /** OK held this long on a card opens its menu: sooner than Android's own long press (400–500 ms). */
+    static final long HOLD_MS = 300;
     /**
      * Focus lift: a damped spring, like tvOS (over 450 ms: 90% in about 120 ms, a 4% overshoot,
      * settled by 300 ms). Going down is slower, so the card you left trails the one you reach.
@@ -2978,8 +2980,10 @@ public class MainActivity extends Activity {
         int sec = Suggestions.advanceSeconds(this);
         // Not while a card is being moved: the picture holds still, as tvOS's top shelf does in edit
         // mode, and each step's grid rebuild doesn't share its frames with a dissolve.
-        // Nor behind the forecast: its glass would keep the old picture's colours.
-        if (sec > 0 && heroShown && resumed && switcher == null && moveIndex < 0 && forecastLayer == null) {
+        // Nor behind the forecast or a card's menu: their glass would keep the old picture's
+        // colours, and a dissolve under a menu cost this TV a third of its frames.
+        if (sec > 0 && heroShown && resumed && switcher == null && moveIndex < 0 && forecastLayer == null
+                && menuLayer == null) {
             handler.postDelayed(heroAdvance, sec * 1000L);
         }
     }
@@ -3918,8 +3922,17 @@ public class MainActivity extends Activity {
             // click, which then opens it) or when the press is called off.
             View f = getCurrentFocus();
             if (f != null && tiles.contains(f)) {
-                if (down && ev.getRepeatCount() == 0) press(f);
-                else if (!down && ev.isCanceled()) rise(f);
+                if (down && ev.getRepeatCount() == 0) {
+                    press(f);
+                    if (moveIndex < 0 && menuLayer == null && !FOLDER_KEY.equals(shown.get(tiles.indexOf(f)).key)) {
+                        held = f;
+                        handler.postDelayed(holdMenu, HOLD_MS);
+                    }
+                } else if (!down) {
+                    handler.removeCallbacks(holdMenu);
+                    held = null;
+                    if (ev.isCanceled()) rise(f);
+                }
             }
         }
         return super.dispatchKeyEvent(ev);
@@ -3927,6 +3940,16 @@ public class MainActivity extends Activity {
 
     /** When the Back (or Menu) being pressed went down. */
     long backDownAt, menuDownAt;
+    /**
+     * The card OK went down on. Still held (and pressed) after HOLD_MS, it's a long press: its
+     * menu opens, and with focus gone to the menu, Android's own later long press never fires.
+     */
+    View held;
+    final Runnable holdMenu = () -> {
+        View h = held;
+        held = null;
+        if (h != null && h == getCurrentFocus() && h.isPressed()) h.performLongClick();
+    };
 
     /** Whether v is group or somewhere inside it. */
     static boolean inside(View v, View group) {
@@ -5053,6 +5076,7 @@ public class MainActivity extends Activity {
         closeMenu();
         menuReturnFocus = anchor;
         menuLayer = new FrameLayout(this);
+        handler.removeCallbacks(heroAdvance);  // the carousel holds still behind it
         menuLayer.setClickable(true);
         // The dim behind the menu fades with it (its own view, so the fade is a single alpha):
         // tvOS dims the screen behind a menu to 70%.
@@ -5171,9 +5195,10 @@ public class MainActivity extends Activity {
 
         // Grows out of the card, as the Apple TV app's menus do: from 0.35 of its size at the side
         // touching the card, level with the card's middle (even when the panel is held inside the
-        // screen), fading up, easeOut 380 ms; the dim comes up over 400 ms. It moves as one picture
-        // (a GPU layer), so its words aren't redrawn at a new size every frame; it lands at exactly
-        // its own size, so there's no change when the picture gives way to the real thing.
+        // screen), fading up. Quicker than the Apple TV app's easeOut 380 ms: most of the way in
+        // the first 80 ms, settled by 240, with the dim alongside. It moves as one picture (a GPU
+        // layer), so its words aren't redrawn at a new size every frame; it lands at exactly its
+        // own size, so there's no change when the picture gives way to the real thing.
         panel.setPivotX(x > cx ? 0 : w);
         panel.setPivotY(Math.max(0f, Math.min(h, cy - y)));
         panel.setAlpha(0f);
@@ -5181,14 +5206,15 @@ public class MainActivity extends Activity {
         panel.setScaleY(0.35f);
         if (!rows.isEmpty()) rows.get(0).requestFocus();
         opening[0] = false;
-        panel.animate().scaleX(1f).scaleY(1f).alpha(1f).setDuration(380).setInterpolator(EASE_OUT_QUAD).withLayer().start();
-        dim.animate().alpha(1f).setDuration(400).setInterpolator(new android.view.animation.LinearInterpolator()).start();
+        panel.animate().scaleX(1f).scaleY(1f).alpha(1f).setDuration(240).setInterpolator(EASE).withLayer().start();
+        dim.animate().alpha(1f).setDuration(240).setInterpolator(EASE).start();
     }
 
     void closeMenu() {
         if (menuLayer == null) return;
         FrameLayout m = menuLayer;
         menuLayer = null;
+        scheduleAdvance();
         // Back into the card it came from (to 0.35 as it fades, 210 ms), and the dim lifts (100 ms).
         // The layer goes when the panel has, which outlasts the dim.
         View panel = m.getChildCount() > 1 ? m.getChildAt(1) : null;
