@@ -5,13 +5,11 @@ import android.app.Activity;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
-import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.Rect;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.LayerDrawable;
-import android.media.session.PlaybackState;
 import android.os.Bundle;
 import android.provider.Settings;
 import android.text.TextUtils;
@@ -25,15 +23,14 @@ import android.widget.TextClock;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import java.util.List;
 import java.util.Locale;
 
 /**
  * Control Centre: a glass panel in the top-right corner of the screen, over Home or any app.
  * Opened by the gear on Home and by the remote's Quick Settings button (KeysService); a second
  * press, Back, or opening anything closes it. It holds what a TV needs at hand, like the quick
- * panels on Google TV, LG and Samsung sets: power, Home and settings beside the time, what's
- * playing, then inputs, picture, sound, network, Bluetooth, sleep timer and screen saver.
+ * panels on Google TV, LG and Samsung sets: power, Home and settings beside the time, then
+ * inputs, picture, sound, network, Bluetooth, sleep timer and screen saver.
  */
 public class ControlCentreActivity extends Activity {
 
@@ -236,12 +233,6 @@ public class ControlCentreActivity extends Activity {
     }
 
     @Override
-    protected void onDestroy() {
-        super.onDestroy();
-        unwatch();
-    }
-
-    @Override
     public void finish() {
         // Closing already brought Home's clock back as the panel went; doing it again restarted its fade.
         MainActivity home = MainActivity.live.get();
@@ -329,8 +320,6 @@ public class ControlCentreActivity extends Activity {
             });
             button("house", "Home", v -> open(new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)));
             button("gear", "Settings", v -> open(new Intent(Settings.ACTION_SETTINGS)));
-            android.media.session.MediaController mc = nowPlaying();
-            if (mc != null) nowPlayingRow(mc);
             Tiles g = new Tiles(dp(TILE_W), dp(TILE_H), dp(GAP));
             if (Inputs.any(this)) g.add("hdmi", "Inputs", null, this::showInputs);
             g.add("picture", "Picture", null,
@@ -370,7 +359,6 @@ public class ControlCentreActivity extends Activity {
 
     void inputTiles() {
         buttons.removeAllViews();
-        unwatch();
         Tiles g = new Tiles(dp(TILE_W), dp(TILE_H), dp(GAP));
         for (Inputs.Input in : Inputs.list(this)) {
             g.add(Inputs.glyph(in), in.label, null, v -> {
@@ -392,7 +380,6 @@ public class ControlCentreActivity extends Activity {
 
     void sleepTiles() {
         buttons.removeAllViews();
-        unwatch();
         Tiles g = new Tiles(dp(TILE_W), dp(TILE_H), dp(GAP));
         int running = SleepReceiver.timerChoice(this);
         if (SleepReceiver.timerLeftMs(this) > 0) g.add(null, "Turn Off", null, v -> setSleep(0));
@@ -734,182 +721,6 @@ public class ControlCentreActivity extends Activity {
         }
         Glass.focus(white, has);
         Glass.lift(v, has, scale, 0, 1f, true, 330, Glass.POP);
-    }
-
-    // ---------------------------------------------------------------- now playing
-
-    /**
-     * What's playing, else what's paused; null when nothing is, or notification access is off.
-     * Some players (BBC iPlayer) keep a session open but never say what's on or whether it's
-     * playing: over an app, the most recent such session stands in, shown by the app's name.
-     */
-    android.media.session.MediaController nowPlaying() {
-        try {
-            android.media.session.MediaSessionManager m = getSystemService(android.media.session.MediaSessionManager.class);
-            List<android.media.session.MediaController> all =
-                    m.getActiveSessions(new android.content.ComponentName(this, MediaListener.class));
-            android.media.session.MediaController paused = null;
-            for (android.media.session.MediaController c : all) {
-                int st = state(c);
-                if (st == PlaybackState.STATE_PLAYING || st == PlaybackState.STATE_BUFFERING) return c;
-                if (st == PlaybackState.STATE_PAUSED && paused == null) paused = c;
-            }
-            if (paused != null || all.isEmpty() || MainActivity.onScreen) return paused;
-            return all.get(0);  // sessions come most recently active first
-        } catch (SecurityException e) {
-            return null;
-        }
-    }
-
-    static int state(android.media.session.MediaController c) {
-        PlaybackState s = c.getPlaybackState();
-        return s == null ? PlaybackState.STATE_NONE : s.getState();
-    }
-
-    /** The player being followed while the panel is open, and what it calls when it changes. */
-    android.media.session.MediaController watched;
-    android.media.session.MediaController.Callback watcher;
-
-    void unwatch() {
-        if (watched != null) watched.unregisterCallback(watcher);
-        watched = null;
-    }
-
-    /**
-     * Now Playing, as in tvOS's Control Centre: the artwork with the title and who it's by (or the
-     * app), which opens the app, and play/pause beside it. Both follow the player while it's open.
-     */
-    void nowPlayingRow(android.media.session.MediaController mc) {
-        LinearLayout row = new LinearLayout(this);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setClipChildren(false);
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
-        lp.bottomMargin = dp(GAP);
-        body.addView(row, lp);
-
-        Glass white = glass(dp(TILE_H) / 2f);
-        LinearLayout card = new LinearLayout(this);
-        card.setGravity(Gravity.CENTER_VERTICAL);
-        card.setBackground(white);
-        card.setPadding(dp(8), dp(8), dp(18), dp(8));
-        card.setFocusable(true);
-        card.setClickable(true);
-        int side = dp(TILE_H - 16);
-        ImageView art = new ImageView(this);
-        GradientDrawable well = new GradientDrawable();
-        well.setCornerRadius(dp(10));
-        well.setColor(0x29FFFFFF);
-        art.setBackground(well);
-        art.setClipToOutline(true);
-        art.setScaleType(ImageView.ScaleType.CENTER_CROP);
-        card.addView(art, new LinearLayout.LayoutParams(side, side));
-        LinearLayout words = new LinearLayout(this);
-        words.setOrientation(LinearLayout.VERTICAL);
-        LinearLayout.LayoutParams wp = new LinearLayout.LayoutParams(0, -2, 1f);
-        wp.leftMargin = dp(10);
-        card.addView(words, wp);
-        TextView title = label(12f, "semibold", "");
-        TextView by = label(10.5f, "regular", "");
-        by.setTextColor(0xA6FFFFFF);
-        words.addView(title);
-        words.addView(by);
-        white.tint = f -> {
-            title.setTextColor((int) EV.evaluate(f, Color.WHITE, INK));
-            by.setTextColor((int) EV.evaluate(f, 0xA6FFFFFF, 0x991C1C1E));
-        };
-        // A smaller lift than the tiles': at 1.12 this wide card's pop would touch play/pause.
-        card.setOnFocusChangeListener((v, has) -> focusOn(v, white, has, 1.04f));
-        card.setOnClickListener(v -> {
-            Intent i = Suggestions.launchIntent(this, mc.getPackageName());
-            if (i != null) open(i);
-        });
-        row.addView(card, new LinearLayout.LayoutParams(0, dp(TILE_H), 1f));
-        space(row, dp(GAP));
-        int button = dp(46);
-        ImageView toggle = (ImageView) circle(row, button, "pause", v -> {
-            int st = state(mc);
-            if (st == PlaybackState.STATE_PLAYING) mc.getTransportControls().pause();
-            else if (st == PlaybackState.STATE_PAUSED) mc.getTransportControls().play();
-            else {
-                // A player that doesn't say: the remote's own Play/Pause button, which it does answer.
-                mc.dispatchMediaButtonEvent(new KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE));
-                mc.dispatchMediaButtonEvent(new KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE));
-            }
-        });
-        toggle.setContentDescription("Play or Pause");
-
-        Runnable showState = () -> {
-            int st = state(mc);
-            String g = st == PlaybackState.STATE_PLAYING ? "pause" : st == PlaybackState.STATE_PAUSED ? "play" : "playpause";
-            toggle.setImageBitmap(Glyphs.get(g, Math.round(button * 0.48f), Color.WHITE));
-        };
-        Runnable showTrack = () -> {
-            String app = mc.getPackageName();
-            try {
-                android.content.pm.PackageManager pm = getPackageManager();
-                app = pm.getApplicationLabel(pm.getApplicationInfo(app, 0)).toString();
-            } catch (android.content.pm.PackageManager.NameNotFoundException ignored) {
-                // the package name will do
-            }
-            android.media.MediaMetadata md = mc.getMetadata();
-            android.media.MediaDescription d = md == null ? null : md.getDescription();
-            String t = d == null || d.getTitle() == null ? "" : d.getTitle().toString();
-            String s = d == null || d.getSubtitle() == null ? "" : d.getSubtitle().toString();
-            title.setText(t.isEmpty() ? app : t);
-            by.setText(t.isEmpty() ? "" : s.isEmpty() ? app : s);
-            Bitmap pic = d == null ? null : d.getIconBitmap();
-            if (pic == null) {
-                art.setScaleType(ImageView.ScaleType.FIT_CENTER);
-                art.setPadding(dp(8), dp(8), dp(8), dp(8));
-                try {
-                    art.setImageDrawable(getPackageManager().getApplicationIcon(mc.getPackageName()));
-                } catch (android.content.pm.PackageManager.NameNotFoundException ignored) {
-                    art.setImageDrawable(null);
-                }
-                return;
-            }
-            // Shrunk to the card's size off the main thread: players hand over full-size artwork.
-            int px = Math.round(side * 1.05f);
-            new Thread(() -> {
-                Bitmap small = square(pic, px);
-                art.post(() -> {
-                    if (!art.isAttachedToWindow()) return;
-                    art.setScaleType(ImageView.ScaleType.CENTER_CROP);
-                    art.setPadding(0, 0, 0, 0);
-                    art.setImageBitmap(small);
-                });
-            }).start();
-        };
-        showState.run();
-        showTrack.run();
-        unwatch();
-        watcher = new android.media.session.MediaController.Callback() {
-            @Override
-            public void onPlaybackStateChanged(PlaybackState s) {
-                showState.run();
-            }
-
-            @Override
-            public void onMetadataChanged(android.media.MediaMetadata m) {
-                showTrack.run();
-            }
-        };
-        watched = mc;
-        mc.registerCallback(watcher);
-    }
-
-    /** The middle square of a picture at s x s, halved in steps first so it shrinks cleanly. */
-    static Bitmap square(Bitmap src, int s) {
-        int side = Math.min(src.getWidth(), src.getHeight());
-        Bitmap cur = Bitmap.createBitmap(src, (src.getWidth() - side) / 2, (src.getHeight() - side) / 2, side, side);
-        while (cur.getWidth() > s * 2) {
-            Bitmap half = Bitmap.createScaledBitmap(cur, cur.getWidth() / 2, cur.getHeight() / 2, true);
-            if (cur != src) cur.recycle();
-            cur = half;
-        }
-        Bitmap out = Bitmap.createScaledBitmap(cur, s, s, true);
-        if (cur != src && cur != out) cur.recycle();
-        return out;
     }
 
     // ---------------------------------------------------------------- states

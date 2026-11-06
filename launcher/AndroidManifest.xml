@@ -112,7 +112,7 @@
             <meta-data android:name="android.accessibilityservice" android:resource="@xml/keys_service" />
         </service>
 
-        <!-- Now Playing in Control Centre: media sessions are only shared with a notification listener. -->
+        <!-- TrailerWatch: media sessions are only shared with a notification listener. -->
         <service
             android:name=".MediaListener"
             android:exported="true"
