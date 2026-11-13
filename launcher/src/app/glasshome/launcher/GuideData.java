@@ -58,6 +58,8 @@ final class GuideData {
 
     static final class Show {
         String title, subtitle, image, catchUp;
+        /** Freely's id for it, for what it's about (about()). */
+        String programId;
         long start, end;
         /** Its times as the guide shows them (21:00, and 21:00 to 22:30): made once, not every frame. */
         String startText, times;
@@ -171,6 +173,8 @@ final class GuideData {
                 s.startText = hm.format(new Date(s.start));
                 s.times = s.startText + " \u2013 " + hm.format(new Date(s.end));
                 s.title = e.optString("main_title");
+                String pid = e.optString("program_id", "");
+                s.programId = pid.isEmpty() ? null : pid;
                 String sub = e.optString("secondary_title", "");
                 // BBC's "subtitle" is often just the date; that's on screen already.
                 s.subtitle = sub.matches("\\d{1,2}/\\d{1,2}/\\d{4}") ? "" : sub;
@@ -207,6 +211,23 @@ final class GuideData {
         if (m.group(3) != null) s += Long.parseLong(m.group(3)) * 60;
         if (m.group(4) != null) s += Long.parseLong(m.group(4));
         return s * 1000;
+    }
+
+    /**
+     * What a programme is about: Freely's short and medium descriptions ("" where it has none), from
+     * the programme request its own guide makes as a programme is opened (0.1 to 0.4 s).
+     */
+    static String[] about(Show s) throws Exception {
+        JSONArray found = new JSONObject(get(API + "program?pid=" + java.net.URLEncoder.encode(s.programId, "UTF-8")
+                + "&sid=" + s.channel.id)).getJSONObject("data").optJSONArray("programs");
+        JSONObject words = found == null || found.length() == 0 ? null : found.getJSONObject(0).optJSONObject("synopsis");
+        if (words == null) return new String[]{"", ""};
+        return new String[]{plain(words.optString("short", "")), plain(words.optString("medium", ""))};
+    }
+
+    /** A description without the access marks broadcasters end it with ([S,HD], [AD], [SL]). */
+    static String plain(String words) {
+        return words.replaceAll("(\\s*\\[[A-Z0-9, /]{1,12}\\])+\\s*$", "").trim();
     }
 
     /** Adds a day's programmes to the channels, leaving out any already there (a day's edges overlap). */

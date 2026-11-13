@@ -17,7 +17,9 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.text.SpannableStringBuilder;
 import android.text.TextUtils;
+import android.text.style.ForegroundColorSpan;
 import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.View;
@@ -28,10 +30,12 @@ import android.widget.TextClock;
 import android.widget.TextView;
 
 import java.text.SimpleDateFormat;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -42,9 +46,9 @@ import java.util.concurrent.Executors;
 /**
  * The Guide: what's on, as Freely's TV guide shows it (channels down the side, time across, a
  * week back and a week ahead, catch-up marked), in tvOS's look: the focused programme large at the
- * top over its picture, glass cells, a white plate for focus. OK on something on now opens the
- * channel live in its broadcaster's app; on something earlier, that programme in the app's
- * catch-up. Back returns to now, then to Home.
+ * top over its picture, with what it's about, glass cells, a white plate for focus. OK on
+ * something on now or later opens the channel live in its broadcaster's app; on something earlier,
+ * that programme in the app's catch-up. Back returns to now, then to Home.
  */
 public class GuideActivity extends Activity {
 
@@ -64,6 +68,20 @@ public class GuideActivity extends Activity {
     static final Map<String, Bitmap> LOGOS = new HashMap<>();
     /** Freely's logo width: enough for the 62 x 26 box even at 4K, with a quarter of the pixels of 400. */
     static final int LOGO_W = 200;
+    /**
+     * What programmes are about ({short, medium}, by channel and programme), kept while Home runs:
+     * a re-read of the listings, or the Guide opened again, doesn't ask again. The screen's thread only.
+     */
+    static final Map<String, String[]> ABOUT = new LinkedHashMap<String, String[]>(64, 0.75f, true) {
+        @Override protected boolean removeEldestEntry(Map.Entry<String, String[]> e) {
+            return size() > 400;
+        }
+    };
+    /** Descriptions are asked for one at a time, the programme in focus first. */
+    final ExecutorService aboutLane = Executors.newSingleThreadExecutor();
+    final ArrayDeque<GuideData.Show> aboutWanted = new ArrayDeque<>();
+    final Set<String> aboutAsked = new HashSet<>();
+    boolean aboutBusy;
 
     float unit;
     int screenW, screenH;
@@ -150,6 +168,7 @@ public class GuideActivity extends Activity {
         work.shutdownNow();
         images.shutdownNow();
         logoLane.shutdownNow();
+        aboutLane.shutdownNow();
         super.onDestroy();
     }
 
@@ -224,15 +243,12 @@ public class GuideActivity extends Activity {
         LinearLayout.LayoutParams ml = new LinearLayout.LayoutParams(-2, -2);
         ml.topMargin = u(7);
         text.addView(metaRow, ml);
+        // The episode, then what it's about: two lines, under the times.
         subtitle = label(11, "regular", 0x99FFFFFF, 2);
         LinearLayout.LayoutParams sl = new LinearLayout.LayoutParams(-2, -2);
         sl.topMargin = u(4);
         text.addView(subtitle, sl);
-        // The words stay 440 wide; the box reaches 6 further, so a long title leaning at the wall
-        // (a programme not on yet, Glass.bump) isn't cut along its right edge.
-        text.setPadding(0, 0, u(6), 0);
-        text.setClipToPadding(false);
-        FrameLayout.LayoutParams textLp = new FrameLayout.LayoutParams(u(446), -2, Gravity.TOP | Gravity.START);
+        FrameLayout.LayoutParams textLp = new FrameLayout.LayoutParams(u(440), -2, Gravity.TOP | Gravity.START);
         textLp.leftMargin = u(40);
         textLp.topMargin = u(34);
         root.addView(text, textLp);
@@ -316,14 +332,129 @@ public class GuideActivity extends Activity {
         }
         if (s.end <= now && s.watchable(now)) m.append("  \u00b7  Catch Up");
         meta.setText(m);
-        subtitle.setText(s.subtitle == null ? "" : s.subtitle);
+        showAbout(s, false);
+        ui.removeCallbacks(aboutFocus);
+        ui.postDelayed(aboutFocus, 200);
         // What OK will really do: My5 can't be sent to a channel or a programme, only opened or searched.
+        // A programme not on yet: the channel as it is now.
         boolean my5 = "com.channel5.my5".equals(ch.pkg);
         if (!installed(ch)) setAction("Get " + ch.app);
-        else if (s.onNow(now)) setAction(my5 ? "Open My5 for Live TV" : "Watch Live on " + ch.app);
-        else if (s.end <= now) setAction(s.watchable(now) ? (my5 ? "Find on My5" : "Watch on " + ch.app) : "Find on " + ch.app);
-        else setAction(null);
+        else if (s.end > now) setAction(my5 ? "Open My5 for Live TV" : s.onNow(now) ? "Watch Live on " + ch.app : "Watch " + ch.name + " Live");
+        else setAction(s.watchable(now) ? (my5 ? "Find on My5" : "Watch on " + ch.app) : "Find on " + ch.app);
         showArt(s.image);
+    }
+
+    // ---------------------------------------------------------------- what it's about
+
+    static String aboutKey(GuideData.Show s) {
+        return s.channel.id + " " + s.programId;
+    }
+
+    /**
+     * The two lines under the times: the episode, then what it's about, in Freely's medium words when
+     * they fit beside it, else its short ones. arrived: the words have just come, so they fade in.
+     */
+    void showAbout(GuideData.Show s, boolean arrived) {
+        String ep = s.subtitle == null ? "" : s.subtitle;
+        String[] a = s.programId == null || s.channel == null ? null : ABOUT.get(aboutKey(s));
+        CharSequence text = a == null ? ep : aboutText(ep, a[0], a[1]);
+        subtitle.animate().cancel();
+        subtitle.setText(text);
+        subtitle.setAlpha(arrived ? 0f : 1f);
+        if (arrived) subtitle.animate().alpha(1f).setDuration(200).setInterpolator(MainActivity.EASE).start();
+    }
+
+    /**
+     * The medium words when they fit the two lines beside the episode, else as many of their whole
+     * sentences as fit (when that says more than the short words), else the short ones, cut to fit.
+     */
+    CharSequence aboutText(String ep, String shortWords, String mediumWords) {
+        if (!mediumWords.isEmpty()) {
+            CharSequence all = withEpisode(ep, mediumWords);
+            if (lines(all) <= 2) return all;
+            String fit = null;
+            for (int i = mediumWords.indexOf(". "); i > 0; i = mediumWords.indexOf(". ", i + 2)) {
+                String part = mediumWords.substring(0, i + 1);
+                if (lines(withEpisode(ep, part)) > 2) break;
+                fit = part;
+            }
+            if (fit != null && fit.length() >= shortWords.length()) return withEpisode(ep, fit);
+        }
+        return withEpisode(ep, shortWords.isEmpty() ? mediumWords : shortWords);
+    }
+
+    /** The episode (brighter), then the words. */
+    static CharSequence withEpisode(String ep, String words) {
+        if (words.isEmpty() || ep.isEmpty()) return words.isEmpty() ? ep : words;
+        SpannableStringBuilder b = new SpannableStringBuilder(ep);
+        b.setSpan(new ForegroundColorSpan(0xCCFFFFFF), 0, ep.length(), 0);
+        return b.append("  ·  ").append(words);
+    }
+
+    /** How many lines text takes in the box under the times. */
+    int lines(CharSequence text) {
+        return android.text.StaticLayout.Builder.obtain(text, 0, text.length(), subtitle.getPaint(), u(440))
+                .setIncludePad(false).build().getLineCount();
+    }
+
+    /** Once focus rests: what the programme in focus is about, then the ones above and below it. */
+    final Runnable aboutFocus = () -> {
+        GuideData.Show f = grid.focus;
+        if (f == null) return;
+        long t = Math.max(f.start, System.currentTimeMillis());
+        wantAbout(grid.showAt(grid.row + 1, t), true);
+        wantAbout(grid.showAt(grid.row - 1, t), true);
+        wantAbout(f, true);
+    };
+
+    /** first: before anything already waiting (the programme in focus). */
+    void wantAbout(GuideData.Show s, boolean first) {
+        if (s == null || s.programId == null || s.channel == null) return;
+        String key = aboutKey(s);
+        if (ABOUT.containsKey(key) || aboutAsked.contains(key)) return;
+        aboutWanted.remove(s);
+        if (first) aboutWanted.addFirst(s);
+        else aboutWanted.addLast(s);
+        nextAbout();
+    }
+
+    void nextAbout() {
+        if (aboutBusy || aboutLane.isShutdown()) return;
+        GuideData.Show s = aboutWanted.pollFirst();
+        if (s == null) return;
+        String key = aboutKey(s);
+        if (ABOUT.containsKey(key) || !aboutAsked.add(key)) {
+            nextAbout();
+            return;
+        }
+        aboutBusy = true;
+        aboutLane.execute(() -> {
+            String[] got;
+            try {
+                got = GuideData.about(s);
+            } catch (Exception e) {
+                got = null;  // asked again when it's next in focus
+            }
+            String[] words = got;
+            ui.post(() -> {
+                aboutBusy = false;
+                aboutAsked.remove(key);
+                if (isDestroyed()) return;
+                if (words != null) {
+                    ABOUT.put(key, words);
+                    if (grid.focus == s) showAbout(s, true);
+                }
+                nextAbout();
+            });
+        });
+    }
+
+    /** OK down sinks the capsule saying what OK does, and its release brings it back, as Home's cards do. */
+    void pressPill(boolean down) {
+        if (actionPill.getVisibility() != View.VISIBLE) return;
+        float s = down ? 0.94f : 1f;
+        actionPill.animate().scaleX(s).scaleY(s).setDuration(MainActivity.PRESS_MS)
+                .setInterpolator(down ? MainActivity.EASE_OUT_QUAD : MainActivity.EASE_IN_QUAD).start();
     }
 
     void setAction(String text) {
@@ -423,6 +554,9 @@ public class GuideActivity extends Activity {
                 readAt = System.currentTimeMillis();
                 readDay = today;
                 grid.reread(toNow);
+                // What's on now is about, down the first screens of channels, before it's looked at.
+                long at = System.currentTimeMillis();
+                for (int r = 0; r < Math.min(channels.size(), 16); r++) wantAbout(grid.showAt(r, at), false);
                 // The days either side, for scrolling there without a wait.
                 need(GuideData.addDays(today, -1));
                 need(GuideData.addDays(today, 1));
@@ -510,8 +644,8 @@ public class GuideActivity extends Activity {
     }
 
     /**
-     * OK: on now, the channel live in its app; earlier, the programme in the app's catch-up; later,
-     * nothing to open yet. The links are the ones each app answers on this TV: Freely's own TV-app
+     * OK: on now or later, the channel live in its app; earlier, the programme in the app's catch-up.
+     * The links are the ones each app answers on this TV: Freely's own TV-app
      * links where an app takes them (iPlayer, ITVX's catch-up), ITVX's channel links, Channel 4's web pages, and My5 (whose links go
      * through its server, and show an error) opened at its start, or searched, instead. My5's TV
      * app has no way in to a channel: it reads one from my5://watch/C7 and then never acts on it.
@@ -523,13 +657,9 @@ public class GuideActivity extends Activity {
             return;
         }
         long now = System.currentTimeMillis();
-        if (s != null && s.start > now) {
-            Glass.bump(actionPill.getVisibility() == View.VISIBLE ? actionPill : title, 1, 0);
-            return;
-        }
         boolean my5 = "com.channel5.my5".equals(ch.pkg);
         List<Intent> tries = new ArrayList<>();
-        if (s == null || s.onNow(now)) {
+        if (s == null || s.end > now) {
             String live = liveLink(ch);
             if (live != null && !my5) tries.add(Suggestions.view(live, ch.pkg));
         } else {
@@ -864,7 +994,10 @@ public class GuideActivity extends Activity {
                 case KeyEvent.KEYCODE_MEDIA_PREVIOUS: return days(-1);
                 case KeyEvent.KEYCODE_DPAD_CENTER:
                 case KeyEvent.KEYCODE_ENTER:
-                    if (ev.getRepeatCount() == 0) okDown = true;
+                    if (ev.getRepeatCount() == 0) {
+                        okDown = true;
+                        pressPill(true);
+                    }
                     return true;
                 default: return super.onKeyDown(k, ev);
             }
@@ -880,6 +1013,7 @@ public class GuideActivity extends Activity {
             if (k != KeyEvent.KEYCODE_DPAD_CENTER && k != KeyEvent.KEYCODE_ENTER) return super.onKeyUp(k, ev);
             boolean down = okDown;
             okDown = false;
+            if (down) pressPill(false);
             if (down && !ev.isCanceled() && !channels.isEmpty()) open(focus, focusChannel());
             return true;
         }
