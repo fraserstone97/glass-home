@@ -1,17 +1,22 @@
 package app.glasshome.launcher;
 
 import android.accessibilityservice.AccessibilityService;
+import android.accessibilityservice.AccessibilityServiceInfo;
 import android.content.Intent;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.SparseArray;
 import android.view.KeyEvent;
 import android.view.accessibility.AccessibilityEvent;
+import android.view.accessibility.AccessibilityNodeInfo;
 
 /**
  * Remote buttons that only the stock Google TV home answered (its GlobalKeyListener receiver), so
  * they do nothing once it is disabled: the app buttons open their apps again, and the Quick
  * Settings button opens Control Centre. The mic button opens Search, listening while it's held,
  * and Home pressed twice opens the App Switcher. Every other key passes straight through untouched.
- * Turned on over ADB (enabled_accessibility_services); it reads nothing on screen.
+ * Turned on over ADB (enabled_accessibility_services). It reads the screen only for a few seconds
+ * after the Guide opens a BBC channel live, and only iPlayer's (pickIPlayerProfile).
  *
  * Trade-off on this TCL (G08, Android 14): while any key-filtering service is bound, the firmware
  * handles volume before the service sees it and drops the held-key repeat, so holding volume
@@ -34,15 +39,20 @@ public class KeysService extends AccessibilityService {
 
     /** Running (bound by the system), so remote keys reach it: a trailer can count on Back (TrailerWatch). */
     static volatile boolean bound;
+    /** The service while it runs, for the Guide (the same process and thread). */
+    static KeysService running;
 
     @Override
     protected void onServiceConnected() {
         bound = true;
+        running = this;
     }
 
     @Override
     public boolean onUnbind(Intent i) {
         bound = false;
+        running = null;
+        stopWatching();
         return super.onUnbind(i);
     }
 
@@ -52,6 +62,8 @@ public class KeysService extends AccessibilityService {
     @Override
     protected boolean onKeyEvent(KeyEvent e) {
         int k = e.getKeyCode();
+        // A button pressed while iPlayer asks who's watching: the choice is yours.
+        if (watching && e.getAction() == KeyEvent.ACTION_DOWN) stopWatching();
         if (k == KeyEvent.KEYCODE_BACK) {
             // A trailer playing in YouTube from a title page: Back is back to the page, as from
             // Apple's player, rather than into YouTube's own pages.
@@ -154,6 +166,85 @@ public class KeysService extends AccessibilityService {
         } catch (SecurityException ignored) {
             // permission not granted on this TV
         }
+    }
+
+    // ---------------------------------------------------------------- iPlayer's profiles
+
+    static final String IPLAYER = "bbc.iplayer.android";
+    /** How long after the Guide opens iPlayer it may still ask who's watching (a cold start takes a few seconds). */
+    static final long WATCH_MS = 20_000;
+    /** How often iPlayer's screen is looked at meanwhile: its web page sends no events until it's read. */
+    static final long LOOK_MS = 400;
+
+    final Handler ui = new Handler(Looper.getMainLooper());
+    final Runnable watchOver = this::stopWatching;
+    boolean watching;
+
+    /**
+     * The Guide is opening a BBC channel live, and iPlayer starts at "Select who's watching": the
+     * profile it has picked out (the last one used) is chosen for you, as OK would. Only then is
+     * this service shown what's on screen, and only until it's done, a button is pressed, or
+     * WATCH_MS. Watch live or from start, which comes next, is left to you.
+     */
+    static void pickIPlayerProfile() {
+        KeysService s = running;
+        if (s != null) s.watch();
+    }
+
+    void watch() {
+        AccessibilityServiceInfo info = getServiceInfo();
+        if (info == null) return;
+        watching = true;
+        info.flags |= AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS;  // the page's element ids
+        setServiceInfo(info);
+        ui.removeCallbacks(watchOver);
+        ui.removeCallbacks(look);
+        ui.postDelayed(watchOver, WATCH_MS);
+        ui.postDelayed(look, LOOK_MS);
+    }
+
+    void stopWatching() {
+        ui.removeCallbacks(watchOver);
+        ui.removeCallbacks(look);
+        if (!watching) return;
+        watching = false;
+        AccessibilityServiceInfo info = getServiceInfo();
+        if (info == null) return;
+        info.flags &= ~AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS;
+        setServiceInfo(info);
+    }
+
+    final Runnable look = new Runnable() {
+        @Override public void run() {
+            if (!watching) return;
+            AccessibilityNodeInfo root = getRootInActiveWindow();
+            AccessibilityNodeInfo profile = root == null || !IPLAYER.contentEquals(String.valueOf(root.getPackageName()))
+                    ? null : focusedProfile(root);
+            if (profile != null && profile.performAction(AccessibilityNodeInfo.ACTION_CLICK)) stopWatching();
+            else ui.postDelayed(this, LOOK_MS);
+        }
+    };
+
+    /**
+     * The profile in focus on "Select who's watching": a button with the id avatar-<profile> (its
+     * name's is avatar-label-, adding one is avatar-add-). Null on any other screen.
+     */
+    static AccessibilityNodeInfo focusedProfile(AccessibilityNodeInfo root) {
+        java.util.ArrayDeque<AccessibilityNodeInfo> todo = new java.util.ArrayDeque<>();
+        todo.add(root);
+        for (int seen = 0; !todo.isEmpty() && seen < 600; seen++) {
+            AccessibilityNodeInfo n = todo.poll();
+            String id = n.getViewIdResourceName();
+            if (id != null && id.startsWith("avatar-") && !id.startsWith("avatar-label-") && !id.startsWith("avatar-add-")
+                    && n.isFocused()) {
+                return n;
+            }
+            for (int i = 0; i < n.getChildCount(); i++) {
+                AccessibilityNodeInfo c = n.getChild(i);
+                if (c != null) todo.add(c);
+            }
+        }
+        return null;
     }
 
     @Override

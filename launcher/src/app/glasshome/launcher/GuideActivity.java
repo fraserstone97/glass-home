@@ -659,9 +659,10 @@ public class GuideActivity extends Activity {
         long now = System.currentTimeMillis();
         boolean my5 = "com.channel5.my5".equals(ch.pkg);
         List<Intent> tries = new ArrayList<>();
-        if (s == null || s.end > now) {
-            String live = liveLink(ch);
-            if (live != null && !my5) tries.add(Suggestions.view(live, ch.pkg));
+        boolean live = s == null || s.end > now;
+        if (live) {
+            String link = liveLink(ch);
+            if (link != null && !my5) tries.add(Suggestions.view(link, ch.pkg));
         } else {
             String link = catchUpLink(s);
             if (link != null && !my5) tries.add(Suggestions.view(link, ch.pkg));
@@ -672,7 +673,11 @@ public class GuideActivity extends Activity {
             // Started afresh: an app already open (ITVX) only comes to the front with what it last
             // showed, and drops the link.
             if (Intent.ACTION_VIEW.equals(i.getAction())) i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
-            if (i.resolveActivity(pm) != null && Suggestions.start(this, i)) return;
+            if (i.resolveActivity(pm) != null && Suggestions.start(this, i)) {
+                // Live on iPlayer: past "Select who's watching" without a press.
+                if (live && KeysService.IPLAYER.equals(ch.pkg)) KeysService.pickIPlayerProfile();
+                return;
+            }
         }
         Intent launch = Suggestions.launchIntent(this, ch.pkg);
         if (launch != null) Suggestions.start(this, launch);
