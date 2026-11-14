@@ -174,7 +174,7 @@ public class KeysService extends AccessibilityService {
     /** How long after the Guide opens iPlayer it may still ask who's watching (a cold start takes a few seconds). */
     static final long WATCH_MS = 20_000;
     /** How often iPlayer's screen is looked at meanwhile: its web page sends no events until it's read. */
-    static final long LOOK_MS = 400;
+    static final long LOOK_MS = 250;
 
     final Handler ui = new Handler(Looper.getMainLooper());
     final Runnable watchOver = this::stopWatching;
