@@ -43,6 +43,12 @@ Android 7 or newer.
 - **A TV guide, like Freely's.** The Guide app (a card on Home) lists what's on across the BBC,
   ITV, Channel 4 and Channel 5 channels, a week back and a week ahead, from Freely's London guide.
   OK on something on now opens the channel live in its app; on something earlier, its catch-up.
+- **Your Jellyfin library.** Got a [Jellyfin](https://jellyfin.org) server at home? Glass Home
+  finds it on your network and signs in with Quick Connect: you approve a code in Jellyfin on your
+  phone or computer, and no password is typed on the TV. Your films and series then turn up in
+  Search, marked *In Your Library*, and their title pages get **Play from Your Library**, which
+  opens them in [Wholphin](https://github.com/damontecres/Wholphin). Settle on Wholphin in the dock
+  and the carousel is a shuffle of your library.
 - **Remote buttons that work.** Netflix, Prime Video, YouTube and Quick Settings, from any screen.
 - **Apple's aerials as the screen saver.** 92 of Apple TV's aerial films in 4K, shuffled with no
   repeats, dissolving from one to the next. Press Up to see where you are, Right for the next one.
@@ -53,8 +59,8 @@ Android 7 or newer.
 - **Light and fast.** About 2 MB, plain Java with no libraries, tuned frame by frame on a
   mid-range TV.
 - **No accounts, no tracking.** The only network calls are JustWatch (recommendations), TMDB
-  (artwork, optional), your weather source, Freely (the Guide's listings) and Apple's video server
-  (the screen saver).
+  (artwork, optional), your weather source, Freely (the Guide's listings), Apple's video server
+  (the screen saver) and your own Jellyfin server, if you connect one.
 
 Recommendations and *How to Watch* are for the UK (BBC iPlayer, ITVX, Channel 4, Netflix, Prime
 Video, Disney+, Apple TV, NOW, HBO Max, Paramount+). Everything else works anywhere.
@@ -147,6 +153,10 @@ your household uses? Point it at [`PROMPT.md`](PROMPT.md).
 - **Guide:** arrows move through channels and programmes; Up from the first channel picks the day;
   Back returns to now, then to Home. My5 can't be opened on a channel or a programme, so for
   Channel 5 the Guide opens My5 (live) or searches it (catch-up).
+- **Jellyfin:** Control Centre › Home Screen › Jellyfin, then **Sign In with Quick Connect** and
+  enter the code in Jellyfin (your profile › Quick Connect). Quick Connect has to be switched on in
+  Jellyfin's Dashboard first. Install Wholphin from Google Play to play from your library.
+  **Sign Out** on the same page forgets the sign-in.
 - **Glass Home's settings:** Control Centre › Home Screen. Top Shelf (which services, films or
   series), Weather, Home Screen (wallpaper, sounds, full screen when idle), Screen Saver (which one,
   when it starts, when the TV turns off), and more.
@@ -205,6 +215,8 @@ Home" ./build.sh` changes the name the TV shows. Code is plain Java with no depe
   [TMDB](https://www.themoviedb.org). This product uses the TMDB API but is not endorsed or
   certified by TMDB.
 - Aerial films stream from Apple and aren't included here.
+- Your own library through [Jellyfin](https://jellyfin.org)'s API, played in
+  [Wholphin](https://github.com/damontecres/Wholphin), a separate app that isn't included here.
 
 Glass Home isn't affiliated with Apple, Google, TCL or any streaming service. Apple TV and tvOS are
 Apple's trademarks; app logos belong to their owners and are drawn from each app installed on your
