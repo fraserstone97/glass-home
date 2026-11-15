@@ -25,9 +25,9 @@ Android 7 or newer.
   its colour from the picture behind it, with spring motion on every focus change.
 - **Apps open out of their tile**, the way they do on Apple TV, and Home brings you back to the
   app you left. Press Home twice for the **App Switcher**: your recent apps as big cards.
-- **Control Centre** (the gear, or your remote's Quick Settings button, from any app): what's
-  playing, with play and pause, then inputs, picture, sound, Wi-Fi, Bluetooth, sleep timer, screen
-  saver and Glass Home's settings, as a glass panel over whatever you're watching.
+- **Control Centre** (the gear, or your remote's Quick Settings button, from any app): inputs,
+  picture, sound, Wi-Fi, Bluetooth, sleep timer, screen saver and Glass Home's settings, as a glass
+  panel over whatever you're watching.
 - **Search that understands you.** Type, or hold the mic button and ask the way you'd ask a
   person: *slow horses*, *films like Inception*, *comedies with Will Ferrell*, *films directed by
   Greta Gerwig*, *documentaries about space*, *80s films*, *kids films*, *what's new on Netflix*,
@@ -50,7 +50,7 @@ Android 7 or newer.
   opens them in [Wholphin](https://github.com/damontecres/Wholphin). Settle on Wholphin in the dock
   and the carousel is a shuffle of your library.
 - **Remote buttons that work.** Netflix, Prime Video, YouTube and Quick Settings, from any screen.
-- **Apple's aerials as the screen saver.** 92 of Apple TV's aerial films in 4K, shuffled with no
+- **Apple's aerials as the screen saver.** 114 of Apple TV's aerial films in 4K, shuffled with no
   repeats, dissolving from one to the next. Press Up to see where you are, Right for the next one.
 - **Weather** from the Met Office (or Open-Meteo, MET Norway, wttr.in) in the corner, with
   Apple's multicolour icons that follow day and night, and the next hours and 5 days a click away.
