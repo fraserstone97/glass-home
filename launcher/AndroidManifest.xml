@@ -45,6 +45,8 @@
              Android's "start screen saver" (Somnambulator), or Glass Aerials when the TV can't. -->
         <package android:name="app.glasshome.aerials" />
         <package android:name="com.android.systemui" />
+        <!-- The TV's Chromecast, which Home keeps connected to so that it isn't frozen (CastAwake). -->
+        <package android:name="com.google.android.apps.mediashell" />
     </queries>
 
     <application

@@ -46,6 +46,7 @@ public class KeysService extends AccessibilityService {
     protected void onServiceConnected() {
         bound = true;
         running = this;
+        CastAwake.hold(this);  // from start-up, before Home is first seen
     }
 
     @Override

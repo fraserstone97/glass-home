@@ -484,6 +484,7 @@ public class MainActivity extends Activity {
         resumed = true;
         away = false;
         KeysService.ensureOn(this);
+        CastAwake.hold(this);
         String ws = prefs.getString("wallpaper", "night");
         if (!ws.equals(wallStyle)) {
             wallStyle = ws;
